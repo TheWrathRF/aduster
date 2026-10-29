@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed (monochrome) launcher icon: the mark without the accent bar. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group>
+        <clip-path android:pathData="M0,0h108v54h-108z" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+    </group>
+    <group>
+        <clip-path android:pathData="M0,62h108v46h-108z" />
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+    </group>
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M65.5,32.5a4.5,4.5 0,0 1,9 0v47.5a4.5,4.5 0,0 1,-9 0z" />
+</vector>

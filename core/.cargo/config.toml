@@ -1,0 +1,10 @@
+# Generic ARMv8-A code: no `target-cpu`, so the library runs on every arm64 phone (a CPU-specific
+# build can emit SVE, LSE or RCpc instructions that crash older cores). ELF segments are aligned
+# to 16 KiB for Android 15+ page-size compatibility. Static C libraries export nothing: the
+# library's only exported symbol is JNI_OnLoad.
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,--gc-sections",
+    "-C", "link-arg=-Wl,--exclude-libs,ALL",
+]

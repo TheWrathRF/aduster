@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Aduster mark: an "a" monogram. Ring body, stem on the right, and a slot through the
+     body (the filter) holding a bar in the app's silver-blue accent. 108-unit adaptive icon, the glyph
+     inside the 66-unit safe circle. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group>
+        <clip-path android:pathData="M0,0h108v54h-108z" />
+        <path
+            android:fillColor="#FFF2F2F2"
+            android:fillType="evenOdd"
+            android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+    </group>
+    <group>
+        <clip-path android:pathData="M0,62h108v46h-108z" />
+        <path
+            android:fillColor="#FFF2F2F2"
+            android:fillType="evenOdd"
+            android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+    </group>
+    <path
+        android:fillColor="#FFF2F2F2"
+        android:pathData="M65.5,32.5a4.5,4.5 0,0 1,9 0v47.5a4.5,4.5 0,0 1,-9 0z" />
+    <path
+        android:fillColor="#FFC2C6D6"
+        android:pathData="M35.5,55.5h11a2.5,2.5 0,0 1,0 5h-11a2.5,2.5 0,0 1,0 -5z" />
+</vector>

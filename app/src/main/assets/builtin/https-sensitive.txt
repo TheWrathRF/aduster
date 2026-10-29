@@ -1,0 +1,85 @@
+! Never decrypted, whatever the settings: payments, password managers, bot checks and sign-in.
+! Suffix match: "paypal.com" covers www.paypal.com and every other name under it. Government sites
+! are covered by a rule in the app (gov.uk, gouv.fr, go.jp ...); banks and health sites come from
+! AdGuard's maintained exclusion lists, downloaded with the filter lists.
+! Payments and wallets
+paypal.com
+stripe.com
+wise.com
+revolut.com
+klarna.com
+cash.app
+alipay.com
+adyen.com
+! Card networks and 3-D Secure checks (the bank's approval page during online payments)
+visa.com
+mastercard.com
+americanexpress.com
+cardinalcommerce.com
+3dsecure.io
+modirum.com
+arcot.com
+netcetera.com
+! Crypto exchanges
+binance.com
+coinbase.com
+kraken.com
+okx.com
+bybit.com
+! Password managers (vaults are decrypted in the page)
+bitwarden.com
+1password.com
+lastpass.com
+dashlane.com
+keepersecurity.com
+proton.me
+! Bot checks and CAPTCHAs: they judge the browser by its own TLS, so they must talk to Chrome
+! directly (Cloudflare Turnstile, reCAPTCHA, hCaptcha, DataDome, Arkose).
+! reCAPTCHA is served mostly from www.google.com/recaptcha and www.gstatic.com/recaptcha, which
+! a host list cannot exclude without leaving Google unfiltered; recaptcha.net covers only its
+! alternative host.
+challenges.cloudflare.com
+recaptcha.net
+hcaptcha.com
+captcha-delivery.com
+arkoselabs.com
+funcaptcha.com
+! More bot checks, each from the vendor's own documentation (2026-10-05): HUMAN/PerimeterX
+! ("Hostnames Used by Enforcers": sapi-/collector-<appid>.perimeterx.net, captcha.px-cdn.net,
+! captcha.px-cloud.net), GeeTest (docs.geetest.com: geetest.com, geevisit.com, gsensebot.com),
+! Friendly Captcha (CSP guide: *.frcapi.com).
+perimeterx.net
+px-cdn.net
+px-cloud.net
+geetest.com
+geevisit.com
+gsensebot.com
+frcapi.com
+! The rest, each from the vendor's own documentation (2026-10-05), only
+! the challenge hosts: AWS WAF (CSP guidance: <integration id>.token.awswaf.com, CAPTCHA SDK on
+! captcha-sdk.awswaf.com; not edge.sdk.awswaf.com, whose telemetry a list blocks by URL), Yandex
+! SmartCaptcha (quickstart: smartcaptcha.cloud.yandex.ru/captcha.js; validation host
+! smartcaptcha.yandexcloud.net), MTCaptcha (CSP header guide: service/service2.mtcaptcha.com).
+! DataDome's challenge is already covered by captcha-delivery.com; its tag hosts (js. and
+! api-js.datadome.co) are left decrypted on purpose: lists block them (HaGeZi, AdGuard Tracking).
+token.awswaf.com
+captcha-sdk.awswaf.com
+smartcaptcha.cloud.yandex.ru
+smartcaptcha.yandexcloud.net
+mtcaptcha.com
+! Identity and sign-in
+accounts.google.com
+myaccount.google.com
+pay.google.com
+payments.google.com
+passwords.google.com
+appleid.apple.com
+idmsa.apple.com
+login.microsoftonline.com
+login.live.com
+account.microsoft.com
+account.samsung.com
+account.xiaomi.com
+id.cloud.huawei.com
+id1.cloud.huawei.com
+oauth-login.cloud.huawei.com

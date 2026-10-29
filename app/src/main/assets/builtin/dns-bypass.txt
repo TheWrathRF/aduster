@@ -1,0 +1,18 @@
+! Stops apps from sidestepping filtering with their own encrypted DNS resolvers.
+! (Their well-known IPs are also routed into the tunnel and refused, see TunConfig.kt PUBLIC_DNS_V4/V6.)
+||dns.google^
+||cloudflare-dns.com^
+||one.one.one.one^
+||dns.quad9.net^
+||dns9.quad9.net^
+||dns10.quad9.net^
+||dns11.quad9.net^
+||doh.opendns.com^
+||dns.adguard-dns.com^
+||unfiltered.adguard-dns.com^
+||family.adguard-dns.com^
+||dns.nextdns.io^
+||doh.cleanbrowsing.org^
+||dns.mullvad.net^
+||doh.mullvad.net^
+||use-application-dns.net^

@@ -1,0 +1,50 @@
+name: Bug report
+description: Something does not work, or a site or app breaks with Aduster on.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead. Include the site or app if one is involved.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aduster version
+      description: Settings › About › Version.
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: android
+    attributes:
+      label: Android version and phone
+      placeholder: Android 15, Pixel 8
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and its version
+      description: If the problem is in a browser.
+      placeholder: Chrome 141
+  - type: dropdown
+    id: pages
+    attributes:
+      label: Page filtering
+      options:
+        - "On"
+        - "Off"
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: report
+    attributes:
+      label: Exported report
+      description: >
+        Settings › Advanced › Diagnostics › Export report saves a file to Downloads. Attach it here
+        by dragging it into this box. The report names hosts your phone connected to: read it
+        first, or send it to arda@aduster.site instead of posting it.

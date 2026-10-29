@@ -1,0 +1,39 @@
+! Xiaomi "safe" profile. Ads, analytics and telemetry from the HaGeZi Xiaomi list stay blocked;
+! these exceptions keep push notifications, Themes, Mi Cloud / Find Device and file downloads working.
+! Push (xmpush) and service discovery
+@@||api.xmpush.global.xiaomi.com^
+@@||register.xmpush.global.xiaomi.com^
+@@||sgp-api.xmpush.global.xiaomi.com^
+@@||fr-api.xmpush.global.xiaomi.com^
+@@||fr-register.xmpush.global.xiaomi.com^
+@@||ru-api.xmpush.global.xiaomi.com^
+@@||ru-register.xmpush.global.xiaomi.com^
+@@||idmb-api.xmpush.global.xiaomi.com^
+@@||vip-api.xmpush.global.xiaomi.com^
+@@||idmb.app.chat.global.xiaomi.net^
+@@||resolver.msg.global.xiaomi.net^
+@@||resolver.mi.xiaomi.com^
+@@||resolver.gslb.mi-idc.com^
+! Themes store
+@@||thm.market.xiaomi.com^
+@@||drm.market.xiaomi.com^
+@@||t1.market.xiaomi.com^
+@@||t2.market.xiaomi.com^
+@@||t3.market.xiaomi.com^
+@@||t4.market.xiaomi.com^
+@@||t5.market.xiaomi.com^
+@@||t7.market.xiaomi.com^
+@@||t15.market.xiaomi.com^
+@@||t17.market.xiaomi.com^
+! File storage (theme, wallpaper and app downloads)
+@@||cdn.fds.api.xiaomi.com^
+@@||cdn.fds-ssl.api.xiaomi.com^
+@@||awssgp0-files.fds.api.xiaomi.com^
+@@||awsusor0-cdn.fds-ssl.api.xiaomi.com^
+! Mi Cloud and Find Device
+@@||api.micloud.xiaomi.net^
+@@||api.g.micloud.xiaomi.net^
+@@||findapi.micloud.xiaomi.net^
+@@||statusapi.micloud.xiaomi.net^
+! Calendar holidays
+@@||api.calendar.intl.miui.com^
