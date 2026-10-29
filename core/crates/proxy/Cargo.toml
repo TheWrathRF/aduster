@@ -1,0 +1,15 @@
+[package]
+name = "proxy"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+# The HTTPS page engine is not part of the public source. This crate has the engine's public
+# API and reports that page filtering is unavailable, so the app builds and runs as a DNS
+# blocker. Release builds replace this folder with the engine.
+
+[dependencies]
+dnsengine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
