@@ -1,0 +1,13 @@
+! Aduster built-in rules, always compiled in.
+! Playback and push must never break, whatever a list contains. Only user rules can override these.
+@@||googlevideo.com^$important
+@@||youtubei.googleapis.com^$important
+@@||youtube.googleapis.com^$important
+@@||ytimg.com^$important
+@@||ggpht.com^$important
+! YouTube's attestation (BotGuard / PoToken), which third-party YouTube clients use before
+! playback; some lists block it.
+@@||jnn-pa.googleapis.com^$important
+@@||connectivitycheck.gstatic.com^$important
+@@||mtalk.google.com^$important
+@@||android.clients.google.com^$important
