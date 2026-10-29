@@ -1,0 +1,25 @@
+[package]
+name = "aduster-ffi"
+edition.workspace = true
+version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[lib]
+name = "aduster"
+crate-type = ["cdylib"]
+
+[dependencies]
+matcher.workspace = true
+dnsengine.workspace = true
+proxy.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+# Not called here: named so its release level (workspace manifest) applies to h2.
+tracing.workspace = true
+jni = "0.21"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
