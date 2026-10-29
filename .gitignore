@@ -1,0 +1,19 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+core/target/
+
+# Machine-specific and signing files: never committed
+local.properties
+keystore.properties
+signing.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
+
+# IDE
+.idea/
+*.iml
+.vscode/
