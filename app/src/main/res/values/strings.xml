@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Aduster</string>
+    <string name="widget_label">Aduster · blocked today</string>
+    <string name="channel_protection">Protection</string>
+    <string name="channel_status">Status</string>
+    <string name="notif_title">Protected</string>
+    <string name="notif_pause">Pause</string>
+    <string name="notif_resume">Resume</string>
+    <string name="notif_paused_title">Paused</string>
+    <string name="notif_paused_text">Until you resume</string>
+    <string name="notif_paused_until">Resumes at %1$s</string>
+    <string name="notif_revoked_title">Protection stopped</string>
+    <string name="notif_revoked_text">The VPN was turned off or replaced. Tap to turn it back on.</string>
+    <string name="notif_stopped_title">Protection stopped</string>
+    <string name="notif_stopped_text">Stopped because %1$s. Tap to turn it back on.</string>
+    <string name="notif_lockdown_title">Internet blocked by a VPN setting</string>
+    <string name="notif_lockdown_text">\"Block connections without VPN\" is on for Aduster. Turn it off in Settings › VPN › Aduster.</string>
+</resources>
