@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly as well, so a security advisory published for a dependency after the last push is
+  # reported (the audit job below).
+  schedule:
+    - cron: "17 5 * * 1"
 
 permissions:
   contents: read
@@ -30,6 +34,21 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
+        with:
+          tool: cargo-audit@0.22.2
+      # The RustSec advisory database is fetched fresh on every run; warnings (unmaintained,
+      # unsound, yanked) fail the job too.
+      - run: cargo audit --deny warnings
 
   android:
     name: Kotlin tests, lint and debug APK
