@@ -1,6 +1,6 @@
 Rust libraries built into the app's native library under CDLA-Permissive-2.0. Each licence text applies to the libraries named above it.
 
-== webpki-roots 1.0.9 ==
+== webpki-roots 1.0.11 ==
 
 # Community Data License Agreement - Permissive - Version 2.0
 

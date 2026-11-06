@@ -170,7 +170,9 @@ mod fd {
             .build()?;
         let local = tokio::task::LocalSet::new();
         let result = local.block_on(&rt, async {
-            let reader = Reader(AsyncFd::new(tun)?);
+            // SAFETY: `Tun` owns the descriptor: it stays open until the `Tun` is dropped, which
+            // happens with the `AsyncFd`, and `as_raw_fd` always returns that same descriptor.
+            let reader = Reader(unsafe { AsyncFd::register(tun) }?);
             serve(shared.clone(), reader, Writer(fd), stop).await
         });
         shared.persist_stats();

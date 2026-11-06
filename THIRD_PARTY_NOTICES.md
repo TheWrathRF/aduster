@@ -59,7 +59,7 @@ Settings › About › Open-source licences.
 | ring | 0.17.14 | ISC |
 | rustls | 0.23.46 | Apache-2.0 |
 | rustls-pki-types | 1.15.1 | Apache-2.0 |
-| rustls-webpki | 0.103.15 | ISC |
+| rustls-webpki | 0.103.16 | ISC |
 | rustversion | 1.0.23 | Apache-2.0 |
 | scopeguard | 1.2.0 | Apache-2.0 |
 | serde | 1.0.229 | Apache-2.0 |
@@ -74,7 +74,7 @@ Settings › About › Open-source licences.
 | syn | 3.0.6 | Apache-2.0 |
 | thiserror | 1.0.69 | Apache-2.0 |
 | thiserror-impl | 1.0.69 | Apache-2.0 |
-| tokio | 1.53.1 | MIT |
+| tokio | 1.54.1 | MIT |
 | tokio-macros | 2.7.2 | MIT |
 | tokio-rustls | 0.26.5 | Apache-2.0 |
 | tokio-util | 0.7.19 | MIT |
@@ -84,7 +84,7 @@ Settings › About › Open-source licences.
 | unicode-ident | 1.0.26 | Unicode-3.0 |
 | untrusted | 0.9.0 | ISC |
 | want | 0.3.1 | MIT |
-| webpki-roots | 1.0.9 | CDLA-Permissive-2.0 |
+| webpki-roots | 1.0.11 | CDLA-Permissive-2.0 |
 | xxhash-rust | 0.8.18 | BSL-1.0 |
 | zeroize | 1.9.0 | Apache-2.0 |
 | zmij | 1.0.23 | MIT |
