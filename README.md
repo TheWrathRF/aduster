@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/TheWrathRF/aduster/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/media/download-dark.png"><img src=".github/media/download-light.png" alt="Download for Android, v1.0.0" height="48"></picture></a>&nbsp;
+  <a href="https://github.com/TheWrathRF/aduster/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/media/download-dark.png"><img src=".github/media/download-light.png" alt="Download for Android, v1.0.1" height="48"></picture></a>&nbsp;
   <a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22app.aduster%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2FTheWrathRF%2Faduster%22%2C%22author%22%3A%22TheWrathRF%22%2C%22name%22%3A%22Aduster%22%7D"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/media/obtainium-dark.png"><img src=".github/media/obtainium-light.png" alt="Get updates with Obtainium" height="48"></picture></a>
 </p>
 
@@ -104,7 +104,7 @@ lists on 29 October 2026.
 
 Android 13 or later, on a 64-bit ARM (arm64) phone.
 
-1. Download `aduster-1.0.0.apk` from the [latest release](https://github.com/TheWrathRF/aduster/releases/latest)
+1. Download `aduster-1.0.1.apk` from the [latest release](https://github.com/TheWrathRF/aduster/releases/latest)
    and open it on the phone. Allow installing from your browser or file manager when asked. If
    Play Protect warns about an app that is not from the Play Store, choose **Install anyway**.
 2. Open Aduster and tap **Turn on**. Android asks to allow a VPN connection: Aduster uses
@@ -123,9 +123,9 @@ apps from their GitHub releases, with the button at the top of this page.
 Compare the APK's SHA-256 with the `.sha256` file next to it on the release page:
 
 ```sh
-sha256sum aduster-1.0.0.apk                  # Linux
-shasum -a 256 aduster-1.0.0.apk              # macOS
-certutil -hashfile aduster-1.0.0.apk SHA256  # Windows
+sha256sum aduster-1.0.1.apk                  # Linux
+shasum -a 256 aduster-1.0.1.apk              # macOS
+certutil -hashfile aduster-1.0.1.apk SHA256  # Windows
 ```
 
 </details>
