@@ -419,7 +419,9 @@ impl Shared {
         } else {
             self.end_episode();
             if servers_changed || new_net {
-                let desc = self.system_servers.load().iter().map(|s| s.ip().to_string()).collect::<Vec<_>>().join(",");
+                // Their kind only: the recorder goes into exported reports, and a network's public
+                // resolver addresses name its provider.
+                let desc = server_kinds(&self.system_servers.load()).join(",");
                 let label = self.net_label.lock().clone();
                 let from = std::mem::replace(&mut *self.net_announced.lock(), label.clone());
                 let name = if label.is_empty() { "network".to_string() } else { label };
@@ -796,10 +798,12 @@ impl Shared {
     }
 
     /// [`Shared::diagnostics_json`] for an exported report, which people post or send: the
-    /// network's search domains (a school's or company's own domain) only counted.
+    /// network's search domains (a school's or company's own domain) only counted, its resolvers
+    /// only by kind (public ones name the provider).
     pub fn report_json(&self) -> serde_json::Value {
         let mut v: serde_json::Value = serde_json::from_str(&self.diagnostics_json()).unwrap_or_default();
         v["search_domains"] = self.search_domains.load().len().into();
+        v["system_servers"] = server_kinds(&self.system_servers.load()).into();
         v
     }
 
@@ -839,6 +843,11 @@ impl Shared {
         })
         .to_string()
     }
+}
+
+/// "local" or "public" for each resolver: what a report may say about them.
+fn server_kinds(servers: &[std::net::SocketAddr]) -> Vec<&'static str> {
+    servers.iter().map(|s| if cache::is_local(&s.ip()) { "local" } else { "public" }).collect()
 }
 
 /// True if `d` is itself a public suffix (`co.uk`, `github.io`), by the Public Suffix List.
@@ -997,7 +1006,7 @@ mod tests {
         let h = s.health_json(300);
         let lost = h["events"].as_array().unwrap().iter().find(|e| e["k"] == "network_lost").unwrap().clone();
         assert_eq!(lost["detail"], "no network: 255 connections and 1000 DNS lookups failed");
-        assert!(h["events"][0]["detail"].as_str().unwrap().starts_with("Wi-Fi · lan · dns=192.168.1.1"), "{}", h["events"][0]);
+        assert!(h["events"][0]["detail"].as_str().unwrap().starts_with("Wi-Fi · lan · dns=local"), "{}", h["events"][0]);
         s.dns_failure(health::Kind::DnsFailed, "x.test", 1, "timeout");
         assert_eq!(s.health_json(300)["events"][0]["host"], "x.test");
         // Search domains: multi-label ones only, matched on label boundaries.
@@ -1007,6 +1016,21 @@ mod tests {
         s.set_network_info("Wi-Fi · eduroam", Vec::new());
         s.set_network(vec!["10.0.0.53:53".parse().unwrap()], true, false, 8);
         assert!(s.health_json(1)["events"][0]["detail"].as_str().unwrap().starts_with("Wi-Fi · lan → Wi-Fi · eduroam"));
+    }
+
+    /// Neither the exported report nor the recorder's network event names
+    /// the network's resolvers (a public one names the provider), only their kind.
+    #[test]
+    fn reports_name_no_resolver_address() {
+        let s = Shared::new(Config::default());
+        s.set_network(vec!["198.51.100.53:53".parse().unwrap(), "192.168.1.1:53".parse().unwrap()], true, false, 7);
+        let r = s.report_json();
+        assert_eq!(r["system_servers"], serde_json::json!(["public", "local"]));
+        let events = s.health_json(10).to_string();
+        for text in [r.to_string(), events.clone()] {
+            assert!(!text.contains("198.51.100") && !text.contains("192.168.1.1"), "{text}");
+        }
+        assert!(events.contains("dns=public,local"), "{events}");
     }
 
     /// A search domain that is a public suffix is ignored (it would take a

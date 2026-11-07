@@ -103,6 +103,11 @@ pub fn diagnostics_json() -> String {
     serde_json::json!({"running": false, "error": UNAVAILABLE}).to_string()
 }
 
+/// [`diagnostics_json`] for an exported report.
+pub fn report_json() -> String {
+    diagnostics_json()
+}
+
 /// Requests that have been waiting for response headers for more than 5 s.
 pub fn stuck_requests_json() -> serde_json::Value {
     serde_json::Value::Array(Vec::new())

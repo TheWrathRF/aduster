@@ -537,7 +537,7 @@ extern "system" fn native_report(mut env: JNIEnv, _: JClass) -> jni::sys::jstrin
         serde_json::json!({
             "time_ms": dnsengine::now_ms(),
             "engine": s.report_json(),
-            "proxy": serde_json::from_str::<serde_json::Value>(&proxy::diagnostics_json()).unwrap_or_default(),
+            "proxy": serde_json::from_str::<serde_json::Value>(&proxy::report_json()).unwrap_or_default(),
             "waiting_over_5s": proxy::stuck_requests_json(),
             "problems": s.health_json(256),
         })
