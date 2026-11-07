@@ -166,6 +166,11 @@ impl Cache {
         self.lru.peek(key).map(|e| e.ttl)
     }
 
+    /// Whether the entry was learned on another network (see `mark_stale`).
+    pub fn moved_of(&self, key: &Key) -> bool {
+        self.lru.peek(key).is_some_and(|e| e.expired)
+    }
+
     /// How long ago (boot-clock ms) the entry was stored; `now`: boot-clock milliseconds.
     pub fn age_ms_of(&self, key: &Key, now: u64) -> Option<u64> {
         self.lru.peek(key).map(|e| now.saturating_sub(e.stored))

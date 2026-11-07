@@ -562,6 +562,11 @@ mod tests {
 
     /// A resolver answering A 1.2.3.4 (TTL 300) after `delay_ms`, counting the queries it got.
     async fn fake_resolver(delay_ms: u64) -> (SocketAddr, Arc<AtomicUsize>) {
+        fake_resolver_with(delay_ms, [1, 2, 3, 4]).await
+    }
+
+    /// [`fake_resolver`] answering `answer`.
+    async fn fake_resolver_with(delay_ms: u64, answer: [u8; 4]) -> (SocketAddr, Arc<AtomicUsize>) {
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = server.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -575,7 +580,7 @@ mod tests {
                 let mut r = dns::blocked_response(&buf[..n], &q, dns::BlockMode::NullIp, 300);
                 let l = r.len();
                 let at = if q.edns { l - 11 - 4 } else { l - 4 };
-                r[at..at + 4].copy_from_slice(&[1, 2, 3, 4]);
+                r[at..at + 4].copy_from_slice(&answer);
                 let s = server.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -726,7 +731,7 @@ mod tests {
     /// once, through the TUN loop and the proxy's path; other names still go to the encrypted one.
     #[tokio::test]
     async fn network_names_go_to_the_network_resolver() {
-        let (up, hits) = fake_resolver(0).await;
+        let (up, hits) = fake_resolver_with(0, [10, 1, 2, 3]).await;
         let doh = crate::UpstreamConfig::Doh { url: "https://dns.test/dns-query".into(), bootstrap: vec!["192.0.2.1".parse().unwrap()] };
         let shared = Shared::new(Config { resolve_uids: false, upstream: doh, ..Config::default() });
         shared.set_network_info("Wi-Fi · campus.test", vec!["campus.test".into()]);
@@ -734,11 +739,11 @@ mod tests {
         let t0 = Instant::now();
         let got = run_loop(shared.clone(), vec![query_packet(1, "lms.campus.test", 53), query_packet(2, "5.1.168.192.in-addr.arpa", 53)], 2).await;
         assert_eq!(got.len(), 2);
-        assert_eq!(dns::inspect(&got[0]).unwrap().addrs, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+        assert_eq!(dns::inspect(&got[0]).unwrap().addrs, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
         assert!(t0.elapsed() < Duration::from_secs(1), "{:?}", t0.elapsed());
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let r = crate::resolve_with(&shared, "moodle.campus.test", false).await.unwrap();
-        assert_eq!(r.addrs, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+        assert_eq!(r.addrs, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
         assert_eq!(hits.load(Ordering::SeqCst), 3);
         // Another name: the encrypted resolver (unreachable here), never the network's.
         let s = shared.clone();
@@ -756,7 +761,7 @@ mod tests {
     /// asked of the campus network's resolver once the phone joins that network.
     #[tokio::test]
     async fn network_names_cached_elsewhere_are_asked_again() {
-        let (up, hits) = fake_resolver(0).await;
+        let (up, hits) = fake_resolver_with(0, [10, 1, 2, 3]).await;
         let doh = crate::UpstreamConfig::Doh { url: "https://dns.test/dns-query".into(), bootstrap: vec!["192.0.2.1".parse().unwrap()] };
         let shared = Shared::new(Config { resolve_uids: false, upstream: doh, ..Config::default() });
         shared.set_network_info("Wi-Fi · home", vec![]);
@@ -765,8 +770,79 @@ mod tests {
         shared.set_network_info("Wi-Fi · campus.test", vec!["campus.test".into()]);
         shared.set_network(vec![up], true, false, 2);
         let got = crate::resolve_with(&shared, "lms.campus.test", false).await.unwrap();
-        assert_eq!(got.addrs, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+        assert_eq!(got.addrs, vec!["10.1.2.3".parse::<IpAddr>().unwrap()]);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// The network answering one of its search-domain names with a public
+    /// address could be forging a public name, so the encrypted resolver's answer wins; a local
+    /// address stays the network's (the encrypted resolver is not asked), and so does a public
+    /// one the encrypted resolver has no answer for.
+    #[tokio::test]
+    async fn a_public_answer_for_a_network_name_is_checked_with_the_encrypted_resolver() {
+        let a = |s: &str| vec![s.parse::<IpAddr>().unwrap()];
+        for (net_addr, doh_addr, want, doh_asked) in
+            [([6, 6, 6, 6], Some([1, 2, 3, 4]), "1.2.3.4", 1), ([10, 1, 2, 3], Some([1, 2, 3, 4]), "10.1.2.3", 0), ([6, 6, 6, 6], None, "6.6.6.6", 1)]
+        {
+            let (net, net_hits) = fake_resolver_with(0, net_addr).await;
+            let (doh, doh_hits) = crate::upstream::testing::doh_answering(doh_addr).await;
+            let shared = Shared::new(Config { resolve_uids: false, ..Config::default() });
+            shared.upstream.store(Arc::new(doh));
+            shared.set_network_info("Wi-Fi", vec!["example.test".into()]);
+            shared.set_network(vec![net], true, false, 1);
+            let r = crate::resolve_with(&shared, "www.example.test", false).await.unwrap();
+            assert_eq!(r.addrs, a(want), "network {net_addr:?}, encrypted {doh_addr:?}");
+            assert_eq!((net_hits.load(Ordering::SeqCst), doh_hits.load(Ordering::SeqCst)), (1, doh_asked), "{want}");
+        }
+    }
+
+    /// The check with the encrypted resolver waits little: on a network that blocks it, a
+    /// network name with a public address still gets the network's answer within about a second
+    /// (not the encrypted resolver's connect timeout).
+    #[tokio::test]
+    async fn an_unreachable_encrypted_resolver_delays_network_names_little() {
+        let (net, _) = fake_resolver_with(0, [6, 6, 6, 6]).await;
+        let doh = crate::UpstreamConfig::Doh { url: "https://dns.test/dns-query".into(), bootstrap: vec!["192.0.2.1".parse().unwrap()] };
+        let shared = Shared::new(Config { resolve_uids: false, upstream: doh, ..Config::default() });
+        shared.set_network_info("Wi-Fi", vec!["example.test".into()]);
+        shared.set_network(vec![net], true, false, 1);
+        let t0 = Instant::now();
+        let r = crate::resolve_with(&shared, "www.example.test", false).await.unwrap();
+        assert_eq!(r.addrs, vec!["6.6.6.6".parse::<IpAddr>().unwrap()]);
+        assert!(t0.elapsed() < Duration::from_millis(1800), "{:?}", t0.elapsed());
+    }
+
+    /// The encrypted check runs to its end when nobody waits for it any more: its failed dial is
+    /// recorded, so the next lookups fail at once instead of dialling again.
+    #[tokio::test]
+    async fn an_abandoned_encrypted_check_still_records_its_failed_dial() {
+        let (net, _) = fake_resolver_with(0, [6, 6, 6, 6]).await;
+        let doh = crate::UpstreamConfig::Doh { url: "https://dns.test/dns-query".into(), bootstrap: vec!["192.0.2.1".parse().unwrap()] };
+        let shared = Shared::new(Config { resolve_uids: false, upstream: doh, ..Config::default() });
+        shared.set_network_info("Wi-Fi", vec!["example.test".into()]);
+        shared.set_network(vec![net], true, false, 1);
+        crate::resolve_with(&shared, "www.example.test", false).await.unwrap();
+        let t0 = Instant::now();
+        while shared.upstream.load().dial_failed_at() == 0 && t0.elapsed() < Duration::from_secs(12) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(shared.upstream.load().dial_failed_at() > 0, "the dial was cancelled, not recorded");
+    }
+
+    /// Only an answer learned on another network counts as stale (the proxy's guard looks such a
+    /// name up again); one whose TTL ran out on this network is served as usual while refreshed.
+    #[tokio::test]
+    async fn only_answers_from_another_network_are_stale() {
+        let (up, _) = fake_resolver_with(0, [10, 1, 2, 3]).await;
+        let shared = shared_with(up);
+        cache_answer(&shared, "ttl.test", 1);
+        cache_answer(&shared, "moved.test", 300);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let r = crate::resolve_with(&shared, "ttl.test", false).await.unwrap();
+        assert!(r.cached && !r.stale, "TTL ran out on this network");
+        shared.set_network(vec![up], true, false, 2);
+        let r = crate::resolve_with(&shared, "moved.test", false).await.unwrap();
+        assert!(r.cached && r.stale, "learned on the network before");
     }
 
     /// A resolver that answers every query with SERVFAIL after `delay_ms`.

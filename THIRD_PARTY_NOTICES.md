@@ -52,6 +52,8 @@ Settings › About › Open-source licences.
 | parking_lot_core | 0.9.12 | Apache-2.0 |
 | pin-project-lite | 0.2.17 | Apache-2.0 |
 | proc-macro2 | 1.0.107 | Apache-2.0 |
+| psl | 2.1.248 | Apache-2.0 |
+| psl-types | 2.0.11 | Apache-2.0 |
 | quote | 1.0.47 | Apache-2.0 |
 | regex | 1.13.1 | Apache-2.0 |
 | regex-automata | 0.4.18 | Apache-2.0 |

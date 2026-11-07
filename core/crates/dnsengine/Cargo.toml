@@ -24,6 +24,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 ring = "0.17"
+psl = "2.1"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

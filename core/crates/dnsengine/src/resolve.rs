@@ -28,6 +28,10 @@ pub struct Resolved {
     /// CONNECT-time check fetched milliseconds ago is not worth a second lookup on a slow
     /// connect.
     pub age_ms: u64,
+    /// At least one family is an answer learned on another network, served while it is
+    /// refreshed: what this network answers may differ (split DNS). Not set for answers whose
+    /// TTL ran out on this network, nor for old answers served because the lookup failed.
+    pub stale: bool,
 }
 
 pub async fn resolve(shared: &Arc<Shared>, host: &str) -> io::Result<Vec<IpAddr>> {
@@ -38,7 +42,7 @@ pub async fn resolve(shared: &Arc<Shared>, host: &str) -> io::Result<Vec<IpAddr>
 pub async fn resolve_with(shared: &Arc<Shared>, host: &str, fresh: bool) -> io::Result<Resolved> {
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        return Ok(Resolved { addrs: vec![ip], cached: false, cnames: Vec::new(), ttl: None, age_ms: 0 });
+        return Ok(Resolved { addrs: vec![ip], cached: false, cnames: Vec::new(), ttl: None, age_ms: 0, stale: false });
     }
     let name = host.trim_end_matches('.').to_ascii_lowercase();
     // Only ask for families the network can use: a v4-only Wi-Fi never needs AAAA.
@@ -56,11 +60,13 @@ pub async fn resolve_with(shared: &Arc<Shared>, host: &str, fresh: bool) -> io::
     let mut cached = false;
     let mut ttl: Option<u32> = None;
     let mut age_ms = 0u64;
+    let mut stale = false;
     let mut err = None;
     for r in results {
         match r {
-            Ok((resp, c, t, age)) => {
+            Ok((resp, c, t, age, old)) => {
                 age_ms = age_ms.max(age);
+                stale |= old;
                 if let Some(info) = dns::inspect(&resp) {
                     // Only answers that carry addresses say anything about them.
                     if !info.addrs.is_empty()
@@ -84,7 +90,7 @@ pub async fn resolve_with(shared: &Arc<Shared>, host: &str, fresh: bool) -> io::
     if addrs.is_empty() {
         return Err(err.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no address for {name}"))));
     }
-    Ok(Resolved { addrs, cached, cnames, ttl, age_ms })
+    Ok(Resolved { addrs, cached, cnames, ttl, age_ms, stale })
 }
 
 /// One family's addresses (`v6`: AAAA), from the cache or by joining the lookup in flight (the
@@ -101,7 +107,7 @@ pub async fn resolve_family(shared: &Arc<Shared>, host: &str, v6: bool) -> io::R
     Ok(dns::inspect(&resp).map(|i| i.addrs).unwrap_or_default().into_iter().filter(|ip| !ip.is_unspecified()).collect())
 }
 
-type Family = io::Result<(Vec<u8>, bool, Option<u32>, u64)>;
+type Family = io::Result<(Vec<u8>, bool, Option<u32>, u64, bool)>;
 /// A family's lookup and its "nobody waits for it" flag.
 type Pending = (tokio::task::JoinHandle<Family>, Arc<AtomicBool>);
 
@@ -143,30 +149,31 @@ async fn both_families(a: Option<Pending>, aaaa: Option<Pending>) -> Vec<Family>
 }
 
 /// One family: the raw answer, whether it came from the cache, (from the cache) the TTL it was
-/// stored with, and its age in ms (0 when fetched now). `abandoned`: nobody waits for it any
+/// stored with, its age in ms (0 when fetched now), and whether it is stale (see
+/// [`Resolved::stale`]). `abandoned`: nobody waits for it any
 /// more, so a failure is counted, not recorded.
-async fn lookup(shared: &Arc<Shared>, name: &str, qtype: u16, fresh: bool, abandoned: &AtomicBool) -> io::Result<(Vec<u8>, bool, Option<u32>, u64)> {
+async fn lookup(shared: &Arc<Shared>, name: &str, qtype: u16, fresh: bool, abandoned: &AtomicBool) -> io::Result<(Vec<u8>, bool, Option<u32>, u64, bool)> {
     let key = Key { name: name.into(), qtype, qclass: dns::CLASS_IN, do_bit: false };
     if !fresh {
         let optimistic = shared.config.load().optimistic_cache;
         let now = crate::clock::boot_ms();
-        let (cached, ttl, age) = {
+        let (cached, ttl, age, moved) = {
             let mut c = shared.cache.lock();
             let r = c.get(&key, 0, optimistic, now);
-            (r, c.ttl_of(&key), c.age_ms_of(&key, now).unwrap_or(0))
+            (r, c.ttl_of(&key), c.age_ms_of(&key, now).unwrap_or(0), c.moved_of(&key))
         };
         match cached {
-            Lookup::Fresh(r, _) => return Ok((r, true, ttl, age)),
+            Lookup::Fresh(r, _) => return Ok((r, true, ttl, age, false)),
             Lookup::Stale(r, _) => {
                 refresh_in_background(shared, key);
-                return Ok((r, true, ttl, age));
+                return Ok((r, true, ttl, age, moved));
             }
             Lookup::Miss => {}
         }
     }
     let t0 = Instant::now();
     match shared_exchange(shared, &key).await {
-        Ok(r) => Ok((r, false, None, 0)),
+        Ok(r) => Ok((r, false, None, 0, false)),
         Err(e) => {
             let ms = t0.elapsed().as_millis() as u32;
             let now = crate::clock::boot_ms();
@@ -184,7 +191,7 @@ async fn lookup(shared: &Arc<Shared>, name: &str, qtype: u16, fresh: bool, aband
             match old {
                 Some(r) => {
                     failed(Kind::DnsStaleServed);
-                    Ok((r, true, ttl, age))
+                    Ok((r, true, ttl, age, false))
                 }
                 None => {
                     failed(Kind::DnsFailed);

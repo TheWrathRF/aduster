@@ -311,10 +311,13 @@ impl Shared {
     /// What the app knows about the next network it reports: a name for the recorder and the
     /// search domains it hands out (names under them are local, see the proxy's rebinding guard).
     /// Single-label domains are left out: they add nothing to the built-in local names and
-    /// would cover a whole top-level domain.
+    /// would cover a whole top-level domain. So are public suffixes (`co.uk`, `github.io`): a
+    /// network handing one out would take a whole public zone off encrypted DNS and make every
+    /// name under it count as local.
     pub fn set_network_info(&self, label: &str, domains: Vec<String>) {
         *self.net_label.lock() = label.to_string();
-        let domains: Vec<String> = domains.into_iter().map(|d| d.trim().trim_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.')).collect();
+        let domains: Vec<String> =
+            domains.into_iter().map(|d| d.trim().trim_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.') && !public_suffix(d)).collect();
         self.search_domains.store(Arc::new(domains));
     }
 
@@ -435,7 +438,10 @@ impl Shared {
     /// With an encrypted resolver, the names the network calls its own (see
     /// [`Shared::network_owns`]) still go to the network's resolvers first (the encrypted
     /// resolver gives a campus name its public address, unreachable from inside); the
-    /// encrypted resolver answers them only when the network's resolvers fail.
+    /// encrypted resolver answers them when the network's resolvers fail, and when the network
+    /// answers one of its search-domain names with a public address: that could be its forgery
+    /// of a public name, so the encrypted resolver's answer wins unless it has none. Local
+    /// addresses, no addresses and private reverse names stay the network's.
     pub async fn upstream_exchange(&self, q: &[u8]) -> std::io::Result<Vec<u8>> {
         // An answer that came, but after more than a second, is recorded: the resolver's p99 is
         // tens of ms, so such a wait is worth a trace.
@@ -456,9 +462,29 @@ impl Shared {
         if matches!(*up, upstream::Upstream::System) {
             return self.system_exchange(q).await;
         }
-        if !self.system_servers.load().is_empty() && dns::parse_query(q).is_some_and(|p| self.network_owns(&p.name)) {
+        if !self.system_servers.load().is_empty()
+            && let Some(p) = dns::parse_query(q)
+            && self.network_owns(&p.name)
+        {
             match self.system_exchange(q).await {
                 Ok(r) if !matches!(dns::rcode_of(&r), dns::RCODE_SERVFAIL | dns::RCODE_REFUSED) => {
+                    if !private_reverse_zone(&p.name) && holds_public_address(&r) {
+                        // Waited for briefly: a network that blocks encrypted DNS must not hold
+                        // its own names for the encrypted resolver's whole connect timeout. The
+                        // query runs on as its own task, so a dial it started ends as it would
+                        // (a failure is remembered, a connection kept), not cut off.
+                        let (up, servers, q) = (up.clone(), self.system_servers.load_full(), q.to_vec());
+                        let check = tokio::spawn(async move { up.exchange(&servers, &q).await });
+                        match tokio::time::timeout(NETWORK_NAME_CHECK, check).await {
+                            Ok(Ok(Ok(e))) if has_answers(&e) => return Ok(e),
+                            Ok(Err(e)) => log::debug!("encrypted check for a network name ended: {e}"),
+                            Ok(Ok(e)) => log::debug!(
+                                "encrypted resolver has no answer for a network name ({}): the network's",
+                                e.err().map_or("none".into(), |e| e.to_string())
+                            ),
+                            Err(_) => log::debug!("encrypted resolver slow for a network name: the network's answer"),
+                        }
+                    }
                     self.counters.network_names.fetch_add(1, Ordering::Relaxed);
                     return Ok(r);
                 }
@@ -815,6 +841,25 @@ impl Shared {
     }
 }
 
+/// True if `d` is itself a public suffix (`co.uk`, `github.io`), by the Public Suffix List.
+fn public_suffix(d: &str) -> bool {
+    psl::suffix(d.as_bytes()).is_some_and(|s| s.is_known() && s.as_bytes() == d.as_bytes())
+}
+
+/// True if a DNS answer holds an address on the public internet.
+fn holds_public_address(r: &[u8]) -> bool {
+    dns::inspect(r).is_some_and(|i| i.addrs.iter().any(|ip| !cache::is_local(ip) && !ip.is_unspecified() && !ip.is_multicast()))
+}
+
+/// How long a network name with a public address waits for the encrypted resolver's answer.
+const NETWORK_NAME_CHECK: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// True if a DNS answer is a success that holds a usable address (a CNAME alone, its target
+/// unresolved, or a filtering resolver's 0.0.0.0 would leave the lookup with none).
+fn has_answers(r: &[u8]) -> bool {
+    dns::rcode_of(r) == dns::RCODE_NOERROR && dns::inspect(r).is_some_and(|i| i.addrs.iter().any(|a| !a.is_unspecified()))
+}
+
 /// A name in the reverse zone of a private, link-local or carrier-grade NAT range
 /// (`5.1.168.192.in-addr.arpa`, `….d.f.ip6.arpa`): only the network's resolvers can answer it.
 fn private_reverse_zone(name: &str) -> bool {
@@ -962,6 +1007,46 @@ mod tests {
         s.set_network_info("Wi-Fi · eduroam", Vec::new());
         s.set_network(vec!["10.0.0.53:53".parse().unwrap()], true, false, 8);
         assert!(s.health_json(1)["events"][0]["detail"].as_str().unwrap().starts_with("Wi-Fi · lan → Wi-Fi · eduroam"));
+    }
+
+    /// A search domain that is a public suffix is ignored (it would take a
+    /// whole public zone off encrypted DNS); a network's own domain under one is kept.
+    #[test]
+    fn public_suffixes_are_not_search_domains() {
+        let s = Shared::new(Config::default());
+        s.set_network_info("Wi-Fi", ["co.uk", "github.io", "Example.CO.UK.", "campus.example.edu", "example.test"].map(String::from).to_vec());
+        for public in ["www.bbc.co.uk", "co.uk", "someone.github.io"] {
+            assert!(!s.in_search_domain(public), "{public}");
+        }
+        for own in ["intranet.example.co.uk", "lms.campus.example.edu", "nas.example.test"] {
+            assert!(s.in_search_domain(own), "{own}");
+        }
+        assert_eq!(s.search_domains.load().len(), 3);
+    }
+
+    /// An encrypted answer replaces the network's only when it holds an address: a CNAME alone
+    /// (its target unresolved) would leave the lookup with none.
+    #[test]
+    fn only_an_encrypted_answer_with_an_address_wins() {
+        let raw = dns::build_query(7, "app.corp.test", dns::TYPE_A);
+        let q = dns::parse_query(&raw).unwrap();
+        // Header, question, one answer record (A 1.2.3.4 here), then the OPT record if any.
+        let mut a = dns::blocked_response(&raw, &q, dns::BlockMode::NullIp, 300);
+        let opt = if q.edns { a.split_off(a.len() - 11) } else { Vec::new() };
+        let l = a.len();
+        a[l - 4..].copy_from_slice(&[1, 2, 3, 4]);
+        let mut cname = a[..q.question_end].to_vec();
+        let target = b"\x08internal\x04corp\x04test\x00";
+        cname.extend_from_slice(&[0xC0, 0x0C, 0, 5, 0, 1, 0, 0, 1, 44, 0, target.len() as u8]);
+        cname.extend_from_slice(target);
+        cname.extend_from_slice(&opt);
+        a.extend_from_slice(&opt);
+        assert_eq!(dns::inspect(&a).unwrap().addrs, vec!["1.2.3.4".parse::<std::net::IpAddr>().unwrap()]);
+        assert!(dns::inspect(&cname).is_some_and(|i| i.addrs.is_empty()), "a well-formed CNAME answer");
+        assert!(!has_answers(&cname), "CNAME only");
+        assert!(has_answers(&a));
+        let blocked = dns::blocked_response(&raw, &q, dns::BlockMode::NullIp, 300);
+        assert!(!has_answers(&blocked), "a filtering resolver's 0.0.0.0 is no address");
     }
 
     /// The reverse zones only the network can answer.

@@ -777,6 +777,87 @@ impl Dot {
 }
 
 #[cfg(test)]
+impl Upstream {
+    /// When the encrypted resolver's last dial failed (now_ms; 0: none).
+    pub(crate) fn dial_failed_at(&self) -> u64 {
+        match self {
+            Upstream::System => 0,
+            Upstream::Doh(d) => d.dial_failed.load(Ordering::Relaxed),
+            Upstream::Dot(d) => d.dial_failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Test helpers for other modules.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A DoH resolver on this machine answering every query with A `addr` (TTL 300; None: no
+    /// records), trusted by the returned upstream alone, and the number of queries it got.
+    pub(crate) async fn doh_answering(addr: Option<[u8; 4]>) -> (Upstream, Arc<AtomicUsize>) {
+        let ck = rcgen::generate_simple_self_signed(vec!["dns.test".into()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = rustls_pki_types::PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
+        let mut server = rustls::ServerConfig::builder_with_provider(tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                let (a, h) = (acceptor.clone(), h.clone());
+                tokio::spawn(async move {
+                    let Ok(t) = a.accept(s).await else { return };
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let h = h.clone();
+                        async move {
+                            let q = req.into_body().collect().await?.to_bytes().to_vec();
+                            h.fetch_add(1, Ordering::SeqCst);
+                            let p = dns::parse_query(&q).unwrap();
+                            let r = match addr {
+                                Some(a) => {
+                                    let mut r = dns::blocked_response(&q, &p, dns::BlockMode::NullIp, 300);
+                                    let l = r.len();
+                                    let at = if p.edns { l - 11 - 4 } else { l - 4 };
+                                    r[at..at + 4].copy_from_slice(&a);
+                                    r
+                                }
+                                None => dns::error_response(&q, &p, dns::RCODE_NOERROR),
+                            };
+                            Ok::<_, hyper::Error>(
+                                hyper::Response::builder().header("content-type", "application/dns-message").body(Full::new(Bytes::from(r))).unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(t), svc).await;
+                });
+            }
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"h2".to_vec()];
+        let mut doh = Doh::new(&format!("https://dns.test:{port}/dns-query"), &["127.0.0.1".parse().unwrap()]).unwrap();
+        doh.connector = TlsConnector::from(Arc::new(client));
+        (Upstream::Doh(Arc::new(doh)), hits)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
