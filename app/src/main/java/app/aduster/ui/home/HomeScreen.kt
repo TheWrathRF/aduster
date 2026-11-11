@@ -179,6 +179,7 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
                                     Fix.HTTPS -> open(Sub.HTTPS)
                                     Fix.DIAGNOSTICS -> open(Sub.DIAGNOSTICS)
                                     Fix.VPN_SETTINGS -> ctx.startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                    Fix.RELEASE -> runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(RELEASES))) }
                                 }
                             }
                         }
@@ -231,6 +232,21 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
                 row { ListRow("Rules", onClick = openFilters) { ValueText("${fmt(rules)} · ${ago(meta.compiledAt)}") } }
             }
         }
+    }
+
+    val refused by vm.vpnRefused.collectAsStateWithLifecycle()
+    if (refused) {
+        AdDialog(
+            "VPN not allowed",
+            onDismiss = { vm.vpnRefused.value = false },
+            text = "The VPN permission was not given. If another app is the Always-on VPN, turn it off in VPN settings.",
+            confirm = "VPN settings",
+            dismiss = "Close",
+            onConfirm = {
+                vm.vpnRefused.value = false
+                runCatching { ctx.startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            },
+        )
     }
 
     if (offDialog) {
@@ -359,6 +375,8 @@ private fun History(stats: Stats) {
     val days = remember(stats.history, stats.day, stats.queries, stats.blocked) {
         app.aduster.ui.historySlots(stats.history, app.aduster.ui.DayStat(stats.day, stats.queries, stats.blocked), slots)
     }
+    val currentDays by androidx.compose.runtime.rememberUpdatedState(days)
+    val currentRtl by androidx.compose.runtime.rememberUpdatedState(androidx.compose.ui.platform.LocalLayoutDirection.current == androidx.compose.ui.unit.LayoutDirection.Rtl)
     // Slots left empty before the first day with data.
     val lead = slots - days.size
     val values = days.map { it?.blocked }
@@ -381,12 +399,17 @@ private fun History(stats: Stats) {
                 .fillMaxWidth()
                 .height(72.dp)
                 .semantics { contentDescription = description }
-                .pointerInput(days.size) {
+                // One gesture handler for the chart's life: it reads the days of now, not those
+                // of when it started (a poll changes them while the same count of days stays).
+                .pointerInput(Unit) {
                     val gap = ChartGap.toPx()
-                    fun pick(x: Float) {
+                    fun pick(at: Float) {
+                        val ds = currentDays
+                        // Today is at the end of the reading direction, as the labels under it.
+                        val x = if (currentRtl) size.width - at else at
                         val w = (size.width - gap * (slots - 1)) / slots
-                        val i = (x / (w + gap)).toInt().coerceIn(0, slots - 1) - lead
-                        val v = i.takeIf { it in days.indices && days[it] != null }
+                        val i = (x / (w + gap)).toInt().coerceIn(0, slots - 1) - (slots - ds.size)
+                        val v = i.takeIf { it in ds.indices && ds[it] != null }
                         if (v != selected) {
                             selected = v
                             if (v != null) Haptics.tick(view)
@@ -415,8 +438,9 @@ private fun History(stats: Stats) {
             val round = CornerRadius(w / 2, w / 2)
             val max = (values.maxOf { it ?: 0L }).coerceAtLeast(1L)
             val t = appear.value
+            val rtl = layoutDirection == androidx.compose.ui.unit.LayoutDirection.Rtl
             for (i in days.indices) {
-                val x = (lead + i) * (w + gap)
+                val x = ((lead + i) * (w + gap)).let { if (rtl) size.width - it - w else it }
                 drawRoundRect(p.surfaceHigh, Offset(x, 0f), Size(w, size.height), round)
                 val v = values[i] ?: continue
                 // Left to right, each bar a little after the one before.
@@ -493,7 +517,10 @@ internal fun httpsProblem(state: String): String = when (state) {
 }
 
 /** Where a problem on Home is fixed. */
-internal enum class Fix { HTTPS, DIAGNOSTICS, VPN_SETTINGS }
+internal enum class Fix { HTTPS, DIAGNOSTICS, VPN_SETTINGS, RELEASE }
+
+/** Where the official release is. */
+internal const val RELEASES = "https://github.com/TheWrathRF/aduster/releases/latest"
 
 internal data class Warning(val text: String, val fix: Fix)
 
@@ -504,6 +531,7 @@ internal data class Warning(val text: String, val fix: Fix)
  * filtering turned off and a build without the page engine are states, not problems.
  */
 internal fun homeWarnings(stats: Stats, httpsOn: Boolean): List<Warning> = buildList {
+    if (!stats.intact) add(Warning("This copy was modified: install the official release", Fix.RELEASE))
     if (httpsOn && stats.running && !stats.httpsActive && stats.httpsState != "unavailable") {
         add(Warning(httpsProblem(stats.httpsState), if (stats.httpsState == "start_failed") Fix.DIAGNOSTICS else Fix.HTTPS))
     }

@@ -14,8 +14,9 @@ import androidx.compose.ui.unit.dp
  * (ring + stem). Tinted where used.
  */
 object AdIcons {
-    private fun icon(name: String, block: PathBuilder.() -> Unit): ImageVector =
-        ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f).apply {
+    /** [mirror]: the icon points along the reading direction and is flipped in right-to-left languages. */
+    private fun icon(name: String, mirror: Boolean = false, block: PathBuilder.() -> Unit): ImageVector =
+        ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f, autoMirror = mirror).apply {
             path(
                 fill = null,
                 stroke = SolidColor(Color.Black),
@@ -44,7 +45,7 @@ object AdIcons {
         line(19f, 5f, 19f, 20f)
     }
 
-    val Log = icon("log") {
+    val Log = icon("log", mirror = true) {
         line(4f, 7f, 4.01f, 7f)
         line(8.5f, 7f, 20f, 7f)
         line(4f, 12f, 4.01f, 12f)
@@ -69,13 +70,13 @@ object AdIcons {
         circle(15f, 16f, 2f)
     }
 
-    val Back = icon("back") {
+    val Back = icon("back", mirror = true) {
         moveTo(14.5f, 5f)
         lineTo(7.5f, 12f)
         lineTo(14.5f, 19f)
     }
 
-    val Chevron = icon("chevron") {
+    val Chevron = icon("chevron", mirror = true) {
         moveTo(9.5f, 6f)
         lineTo(15.5f, 12f)
         lineTo(9.5f, 18f)

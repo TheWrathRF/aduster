@@ -12,6 +12,7 @@ import android.os.PersistableBundle
 import app.aduster.settings.Settings
 import app.aduster.settings.SettingsStore
 import app.aduster.vpn.AdusterVpnService
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,7 +32,8 @@ import java.util.concurrent.ConcurrentHashMap
  * Compiling here keeps the heavy work out of the always-on :core process as well.
  */
 class FilterJobService : JobService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** A failure the job did not handle is logged, never the end of the app's process. */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, e -> android.util.Log.e("Aduster", "list job failed", e) })
     private val running = ConcurrentHashMap<Int, Job>()
 
     override fun onStartJob(params: JobParameters): Boolean {
@@ -40,6 +42,10 @@ class FilterJobService : JobService() {
             var retry = false
             try {
                 retry = FilterJobs.run(applicationContext, id, params.extras)
+            } catch (e: java.io.IOException) {
+                // A full disk or an unwritable file: tried again later, with the job's backoff.
+                android.util.Log.w("Aduster", "list job $id: $e")
+                retry = true
             } finally {
                 running.remove(id)
                 jobFinished(params, retry)

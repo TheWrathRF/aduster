@@ -225,19 +225,20 @@ private fun NavItem(t: Tab, selected: Boolean, modifier: Modifier, onClick: () -
 fun BackBar(title: String, onBack: () -> Unit, trailing: @Composable () -> Unit = {}) {
     val p = LocalPalette.current
     Row(
-        Modifier.fillMaxWidth().padding(start = 6.dp, end = 8.dp, top = 8.dp),
+        Modifier.fillMaxWidth().padding(start = 4.dp, end = 8.dp, top = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // 48 dp: the smallest touch target Android's accessibility guidance allows.
         Box(
             Modifier
-                .size(44.dp)
+                .size(48.dp)
                 .clip(CircleShape)
                 .clickable(role = Role.Button, onClick = onBack),
             contentAlignment = Alignment.Center,
         ) {
             Icon(AdIcons.Back, "Back", tint = p.text, modifier = Modifier.size(22.dp))
         }
-        Spacer(Modifier.width(4.dp))
+        Spacer(Modifier.width(2.dp))
         Text(title, style = Type.title, color = p.text, modifier = Modifier.weight(1f))
         trailing()
     }

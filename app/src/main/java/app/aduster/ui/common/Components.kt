@@ -48,6 +48,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Alignment
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
@@ -545,9 +547,12 @@ fun TextAction(text: String, color: Color = LocalPalette.current.accent, onClick
         text,
         style = Type.bodyStrong,
         color = color,
+        // At least 48 dp tall to touch, the text centred in it.
         modifier = Modifier
+            .defaultMinSize(minHeight = 48.dp)
             .clip(CircleShape)
             .clickable(role = Role.Button, onClick = onClick)
+            .wrapContentHeight(Alignment.CenterVertically)
             .padding(horizontal = 12.dp, vertical = 10.dp),
     )
 }

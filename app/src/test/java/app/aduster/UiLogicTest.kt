@@ -7,6 +7,7 @@ import app.aduster.settings.SettingsBackup
 import app.aduster.settings.ThemeMode
 import app.aduster.settings.coreKey
 import app.aduster.settings.sanitized
+import app.aduster.settings.updateOrKeep
 import app.aduster.ui.DayStat
 import app.aduster.ui.LogItem
 import app.aduster.ui.QueryAction
@@ -122,6 +123,9 @@ class UiLogicTest {
         assertEquals(3, apart.size)
         val mixed = app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.BLOCKED), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM)))
         assertEquals(3, mixed.size)
+        // An AAAA answered with no address (IPv4-only answers) is not hidden under its A row.
+        val v4 = app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.NO_IPV6), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM)))
+        assertEquals(3, v4.size)
     }
 
     /** Diagnostics: process ends grouped by what happened, in plain words, newest group first. */
@@ -230,7 +234,122 @@ class UiLogicTest {
         val file = SettingsBackup.encode(Settings(httpsFiltering = true, httpsExclusions = "bank.example"))
         val public = SettingsBackup.decode(file, Settings(), pages = false)!!.summary
         assertTrue(public.toString(), public.none { it.contains("page", ignoreCase = true) || it.contains("decrypt") })
-        assertTrue(SettingsBackup.decode(file, Settings(), pages = true)!!.summary.any { it.contains("Page filtering on (changes)") })
+        assertTrue(SettingsBackup.decode(file, Settings(), pages = true)!!.summary.any { it.contains("Page filtering: on (now off)") })
+    }
+
+    /**
+     * Every stored field is one the import preview names, one an import keeps, or one :core never
+     * reads (and [coreKey] blanks): a field added later cannot miss the preview.
+     */
+    @Test
+    fun everyFieldIsPreviewedKeptOrUiOnly() {
+        val d = Settings.serializer().descriptor
+        val names = (0 until d.elementsCount).map { d.getElementName(it) }.toSet()
+        val groups = listOf(SettingsBackup.PREVIEWED_FIELDS, SettingsBackup.KEPT_FIELDS, app.aduster.settings.UI_ONLY_FIELDS)
+        assertEquals(names, groups.flatten().toSet())
+        assertEquals(names.size, groups.sumOf { it.size })
+        val ui = Settings(
+            listOverrides = mapOf("x" to false), customLists = listOf(app.aduster.settings.CustomList("custom-0123abcd", "n", "https://x")),
+            deviceProfile = app.aduster.settings.DeviceProfile.FULL, autoUpdate = false, updateIntervalHours = 48, updateWifiOnly = false,
+            updateWhileCharging = true, theme = ThemeMode.LIGHT,
+        )
+        assertEquals(Settings().coreKey(), ui.coreKey())
+        // Excluded apps by name; a long list is cut.
+        val apps = SettingsBackup.encode(Settings(excludedApps = setOf("p.a", "p.b", "p.c", "p.d", "p.e")))
+        val line = SettingsBackup.decode(apps, Settings()) { it.removePrefix("p.").uppercase() }!!.summary.single { it.startsWith("Excluded apps") }
+        assertEquals("Excluded apps: adds A, B, C and 2 more", line)
+        // A change that keeps the count is named too: which apps and sites come and go.
+        val now = Settings(excludedApps = setOf("p.a", "p.b", "p.c", "p.d", "p.e"), httpsExclusions = "bank.example\nshop.example")
+        val swapped = SettingsBackup.encode(Settings(excludedApps = setOf("p.a", "p.b", "p.c", "p.x", "p.y"), httpsExclusions = "bank.example\nother.example"))
+        val lines = SettingsBackup.decode(swapped, now) { it.removePrefix("p.").uppercase() }!!.summary
+        assertTrue(lines.toString(), "Excluded apps: adds X, Y; removes D, E" in lines)
+        assertTrue(lines.toString(), "Never-decrypted sites of your own: adds other.example; removes shop.example" in lines)
+    }
+
+    /**
+     * A shared settings file that sends every lookup to its own server, turns Block DNS bypass off
+     * and leaves Chrome out says so before it is applied; comment lines
+     * are not counted as rules.
+     */
+    @Test
+    fun importNamesWhatProtectionChanges() {
+        val file = SettingsBackup.encode(
+            Settings(
+                upstream = "custom", customUpstream = "https://dns.other.example/q", blockDnsBypass = false,
+                excludedApps = setOf("com.android.chrome"), userRules = "# a\n||b.example^",
+            ),
+        )
+        val lines = SettingsBackup.decode(file, Settings())!!.summary
+        assertTrue(lines.toString(), "DNS server: https://dns.other.example/q (now Network default)" in lines)
+        assertTrue(lines.toString(), "Block DNS bypass: off (now on)" in lines)
+        assertTrue(lines.toString(), "1 rules of your own (now 0)" in lines)
+        // What does not change is not listed as a change.
+        assertTrue(lines.toString(), lines.none { it.startsWith("Reply to blocked lookups") })
+    }
+
+    /**
+     * A settings write that fails (a full disk) still gives the protection process the changed
+     * settings to go on with, instead of an exception that ends it.
+     */
+    @Test
+    fun aFailedSettingsWriteKeepsTheChange() = kotlinx.coroutines.runBlocking {
+        class Store(val fail: Boolean) : androidx.datastore.core.DataStore<Settings> {
+            var saved = Settings()
+            override val data = kotlinx.coroutines.flow.flowOf(saved)
+            override suspend fun updateData(transform: suspend (t: Settings) -> Settings): Settings {
+                if (fail) throw java.io.IOException("No space left on device")
+                return transform(saved).also { saved = it }
+            }
+        }
+        val now = Settings(enabled = true)
+        val full = Store(fail = true)
+        assertEquals(now.copy(pausedUntil = 5), full.updateOrKeep(now) { it.copy(pausedUntil = 5) })
+        assertEquals(Settings(), full.saved)
+        val ok = Store(fail = false)
+        assertEquals(5L, ok.updateOrKeep(now) { it.copy(pausedUntil = 5) }.pausedUntil)
+        assertEquals(5L, ok.saved.pausedUntil)
+    }
+
+    /**
+     * Diagnostics says "Paused" during a pause, not "Running", and why page
+     * filtering is not running when it is switched on, as Home says it, not "Off".
+     */
+    @Test
+    fun diagnosticsStatesSayWhatIsTrue() {
+        val on = Stats.parse("""{"running":true,"https_state":"ca_untrusted"}""", running = true)
+        val d = app.aduster.ui.settings.DiagnosticsStates
+        assertEquals("Paused", d.protection(on, paused = true))
+        assertEquals("Running", d.protection(on, paused = false))
+        assertEquals("Stopped", d.protection(on.copy(running = false), paused = true))
+        assertEquals("…", d.protection(null, paused = false))
+        assertEquals("Certificate not trusted", d.pages(available = true, pagesRunning = false, httpsOn = true, stats = on))
+        assertEquals("Running", d.pages(available = true, pagesRunning = true, httpsOn = true, stats = on))
+        assertEquals("Off", d.pages(available = true, pagesRunning = false, httpsOn = false, stats = on))
+        assertEquals("Off", d.pages(available = true, pagesRunning = false, httpsOn = true, stats = on.copy(running = false)))
+        assertEquals("Not in this build", d.pages(available = false, pagesRunning = false, httpsOn = true, stats = on))
+    }
+
+    /**
+     * "Delete saved reports" matches its own file names only (`_` is a LIKE wildcard), and says
+     * that an earlier install's reports are out of its reach.
+     */
+    @Test
+    fun savedReportsAreMatchedByTheirName() {
+        assertEquals("Aduster\\_report\\_", app.aduster.vpn.Reports.likeLiteral("Aduster_report_"))
+        assertEquals("a\\%b\\\\c", app.aduster.vpn.Reports.likeLiteral("a%b\\c"))
+        assertTrue(app.aduster.vpn.Reports.deletedText(0).contains("earlier install"))
+        assertEquals("Deleted 1 report", app.aduster.vpn.Reports.deletedText(1))
+    }
+
+    /** The IPv4-only switch reaches the DNS engine's config, and its Log rows are named. */
+    @Test
+    fun ipv4OnlyReachesTheEngine() {
+        fun sent(s: Settings) = kotlinx.serialization.json.Json.parseToJsonElement(app.aduster.core.EngineConfig.json("stats.json", s, 0))
+            .let { it as kotlinx.serialization.json.JsonObject }["ipv4_only"].toString()
+        assertEquals("true", sent(Settings(ipv4Only = true)))
+        assertEquals("false", sent(Settings()))
+        assertEquals(QueryAction.NO_IPV6, QueryAction.of("NoIpv6"))
+        assertTrue(QueryAction.NO_IPV6.answered && !QueryAction.NO_IPV6.blocked)
     }
 
     @Test
@@ -399,6 +518,9 @@ class UiLogicTest {
             listOf("Private DNS bypasses protection" to "DIAGNOSTICS", "Block connections without VPN is on" to "VPN_SETTINGS"),
             rows("""{"running":false,"private_dns_strict":true,"lockdown":true}""", running = false),
         )
+        // A modified copy that refuses to start says so on Home, with where the real one is,
+        // not only in a notification that offered a retry.
+        assertEquals(listOf("This copy was modified: install the official release" to "RELEASE"), rows("""{"running":false,"intact":false}""", running = false))
     }
 
     /**

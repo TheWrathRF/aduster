@@ -134,8 +134,9 @@ object Notifications {
     fun cancelLockdown(ctx: Context) = ctx.getSystemService(NotificationManager::class.java).cancel(ID_LOCKDOWN)
 
     /** Protection stopped without anyone asking ([reason]); tapping opens the app to turn it on. */
-    fun showStopped(ctx: Context, reason: String) {
-        val text = ctx.getString(R.string.notif_stopped_text, reason)
+    /** [retry]: turning it on again can help (not for a modified copy, which always refuses). */
+    fun showStopped(ctx: Context, reason: String, retry: Boolean = true) {
+        val text = ctx.getString(if (retry) R.string.notif_stopped_text else R.string.notif_stopped_final, reason)
         val n = Notification.Builder(ctx, CH_STATUS)
             .setSmallIcon(R.drawable.ic_stat_aduster)
             .setColor(AMBER)

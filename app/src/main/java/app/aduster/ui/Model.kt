@@ -41,6 +41,8 @@ data class Stats(
     /** Today's DNS lookups and DNS blocks alone. */
     val dnsQueries: Long = 0,
     val dnsBlocked: Long = 0,
+    /** False: this copy is not the released one and protection refuses to start. */
+    val intact: Boolean = true,
 ) {
     /** Share of DNS lookups blocked: one unit (the totals mix connections and page requests). */
     val dnsRatio: Double get() = if (dnsQueries == 0L) 0.0 else dnsBlocked.toDouble() / dnsQueries
@@ -88,6 +90,7 @@ data class Stats(
                 inPages = pairs("top_blocked_page_counts").toMap(),
                 dnsQueries = l("dns_queries"),
                 dnsBlocked = l("dns_blocked"),
+                intact = o["intact"]?.jsonPrimitive?.content != "false",
             )
         }
     }
@@ -115,6 +118,8 @@ enum class QueryAction(val blocked: Boolean, val label: String) {
     /** Log markers, not queries: filtering was paused / resumed here. */
     PAUSED(false, "Paused"),
     RESUMED(false, "Resumed"),
+    /** An AAAA lookup answered with no address (IPv4-only answers). */
+    NO_IPV6(false, "IPv4 only"),
     /** An action this app version does not know (a newer core): shown by name, never as a cache hit. */
     UNKNOWN(false, "Other"),
     /** Marker the Log inserts itself: protection's process restarted, older entries are from before. */
@@ -124,7 +129,7 @@ enum class QueryAction(val blocked: Boolean, val label: String) {
     val marker: Boolean get() = this == PAUSED || this == RESUMED || this == RESTARTED
 
     /** Answered (from the resolver or the cache): the "Allowed" tab (failures are not allowed answers). */
-    val answered: Boolean get() = this == UPSTREAM || this == CACHE || this == STALE
+    val answered: Boolean get() = this == UPSTREAM || this == CACHE || this == STALE || this == NO_IPV6
 
     companion object {
         fun of(s: String) = when (s) {
@@ -137,6 +142,7 @@ enum class QueryAction(val blocked: Boolean, val label: String) {
             "Filtered" -> FILTERED
             "Paused" -> PAUSED
             "Resumed" -> RESUMED
+            "NoIpv6" -> NO_IPV6
             else -> UNKNOWN
         }
     }

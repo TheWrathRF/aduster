@@ -7,4 +7,13 @@
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
+
+    <!-- The Light theme's window, from the first frame too (MainActivity picks it, and the
+         launch screen of the next start): the Light palette's background, no black flash. -->
+    <style name="Theme.Aduster.Light">
+        <item name="android:windowBackground">@color/light_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <color name="light_background">#FFF2F2F0</color>
 </resources>

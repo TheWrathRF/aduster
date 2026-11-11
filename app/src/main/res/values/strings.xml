@@ -14,6 +14,7 @@
     <string name="notif_revoked_text">The VPN was turned off or replaced. Tap to turn it back on.</string>
     <string name="notif_stopped_title">Protection stopped</string>
     <string name="notif_stopped_text">Stopped because %1$s. Tap to turn it back on.</string>
+    <string name="notif_stopped_final">Stopped because %1$s.</string>
     <string name="notif_lockdown_title">Internet blocked by a VPN setting</string>
     <string name="notif_lockdown_text">\"Block connections without VPN\" is on for Aduster. Turn it off in Settings › VPN › Aduster.</string>
 </resources>

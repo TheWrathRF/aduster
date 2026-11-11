@@ -67,13 +67,24 @@ object Reports {
         return "{\"version\":\"${pi?.versionName.orEmpty()}\",\"installed\":${pi?.lastUpdateTime ?: 0},\"apk_sha256\":\"$sha\"}"
     }
 
-    /** Deletes the reports saved earlier (they name hosts that were visited); returns how many. */
+    /**
+     * Deletes the reports this install saved (they name hosts that were visited); returns how
+     * many. Android shows an app only its own files in Downloads, so those of an earlier install
+     * (before an uninstall) are out of reach: [deletedText] says so.
+     */
     fun deleteAll(ctx: Context): Int =
         runCatching {
             ctx.contentResolver.delete(
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                "${MediaStore.Downloads.DISPLAY_NAME} LIKE ?",
-                arrayOf("Aduster_report_%.json"),
+                "${MediaStore.Downloads.DISPLAY_NAME} LIKE ? ESCAPE '\\'",
+                arrayOf(likeLiteral("Aduster_report_") + "%.json"),
             )
         }.getOrDefault(0)
+
+    /** [s] matched as written in a LIKE pattern with `ESCAPE '\'` (`_` and `%` are wildcards). */
+    internal fun likeLiteral(s: String): String = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    /** What Delete saved reports did, in words. */
+    fun deletedText(n: Int): String =
+        if (n > 0) "Deleted $n report${if (n == 1) "" else "s"}" else "No reports from this install; an earlier install's stay in Downloads"
 }

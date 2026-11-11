@@ -49,7 +49,12 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
     // restored before DataStore's first read, and starting from the placeholder settings would
     // save an empty set over the user's exclusions (the same guard as My rules).
     var excluded by remember { mutableStateOf<Set<String>?>(null) }
-    LaunchedEffect(Unit) { if (excluded == null) excluded = vm.storedSettings().excludedApps }
+    // The exclusions as the screen opened: the order follows them, so a row does not jump away
+    // from under the finger that toggled it.
+    var opened by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(Unit) {
+        if (excluded == null) excluded = vm.storedSettings().excludedApps.also { opened = it }
+    }
     val current = excluded ?: emptySet()
     LaunchedEffect(excluded) {
         val want = excluded ?: return@LaunchedEffect
@@ -63,12 +68,13 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
 
     val q = query.trim().lowercase()
     // Filtered and sorted only when its inputs change, not for every icon that loads.
-    val shown = remember(apps, q, showSystem, current) {
+    val shown = remember(apps, q, showSystem, opened, current) {
         apps.orEmpty()
-            .filter { showSystem || !it.system || it.pkg in current }
+            // An excluded system app stays listed, also one excluded since the screen opened.
+            .filter { showSystem || !it.system || it.pkg in opened || it.pkg in current }
             .filter { q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.contains(q) }
-            // Excluded apps first, so the current state is visible at a glance.
-            .sortedByDescending { it.pkg in current }
+            // Apps excluded when the screen opened come first, so the state is visible at a glance.
+            .sortedByDescending { it.pkg in opened }
     }
 
     Column(Modifier.fillMaxSize()) {

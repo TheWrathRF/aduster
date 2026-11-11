@@ -151,6 +151,7 @@ fun LogScreen(vm: MainViewModel) {
     // pill counts them instead.
     val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val scope = rememberCoroutineScope()
+    val undoBar = remember { androidx.compose.material3.SnackbarHostState() }
     var pinnedTop by remember { mutableStateOf(true) }
     var seenSeq by remember { mutableLongStateOf(0L) }
     val topSeq = shown.firstOrNull()?.seq ?: 0L
@@ -177,6 +178,7 @@ fun LogScreen(vm: MainViewModel) {
     }
     val fresh = if (pinnedTop) 0 else shown.takeWhile { it.seq > seenSeq }.size
 
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         ScreenTitle("Log") {
             TextAction("Clear", color = p.muted) { scope.launch { vm.clearLog() } }
@@ -228,12 +230,12 @@ fun LogScreen(vm: MainViewModel) {
                     visible = fresh > 0,
                     enter = fadeIn(tween(Motion.MEDIUM)) + slideInVertically(tween(Motion.MEDIUM, easing = Motion.Emphasized)) { -it },
                     exit = fadeOut(tween(Motion.SHORT)) + slideOutVertically(tween(Motion.SHORT)) { -it },
-                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp),
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 2.dp),
                 ) {
+                    // The pill is 32 dp tall; the touch area around it is 48 dp.
                     Row(
                         Modifier
                             .clip(RoundedCornerShape(50))
-                            .background(p.accent)
                             .clickable(role = Role.Button) {
                                 scope.launch {
                                     listState.animateScrollToItem(0)
@@ -241,6 +243,9 @@ fun LogScreen(vm: MainViewModel) {
                                     seenSeq = topSeq
                                 }
                             }
+                            .padding(vertical = 8.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(p.accent)
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -251,6 +256,11 @@ fun LogScreen(vm: MainViewModel) {
                 }
             }
         }
+    }
+    // Under Allow / Block from the Log: what changed, with Undo.
+    androidx.compose.material3.SnackbarHost(undoBar, Modifier.align(Alignment.BottomCenter).padding(horizontal = Gutter, vertical = 12.dp)) { d ->
+        androidx.compose.material3.Snackbar(d, containerColor = p.surfaceHigh, contentColor = p.text, actionColor = p.accent, shape = RoundedCornerShape(18.dp))
+    }
     }
 
     if (appDialog) {
@@ -270,7 +280,18 @@ fun LogScreen(vm: MainViewModel) {
     }
 
     selected?.let { r ->
-        Details(r.e, r.types, appName(labels, r.e.uid), vm, onOnlyApp = { app = r.e.uid; selected = null }) { selected = null }
+        Details(
+            r.e, r.types, appName(labels, r.e.uid), vm,
+            onOnlyApp = { app = r.e.uid; selected = null },
+            onRuleAdded = { text ->
+                // Allow and Block act at once; the bar says what changed and takes it back.
+                scope.launch {
+                    undoBar.currentSnackbarData?.dismiss()
+                    val r2 = undoBar.showSnackbar(text, actionLabel = "Undo", duration = androidx.compose.material3.SnackbarDuration.Long)
+                    if (r2 == androidx.compose.material3.SnackbarResult.ActionPerformed) vm.undoAddedRule()
+                }
+            },
+        ) { selected = null }
     }
 }
 
@@ -317,7 +338,8 @@ internal sealed class LogLine(val key: Any) {
 }
 
 /** Blocked, answered, or neither (failed): only lookups of one kind share a row. */
-private fun kind(a: QueryAction) = if (a.blocked) 0 else if (a.answered) 1 else 2
+/** Rows of one kind merge; an AAAA left out by IPv4-only answers keeps a row of its own. */
+private fun kind(a: QueryAction) = if (a.blocked) 0 else if (a == QueryAction.NO_IPV6) 3 else if (a.answered) 1 else 2
 
 /** One app's lookups of one name within 2 seconds and of one kind: its A, AAAA and HTTPS records. */
 private fun sameLookup(a: LogItem, b: LogItem) =
@@ -502,7 +524,7 @@ private fun Empty(title: String, detail: String? = null) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onDismiss: () -> Unit) {
+private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onRuleAdded: (String) -> Unit, onDismiss: () -> Unit) {
     val p = LocalPalette.current
     val ctx = LocalContext.current
     val view = LocalView.current
@@ -530,7 +552,7 @@ private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, o
                 PillButton("Allow ${e.name} on $page", Modifier.fillMaxWidth(), filled = true) {
                     Haptics.confirm(view)
                     vm.addUserRule("@@||${e.name}^\$domain=$page")
-                    Toast.makeText(ctx, "Added to My rules: @@||${e.name}^\$domain=$page", Toast.LENGTH_LONG).show()
+                    onRuleAdded("${e.name} allowed on $page")
                     onDismiss()
                 }
                 Spacer(Modifier.height(10.dp))
@@ -538,7 +560,7 @@ private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, o
                     PillButton("Allow everywhere", Modifier.weight(1f)) {
                         Haptics.confirm(view)
                         vm.addUserRule("@@||${e.name}^")
-                        Toast.makeText(ctx, "${e.name} allowed in every app; its own pages are no longer filtered", Toast.LENGTH_LONG).show()
+                        onRuleAdded("${e.name} allowed everywhere; its pages are no longer filtered")
                         onDismiss()
                     }
                     PillButton("Copy") {
@@ -553,12 +575,14 @@ private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, o
                     PillButton("Allow this domain", Modifier.weight(1f), filled = true) {
                         Haptics.confirm(view)
                         vm.addUserRule("@@||${e.name}^")
+                        onRuleAdded("${e.name} allowed")
                         onDismiss()
                     }
                 } else {
                     PillButton("Block this domain", Modifier.weight(1f), filled = true) {
                         Haptics.confirm(view)
                         vm.addUserRule("||${e.name}^")
+                        onRuleAdded("${e.name} blocked")
                         onDismiss()
                     }
                 }

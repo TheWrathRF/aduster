@@ -18,7 +18,10 @@ object EngineConfig {
      * engine turns it into its own boot-clock deadline, so a wall-clock change does
      * not move the end of a pause.
      */
-    fun json(context: Context, s: Settings, pauseLeftMs: Long): String {
+    fun json(context: Context, s: Settings, pauseLeftMs: Long): String = json(statsFile(context).path, s, pauseLeftMs)
+
+    /** [json] with the stats file's path given (unit tests have no Context). */
+    fun json(statsPath: String, s: Settings, pauseLeftMs: Long): String {
         val now = System.currentTimeMillis()
         return buildJsonObject {
             put("upstream", Upstreams.json(s.upstream, s.customUpstream))
@@ -28,11 +31,12 @@ object EngineConfig {
             put("resolve_uids", s.resolveApps)
             put("cname_check", s.cnameCheck)
             put("optimistic_cache", s.optimisticCache)
+            put("ipv4_only", s.ipv4Only)
             put("cache_size", CACHE_SIZE)
             put("paused_until_ms", if (s.pausedUntil > now) s.pausedUntil else 0L)
             put("pause_left_ms", pauseLeftMs)
             put("tz_offset_s", TimeZone.getDefault().getOffset(now) / 1000)
-            put("stats_path", statsFile(context).path)
+            put("stats_path", statsPath)
         }.toString()
     }
 }

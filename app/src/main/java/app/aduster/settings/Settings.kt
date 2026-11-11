@@ -75,6 +75,8 @@ data class Settings(
     val cnameCheck: Boolean = true,
     val optimisticCache: Boolean = true,
     val blockDnsBypass: Boolean = true,
+    /** AAAA lookups answered with no address, so apps connect over IPv4 only. */
+    val ipv4Only: Boolean = false,
     val pausedUntil: Long = 0,
     val excludedApps: Set<String> = emptySet(),
     /** Per-list on/off overrides of the catalog defaults, keyed by list id. */
@@ -105,7 +107,9 @@ val SettingsJson = Json {
  * What the always-on :core process reads of the settings: a change outside it (the
  * theme, the update schedule, list choices, which the compile job applies) must not make :core
  * re-initialise its engine. Built by blanking the fields :core never reads, so a field added
- * later counts as :core's until someone decides otherwise (the safe side).
+ * later counts as :core's until someone decides otherwise (the safe side). Those fields are
+ * [UI_ONLY_FIELDS]; every other field is named by the import preview (a test holds both lists
+ * to the fields that exist).
  */
 fun Settings.coreKey(): Settings = copy(
     listOverrides = emptyMap(),
@@ -116,6 +120,11 @@ fun Settings.coreKey(): Settings = copy(
     updateWifiOnly = true,
     updateWhileCharging = false,
     theme = ThemeMode.BLACK,
+)
+
+/** The stored names of the fields [coreKey] blanks. */
+val UI_ONLY_FIELDS = setOf(
+    "listOverrides", "customLists", "xiaomiProfile", "autoUpdate", "updateIntervalHours", "updateWifiOnly", "updateWhileCharging", "theme",
 )
 
 /** Custom list ids are path parts of the list files: only the form the app makes. */
@@ -138,6 +147,19 @@ fun Settings.sanitized(): Settings {
     )
     return if (s == this) this else s
 }
+
+/**
+ * Saves a change. When the file cannot be written (a full disk) the change is still returned,
+ * made to [current], so the caller goes on with it in memory (the protection process pausing or
+ * stopping as asked) instead of ending on the exception.
+ */
+suspend fun DataStore<Settings>.updateOrKeep(current: Settings, change: (Settings) -> Settings): Settings =
+    try {
+        updateData(change)
+    } catch (e: java.io.IOException) {
+        android.util.Log.w("Aduster", "settings not saved: $e")
+        change(current)
+    }
 
 private object SettingsSerializer : Serializer<Settings> {
     override val defaultValue = Settings()

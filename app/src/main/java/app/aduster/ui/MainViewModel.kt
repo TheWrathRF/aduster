@@ -36,6 +36,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -59,6 +60,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val client = CoreClient(ctx)
 
     val settings: StateFlow<Settings> = store.data.stateIn(viewModelScope, SharingStarted.Eagerly, Settings())
+
+    /** The stored settings have been read ([settings] holds the placeholder until then). */
+    val settingsRead: StateFlow<Boolean> = store.data.map { true }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /**
      * Polled only while something on screen collects it and the core is bound. Null = not known
@@ -135,6 +139,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---- protection ----
+
+    /** Android did not give the VPN permission to the last Turn on (Home shows why, once). */
+    val vpnRefused = MutableStateFlow(false)
 
     fun start() = AdusterVpnService.start(ctx)
     fun stop() = AdusterVpnService.stop(ctx)
@@ -234,7 +241,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun addUserRule(rule: String) = setUserRules { UserRules.withRule(it, rule) }
+    /** The rules before and after the last rule added from the Log, for its Undo. */
+    @Volatile
+    private var lastAdded: Pair<String, String>? = null
+
+    fun addUserRule(rule: String) = setUserRules { before -> UserRules.withRule(before, rule).also { lastAdded = before to it } }
+
+    /** Takes back the last rule added from the Log, unless the rules changed again since. */
+    fun undoAddedRule() {
+        val (before, after) = lastAdded ?: return
+        lastAdded = null
+        setUserRules { cur -> if (cur == after) before else cur }
+    }
 
     /** Saves the user's rules; the browser part is recompiled into the page filter right away. */
     fun saveUserRules(text: String) = setUserRules { text }
@@ -443,7 +461,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     suspend fun readImport(uri: android.net.Uri): SettingsBackup.Preview? = withContext(Dispatchers.IO) {
         val text = runCatching { ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() } }.getOrNull().orEmpty()
-        SettingsBackup.decode(text, storedSettings(), pages = HttpsConfig.available)
+        val pm = ctx.packageManager
+        SettingsBackup.decode(text, storedSettings(), pages = HttpsConfig.available) { pkg ->
+            runCatching { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
+        }
     }
 
     private val _undoImport = MutableStateFlow(false)

@@ -28,6 +28,7 @@ import app.aduster.https.CaManager
 import app.aduster.https.HttpsConfig
 import app.aduster.settings.Settings
 import app.aduster.settings.SettingsStore
+import app.aduster.settings.updateOrKeep
 import app.aduster.tile.ProtectionTileService
 import app.aduster.ui.MainActivity
 import app.aduster.widget.StatsWidget
@@ -143,10 +144,28 @@ class AdusterVpnService : VpnService() {
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     private val serial = Dispatchers.IO.limitedParallelism(1)
-    private val scope = CoroutineScope(SupervisorJob() + serial)
+    /**
+     * A task that fails (an I/O error not handled where it happened) must not end this process,
+     * which would take protection down with it. It is logged. A start that failed half-way
+     * ([starting]) is taken down like any stop nobody asked for (tunnel, engine, card; the user
+     * is told); any other failure leaves protection as it was.
+     */
+    private val failed: kotlinx.coroutines.CoroutineExceptionHandler = kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+        Log.e(TAG, "protection task failed", e)
+        if (starting) {
+            starting = false
+            scope.launch { stopProtection(userInitiated = false, reason = "an internal error (${e.javaClass.simpleName})") }
+        }
+    }
+    /** A start is under way: set first in [startProtection], cleared only when it returns. */
+    @Volatile
+    private var starting = false
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + serial + failed)
     private val store by lazy { SettingsStore.get(this) }
 
     private var settings = Settings()
+    /** This copy is the released one (a re-signed copy refuses to start protection); asked once. */
+    private val intact by lazy { NativeCore.nativeIntact() }
     /** Settings read and the engine configured (stats, Home's counts): cheap, done at creation. */
     private var engineReady = false
     /** Filter tables installed and loaded: only when protection starts or a check needs them. */
@@ -252,6 +271,7 @@ class AdusterVpnService : VpnService() {
             if (proxyPort > 0) s = withField(s, "https_browsers", browserNames())
             // One binder call for Home and Diagnostics: the running state rides along.
             s = withField(s, "running", "$running")
+            if (!intact) s = withField(s, "intact", "false")
             return withField(withField(s, "private_dns_strict", "${monitor?.privateDnsStrict ?: false}"), "lockdown", "$lockdown")
         }
         override fun log(since: Long, max: Int): String = NativeCore.nativeLog(since, max)
@@ -375,7 +395,7 @@ class AdusterVpnService : VpnService() {
                     } else {
                         // Nothing runs: no "stopped" entry, no core start-up just to stop; only
                         // the wish to stay off is kept.
-                        if (settings.enabled || settings.pausedUntil != 0L) settings = store.updateData { it.copy(enabled = false, pausedUntil = 0) }
+                        if (settings.enabled || settings.pausedUntil != 0L) settings = store.updateOrKeep(settings) { it.copy(enabled = false, pausedUntil = 0) }
                         withContext(Dispatchers.Main) { stopSelf(startId) }
                     }
                 }
@@ -633,8 +653,14 @@ class AdusterVpnService : VpnService() {
         if (!shown || SystemClock.elapsedRealtime() - cardBornAt >= CARD_RENEW_MS) postCard(foreground = false)
     }
 
-    /** [from]: who started it, for the timeline. */
+    /** [from]: who started it, for the timeline. A failure on the way is [failed]'s to clean up. */
     private suspend fun startProtection(from: String) {
+        starting = true
+        startSteps(from)
+        starting = false
+    }
+
+    private suspend fun startSteps(from: String) {
         initialize()
         if (running) {
             reconfigure()
@@ -646,8 +672,11 @@ class AdusterVpnService : VpnService() {
             Notifications.showRevoked(this)
             return
         }
-        if (!NativeCore.nativeIntact()) {
-            stopProtection(userInitiated = false, reason = "this copy of Aduster was modified; install it from its official release")
+        if (!intact) {
+            // Trying again cannot help: the notification does not offer it, and Home says why.
+            val reason = "this copy of Aduster was modified; install it from its official release"
+            stopProtection(userInitiated = false, reason = reason, notify = false)
+            Notifications.showStopped(this, reason, retry = false)
             return
         }
         proxyPort = startProxy(settings)
@@ -667,7 +696,7 @@ class AdusterVpnService : VpnService() {
             PauseAtStart.STILL_PAUSED -> Timeline.add(this, Timeline.PAUSED, "still paused")
             PauseAtStart.ENDED -> {
                 pauseDeadlineBoot = 0
-                settings = store.updateData { it.copy(pausedUntil = 0) }
+                settings = store.updateOrKeep(settings) { it.copy(pausedUntil = 0) }
                 pausedUntil = 0
             }
             PauseAtStart.NONE -> {}
@@ -679,7 +708,7 @@ class AdusterVpnService : VpnService() {
         // a timed pause gets its end-of-pause alarm again.
         showProtectionNotification()
         scheduleResume(pausedUntil)
-        if (!settings.enabled) settings = store.updateData { it.copy(enabled = true) }
+        if (!settings.enabled) settings = store.updateOrKeep(settings) { it.copy(enabled = true) }
         refreshSurfaces()
     }
 
@@ -708,7 +737,8 @@ class AdusterVpnService : VpnService() {
         if (!userInitiated && notify) Notifications.showStopped(this, reason)
         monitor?.stop()
         monitor = null
-        if (running) NativeCore.nativeStop()
+        // Also an engine a failed start left running before it was marked as running.
+        if (running || NativeCore.nativeIsRunning()) NativeCore.nativeStop()
         NativeCore.nativeProxyStop()
         proxyPort = 0
         proxySignature = null
@@ -716,7 +746,7 @@ class AdusterVpnService : VpnService() {
         tunSignature = null
         checkLockdown()
         if (userInitiated && (settings.enabled || settings.pausedUntil != 0L)) {
-            settings = store.updateData { it.copy(enabled = false, pausedUntil = 0) }
+            settings = store.updateOrKeep(settings) { it.copy(enabled = false, pausedUntil = 0) }
             pausedUntil = 0
             pauseDeadlineBoot = 0
             initEngine()
@@ -759,7 +789,7 @@ class AdusterVpnService : VpnService() {
     }
 
     private suspend fun setPause(until: Long) {
-        settings = store.updateData { it.copy(pausedUntil = until) }
+        settings = store.updateOrKeep(settings) { it.copy(pausedUntil = until) }
         pausedUntil = until
         initEngine()
         scheduleResume(until)

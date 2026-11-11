@@ -45,6 +45,25 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 
+/** The two state rows, as words that are true (see `UiLogicTest.diagnosticsStatesSayWhatIsTrue`). */
+internal object DiagnosticsStates {
+    /** Protection: unknown until the core answers, stopped, paused or running. */
+    fun protection(stats: app.aduster.ui.Stats?, paused: Boolean): String = when {
+        stats == null -> "…"
+        !stats.running -> "Stopped"
+        paused -> "Paused"
+        else -> "Running"
+    }
+
+    /** Page filtering: running, or why it does not run while switched on (Home's words), or off. */
+    fun pages(available: Boolean, pagesRunning: Boolean, httpsOn: Boolean, stats: app.aduster.ui.Stats?): String = when {
+        !available -> "Not in this build"
+        pagesRunning -> "Running"
+        httpsOn && stats != null && stats.running -> app.aduster.ui.home.httpsProblem(stats.httpsState)
+        else -> "Off"
+    }
+}
+
 /**
  * What a person needs to tell whether protection works and to report a problem: its state and
  * the system settings that undo it, the resolver and its latency, today's counts, how the
@@ -55,6 +74,7 @@ import kotlinx.serialization.json.longOrNull
 fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
     val p = LocalPalette.current
     val stats by vm.stats.collectAsStateWithLifecycle()
+    val s by vm.settings.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var d by remember { mutableStateOf<JsonObject?>(null) }
@@ -92,7 +112,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
 
             SectionHeading("Protection")
             Group {
-                row { ListRow("State") { ValueText(if (stats == null) "…" else if (running) "Running" else "Stopped") } }
+                row { ListRow("State") { ValueText(DiagnosticsStates.protection(stats, s.isPaused())) } }
                 row { ListRow("Running for") { ValueText(uptime(n("uptime_s"))) } }
                 d?.get("network")?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() }?.let { net ->
                     val domains = list("search_domains")
@@ -132,7 +152,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
             Group {
                 row { ListRow("DNS lookups") { ValueText(fmt(stats?.dnsQueries ?: 0)) } }
                 row { ListRow("DNS lookups blocked") { ValueText(fmt(stats?.dnsBlocked ?: 0)) } }
-                if (HttpsConfig.available) row { ListRow("Requests blocked in pages") { ValueText(fmt(pn("blocked_requests"))) } }
+                if (HttpsConfig.available) row { ListRow("Blocked in browsers") { ValueText(fmt(pn("blocked_requests"))) } }
                 row { ListRow("DNS bypass attempts blocked") { ValueText(fmt(n("rst_sent"))) } }
             }
         } }
@@ -142,13 +162,9 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
             Group {
                 row {
                     ListRow("State") {
-                        ValueText(
-                            when {
-                                !HttpsConfig.available -> "Not in this build"
-                                pagesRunning -> "Running"
-                                else -> "Off"
-                            },
-                        )
+                        // Until the first diagnostics arrive nothing is known: no warning flashes.
+                        val state = if (d == null) "…" else DiagnosticsStates.pages(HttpsConfig.available, pagesRunning, s.httpsFiltering, stats)
+                        ValueText(state, if (state in listOf("…", "Running", "Off", "Not in this build")) p.muted else p.warn)
                     }
                 }
                 px?.get("error")?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() && HttpsConfig.available }?.let {
@@ -257,7 +273,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                         onClick = {
                             scope.launch {
                                 val n = vm.deleteReports()
-                                Toast.makeText(ctx, if (n > 0) "Deleted $n report${if (n == 1) "" else "s"}" else "No saved reports", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(ctx, app.aduster.vpn.Reports.deletedText(n), Toast.LENGTH_LONG).show()
                             }
                         },
                     )
