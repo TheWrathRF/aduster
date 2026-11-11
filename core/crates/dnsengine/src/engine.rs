@@ -309,6 +309,12 @@ fn handle_query<W: TunWrite + 'static>(ctx: &Rc<Ctx<W>>, u: packet::Udp) {
         answer(ctx, &u, &q, uid, resp, Action::Blocked, why, t0);
         return;
     }
+    // IPv4-only answers: an empty answer (no error), so the app asks for and uses the A record.
+    if q.qtype == dns::TYPE_AAAA && q.qclass == dns::CLASS_IN && shared.ipv4_only(&cfg) {
+        let resp = dns::error_response(u.payload, &q, dns::RCODE_NOERROR);
+        answer(ctx, &u, &q, uid, resp, Action::NoIpv6, None, t0);
+        return;
+    }
     // A name an allow rule matched is not CNAME-checked: the user's own allow, and the lists'
     // important allows such as YouTube's, must win over a cloaking block.
     let allowed = hit.class.is_allow();
@@ -944,6 +950,46 @@ mod tests {
         run_loop(shared.clone(), (2..6).map(|i| query_packet(i, &format!("n{i}.test"), 53)).collect(), 4).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(shared.stats.lock().upstream_latency.count(), dial, "the refused queries were counted");
+    }
+
+    /// IPv4-only answers: an allowed name's AAAA lookup is answered at
+    /// once with no address and never asked upstream, its A lookup as usual, a blocked name keeps
+    /// its block answer, and the proxy's own lookups ask for IPv4 only. Off, paused, or on a
+    /// network that cannot reach IPv4, AAAA lookups go upstream as before.
+    #[tokio::test]
+    async fn ipv4_only_answers_aaaa_with_no_address() {
+        fn typed(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+            let mut out = Vec::new();
+            packet::build_udp(CLIENT.parse().unwrap(), RESOLVER.parse().unwrap(), &dns::build_query(id, name, qtype), &mut out);
+            out
+        }
+        let (up, hits) = fake_resolver(0).await;
+        let shared = Shared::new(Config { resolve_uids: false, ipv4_only: true, ..Config::default() });
+        let (lists, _) = matcher::compile(&[Source { name: "l", text: "||ads.test^\n", user: false, allow: false }]);
+        let (user, _) = matcher::compile(&[Source { name: "u", text: "", user: true, allow: false }]);
+        shared.set_filters(Filters { lists: Table::from_bytes(lists).unwrap(), user: Table::from_bytes(user).unwrap() });
+        shared.set_network(vec![up], true, true, 1);
+        let got =
+            run_loop(shared.clone(), vec![typed(1, "a.test", dns::TYPE_AAAA), typed(2, "a.test", dns::TYPE_A), typed(3, "ads.test", dns::TYPE_AAAA)], 3).await;
+        let by_id = |id: u16| got.iter().find(|r| dns::id_of(r) == id).unwrap();
+        assert_eq!(dns::rcode_of(by_id(1)), dns::RCODE_NOERROR);
+        assert!(dns::inspect(by_id(1)).unwrap().addrs.is_empty(), "no IPv6 address");
+        assert_eq!(dns::inspect(by_id(2)).unwrap().addrs, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+        assert_eq!(dns::inspect(by_id(3)).unwrap().addrs, vec!["::".parse::<IpAddr>().unwrap()], "the block answer");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "only the A lookup went upstream");
+        let r = crate::resolve_with(&shared, "b.test", false).await.unwrap();
+        assert!(r.addrs.iter().all(|ip| ip.is_ipv4()), "{:?}", r.addrs);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the proxy asked for A only");
+        assert!(crate::resolve_family(&shared, "b.test", true).await.unwrap().is_empty());
+        // A network without IPv4 (no NAT64 either) keeps its IPv6 answers.
+        shared.set_network(vec![up], false, true, 2);
+        run_loop(shared.clone(), vec![typed(4, "c.test", dns::TYPE_AAAA)], 1).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        // Off: as before.
+        shared.set_network(vec![up], true, true, 3);
+        shared.set_config(Config { resolve_uids: false, ..Config::default() });
+        run_loop(shared.clone(), vec![typed(5, "d.test", dns::TYPE_AAAA)], 1).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
     /// A name an allow rule matches is not blocked for its CNAME chain (user allow and the

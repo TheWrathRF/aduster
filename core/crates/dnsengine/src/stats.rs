@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
 const HISTORY_DAYS: usize = 30;
+/// A day this far back or less is a time-zone move or a small clock change, not a correction.
+const BACK_DAYS: i64 = 2;
 const TOP_LIMIT: usize = 1500;
 const TOP_KEEP: usize = 1000;
 const TOP_REPORT: usize = 50;
@@ -25,6 +27,8 @@ pub enum Action {
     /// Query-log markers (never counted in the stats): filtering was paused / resumed here.
     Paused = 7,
     Resumed = 8,
+    /// An AAAA lookup answered with no address: IPv4-only answers are on.
+    NoIpv6 = 9,
 }
 
 impl Action {
@@ -113,19 +117,36 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Moves today's counts into the history when the day changes. A day up to [`BACK_DAYS`]
+    /// earlier (a time zone to the west, the clock set back a little) keeps counting into
+    /// today, which would otherwise be split. Nothing counted is ever dropped for the clock: a
+    /// day further back (a wrong clock at start, a clock that was ahead) is a day of its own, a
+    /// day already in the history is added to it, and the day the clock comes back to is taken
+    /// out of the history and counted on as today. The history stays in day order and keeps
+    /// its [`HISTORY_DAYS`] latest days.
     pub fn roll_day(&mut self, day: i64) {
-        if self.day == day {
+        if self.day == day || (day < self.day && self.day - day <= BACK_DAYS) {
             return;
         }
         if self.day != 0 && (self.queries > 0 || self.blocked > 0) {
-            self.history.push_back(DayStat { day: self.day, queries: self.queries, blocked: self.blocked });
+            match self.history.iter_mut().find(|d| d.day == self.day) {
+                Some(d) => {
+                    d.queries += self.queries;
+                    d.blocked += self.blocked;
+                }
+                None => {
+                    self.history.push_back(DayStat { day: self.day, queries: self.queries, blocked: self.blocked });
+                    self.history.make_contiguous().sort_by_key(|d| d.day);
+                }
+            }
             while self.history.len() > HISTORY_DAYS {
                 self.history.pop_front();
             }
         }
+        let back = self.history.iter().position(|d| d.day == day).and_then(|i| self.history.remove(i));
         self.day = day;
-        self.queries = 0;
-        self.blocked = 0;
+        self.queries = back.as_ref().map_or(0, |d| d.queries);
+        self.blocked = back.as_ref().map_or(0, |d| d.blocked);
         self.cached = 0;
         self.top_blocked.clear();
         self.top_allowed.clear();
@@ -349,6 +370,55 @@ mod tests {
         s.roll_day(101);
         assert_eq!((s.queries, s.blocked, s.total_queries, s.total_blocked), (0, 0, 2, 1));
         assert_eq!(s.history.back().map(|d| (d.day, d.queries, d.blocked)), Some((100, 2, 1)));
+    }
+
+    /// A day that goes back (a time zone to the west, the clock set back) neither splits today
+    /// nor writes a day into the history twice; a clock that was far ahead leaves no future
+    /// days behind.
+    #[test]
+    fn a_day_that_goes_back_keeps_one_history_entry_per_day() {
+        let mut s = Stats::default();
+        s.roll_day(100);
+        s.add("a.com", 10, Action::Upstream, Some(5));
+        s.roll_day(101);
+        s.add("b.com", 10, Action::Upstream, Some(5));
+        s.roll_day(100);
+        s.add("c.com", 10, Action::Upstream, Some(5));
+        s.roll_day(101);
+        s.roll_day(102);
+        let days: Vec<(i64, u64)> = s.history.iter().map(|d| (d.day, d.queries)).collect();
+        assert_eq!(days, vec![(100, 1), (101, 2)]);
+        // The clock was a year ahead and is put right: nothing counted is lost, and the
+        // made-up day sorts after the real ones.
+        s.add("d.com", 10, Action::Upstream, Some(5));
+        s.roll_day(500);
+        s.add("e.com", 10, Action::Upstream, Some(5));
+        s.roll_day(103);
+        assert_eq!(s.history.iter().map(|d| (d.day, d.queries)).collect::<Vec<_>>(), vec![(100, 1), (101, 2), (102, 1), (500, 1)]);
+        assert_eq!((s.day, s.queries), (103, 0));
+    }
+
+    /// A phone that starts with a wrong clock (years back, before network time) and then gets
+    /// the right time keeps all its history; the day it left and came back to is one entry,
+    /// counted on as today.
+    #[test]
+    fn a_wrong_clock_at_start_loses_no_history() {
+        let mut s = Stats::default();
+        for d in 19970..20000 {
+            s.history.push_back(DayStat { day: d, queries: 10, blocked: 1 });
+        }
+        s.roll_day(20000);
+        s.add("a.com", 10, Action::Upstream, Some(5));
+        s.roll_day(14610);
+        s.add("b.com", 10, Action::Upstream, Some(5));
+        s.roll_day(20000);
+        assert_eq!(s.queries, 1, "today's earlier count came back from the history");
+        s.add("c.com", 10, Action::Upstream, Some(5));
+        s.roll_day(20001);
+        let days: Vec<i64> = s.history.iter().map(|d| d.day).collect();
+        assert_eq!(days.len(), HISTORY_DAYS);
+        assert!(days.contains(&19999) && days.contains(&20000) && !days.contains(&14610), "{days:?}");
+        assert_eq!(s.history.iter().find(|d| d.day == 20000).map(|d| d.queries), Some(2));
     }
 
     /// Hosts blocked mostly inside pages are named as such for the Home screen.

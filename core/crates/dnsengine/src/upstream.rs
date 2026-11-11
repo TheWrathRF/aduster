@@ -75,13 +75,16 @@ impl Upstream {
     }
 
     /// Sends `q` (as received from the client) and returns the response with the client's ID.
-    /// Forgets open encrypted connections (after a network change); the next query re-dials.
+    /// Forgets open encrypted connections (after a network change) and a dial that failed on
+    /// the old network; the next query re-dials.
     pub fn reset_connections(&self) {
-        match self {
-            Upstream::System => {}
-            Upstream::Doh(d) => d.stale.store(true, Ordering::Release),
-            Upstream::Dot(d) => d.stale.store(true, Ordering::Release),
-        }
+        let (stale, dial_failed) = match self {
+            Upstream::System => return,
+            Upstream::Doh(d) => (&d.stale, &d.dial_failed),
+            Upstream::Dot(d) => (&d.stale, &d.dial_failed),
+        };
+        stale.store(true, Ordering::Release);
+        dial_failed.store(0, Ordering::Relaxed);
     }
 
     pub async fn exchange(&self, system: &[SocketAddr], q: &[u8]) -> io::Result<Vec<u8>> {
@@ -995,6 +998,25 @@ mod tests {
             assert!(t.await.unwrap().is_err());
         }
         assert!(t0.elapsed() < Duration::from_secs(8), "took {:?}", t0.elapsed());
+    }
+
+    /// A dial that failed on the old network does not refuse lookups on the new one: after a
+    /// network change the next lookup dials again at once.
+    #[tokio::test]
+    async fn a_network_change_forgets_a_failed_dial() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let local: [IpAddr; 1] = ["127.0.0.1".parse().unwrap()];
+        let doh = Upstream::Doh(Arc::new(Doh::new(&format!("https://dns.test:{port}/dns-query"), &local).unwrap()));
+        let dot = Upstream::Dot(Arc::new(Dot::new("dns.test", port, &local)));
+        let q = dns::build_query(7, "a.test", dns::TYPE_A);
+        for u in [doh, dot] {
+            let first = u.exchange(&[], &q).await.unwrap_err();
+            assert_ne!(first.to_string(), DIAL_FAILED_RECENTLY);
+            assert_eq!(u.exchange(&[], &q).await.unwrap_err().to_string(), DIAL_FAILED_RECENTLY, "{}", u.describe());
+            u.reset_connections();
+            let after = u.exchange(&[], &q).await.unwrap_err();
+            assert_ne!(after.to_string(), DIAL_FAILED_RECENTLY, "{}: refused without a dial after the reset", u.describe());
+        }
     }
 
     /// A first resolver address that swallows the SYN costs a quarter second, not the

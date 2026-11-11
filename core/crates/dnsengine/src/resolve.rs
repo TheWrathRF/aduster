@@ -45,9 +45,10 @@ pub async fn resolve_with(shared: &Arc<Shared>, host: &str, fresh: bool) -> io::
         return Ok(Resolved { addrs: vec![ip], cached: false, cnames: Vec::new(), ttl: None, age_ms: 0, stale: false });
     }
     let name = host.trim_end_matches('.').to_ascii_lowercase();
-    // Only ask for families the network can use: a v4-only Wi-Fi never needs AAAA.
+    // Only ask for families the network can use: a v4-only Wi-Fi never needs AAAA; nor does
+    // anyone while IPv4-only answers are on.
     let v4 = shared.has_v4.load(Ordering::Relaxed);
-    let v6 = shared.has_v6.load(Ordering::Relaxed);
+    let v6 = shared.has_v6.load(Ordering::Relaxed) && !shared.ipv4_only(&shared.config.load());
     let family = |qtype: u16| {
         let (s, n) = (shared.clone(), name.clone());
         let abandoned = Arc::new(AtomicBool::new(false));
@@ -99,6 +100,9 @@ pub async fn resolve_with(shared: &Arc<Shared>, host: &str, fresh: bool) -> io::
 /// as its own task (as [`resolve_with`]'s): the caller is dropped when its connect wins, and a
 /// lookup leading the upstream query would take every app joined to it down with it.
 pub async fn resolve_family(shared: &Arc<Shared>, host: &str, v6: bool) -> io::Result<Vec<IpAddr>> {
+    if v6 && shared.ipv4_only(&shared.config.load()) {
+        return Ok(Vec::new());
+    }
     let name = host.trim_end_matches('.').to_ascii_lowercase();
     let qtype = if v6 { dns::TYPE_AAAA } else { dns::TYPE_A };
     let s = shared.clone();

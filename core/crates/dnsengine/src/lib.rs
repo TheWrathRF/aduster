@@ -49,6 +49,8 @@ pub struct Config {
     /// Block responses whose CNAME chain points at a blocked domain (CNAME cloaking).
     pub cname_check: bool,
     pub optimistic_cache: bool,
+    /// AAAA lookups answered with no address, so apps connect over IPv4 (see [`Shared::ipv4_only`]).
+    pub ipv4_only: bool,
     pub cache_size: usize,
     /// Filtering is off until this unix-ms time (pause without any timer). For display and the
     /// log markers; the decision uses [`Config::pause_until_boot`].
@@ -94,6 +96,7 @@ impl Default for Config {
             resolve_uids: true,
             cname_check: true,
             optimistic_cache: true,
+            ipv4_only: false,
             cache_size: 4096,
             paused_until_ms: 0,
             pause_left_ms: None,
@@ -322,9 +325,8 @@ impl Shared {
     }
 
     /// A stable key for the current network: its kind ("Wi-Fi", "Mobile data"), its search
-    /// domains and its set of resolvers. What is learned about one network (which hosts a
-    /// censorship box on it cuts) is kept apart from the others, also across restarts (so not the
-    /// per-boot network handle).
+    /// domains and its set of resolvers. What is learned about one network is kept apart from
+    /// the others, also across restarts (so not the per-boot network handle).
     pub fn network_key(&self) -> u64 {
         let mut servers: Vec<std::net::IpAddr> = self.system_servers.load().iter().map(|s| s.ip()).collect();
         servers.sort();
@@ -612,6 +614,13 @@ impl Shared {
     /// Not paused, or the pause ran out (boot clock: sleep counts, wall-clock changes do not).
     pub fn filtering_active(&self, cfg: &Config) -> bool {
         cfg.pause_until_boot == 0 || clock::boot_ms() >= cfg.pause_until_boot
+    }
+
+    /// AAAA lookups get no address now: the switch is on, filtering is not paused, and the
+    /// network reaches IPv4 (directly or through NAT64), so leaving IPv6 out never leaves an app
+    /// without an address.
+    pub fn ipv4_only(&self, cfg: &Config) -> bool {
+        cfg.ipv4_only && self.has_v4.load(Ordering::Relaxed) && self.filtering_active(cfg)
     }
 
     pub fn lookup_uid(&self, proto: u8, src: SocketAddr, dst: SocketAddr) -> i32 {
@@ -915,7 +924,17 @@ fn write_atomic(path: &str, bytes: &[u8], seq: u64) {
     }
     *last = seq;
     let tmp = format!("{path}.{}.tmp", N.fetch_add(1, Ordering::Relaxed));
-    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+    // On disk before the rename: a power cut right after it must not leave an empty file in
+    // place of the history. A write that fails half-way (a full disk) leaves no temp file.
+    let written = (|| {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
