@@ -14,7 +14,7 @@ body:
     attributes:
       label: Aduster version
       description: Settings › About › Version.
-      placeholder: 1.0.1
+      placeholder: 1.1.0
     validations:
       required: true
   - type: input

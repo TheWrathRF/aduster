@@ -1,12 +1,12 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/media/hero-dark.png">
-    <img src=".github/media/hero-light.png" alt="Aduster. Your phone, unsponsored. Blocks ads and trackers in every app and on web pages; all filtering runs on your phone. 98% accuracy, 58% less browser CPU time. Two screens of the app: Home, showing Protected, and the Log." width="100%">
+    <img src=".github/media/hero-light.png" alt="Aduster. Your phone, unsponsored. Blocks ads and trackers in every app and on web pages; all filtering runs on your phone. No root, no account. 58% less browser CPU time. Two screens of the app: Home, showing Protected, and the Log." width="100%">
   </picture>
 </p>
 
 <p align="center">
-  <a href="https://github.com/TheWrathRF/aduster/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/media/download-dark.png"><img src=".github/media/download-light.png" alt="Download for Android, v1.0.1" height="48"></picture></a>&nbsp;
+  <a href="https://github.com/TheWrathRF/aduster/releases/latest"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/media/download-dark.png"><img src=".github/media/download-light.png" alt="Download for Android, v1.1.0" height="48"></picture></a>&nbsp;
   <a href="https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22app.aduster%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2FTheWrathRF%2Faduster%22%2C%22author%22%3A%22TheWrathRF%22%2C%22name%22%3A%22Aduster%22%7D"><picture><source media="(prefers-color-scheme: dark)" srcset=".github/media/obtainium-dark.png"><img src=".github/media/obtainium-light.png" alt="Get updates with Obtainium" height="48"></picture></a>
 </p>
 
@@ -21,18 +21,17 @@ Aduster blocks ads and trackers for every app on an Android phone, and in Chromi
 also removes them from web pages before they appear. Everything runs on the phone: there is no
 Aduster server or account, and no root is needed.
 
-## The test
+## What it blocks
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/media/test-dark.png">
-  <img src=".github/media/test-light.png" alt="adblock.turtlecute.org in a browser with Aduster on: 129 of 132 blocked. All 128 ad and tracker domains blocked and the page's static ad hidden. The other three checks are an ad the page inserts with its own script and two ad scripts served by the test site itself; only rules written for that one site can catch them." width="100%">
-</picture>
+| Blocked | Left alone |
+|---|---|
+| Ad and tracker servers, in every app | Banking and payment sites |
+| Trackers hidden behind a site's own domain | Sign-in, government and CAPTCHA pages |
+| Ads and cookie notices inside web pages | Devices on your local network |
+| Apps that try to bypass the filter with their own DNS | Apps and sites you choose to exclude |
 
-This is [adblock.turtlecute.org](https://adblock.turtlecute.org/), a public ad block test, run
-on 29 October 2026 in a Chromium browser on an Android 16 emulator with Aduster's default lists.
-With page filtering off, the same test scores 128 of 132: every domain is still blocked by DNS,
-and the four checks inside the page fail. Open the test on your phone with Aduster on to see
-your own result.
+Want to see it for yourself? Open a public ad block test such as
+[adblock.turtlecute.org](https://adblock.turtlecute.org/) on your phone with Aduster on.
 
 ## Every app
 
@@ -89,9 +88,9 @@ Measured on one test phone in October 2026; other phones and lists will differ. 
 eight pages took the browser 128.8&nbsp;s of CPU time without Aduster and 53.6&nbsp;s with it,
 and its background CPU time fell from 4.9&nbsp;s to 0.9&nbsp;s. With filtering always on,
 Aduster's share of the phone's battery use was 0.36% and it used 0.2&nbsp;s of CPU time per five
-idle minutes; it sets no
-timers, alarms or wakelocks, so it never wakes a sleeping phone. The rule count is that of the default
-lists on 29 October 2026.
+idle minutes. It sets no wake-up alarms and holds no wakelocks, so it never wakes a sleeping
+phone; list updates run as one daily system job. The rule count is that of the default lists on
+29 October 2026.
 
 ## Screens
 
@@ -104,7 +103,7 @@ lists on 29 October 2026.
 
 Android 13 or later, on a 64-bit ARM (arm64) phone.
 
-1. Download `aduster-1.0.1.apk` from the [latest release](https://github.com/TheWrathRF/aduster/releases/latest)
+1. Download `aduster-1.1.0.apk` from the [latest release](https://github.com/TheWrathRF/aduster/releases/latest)
    and open it on the phone. Allow installing from your browser or file manager when asked. If
    Play Protect warns about an app that is not from the Play Store, choose **Install anyway**.
 2. Open Aduster and tap **Turn on**. Android asks to allow a VPN connection: Aduster uses
@@ -123,9 +122,9 @@ apps from their GitHub releases, with the button at the top of this page.
 Compare the APK's SHA-256 with the `.sha256` file next to it on the release page:
 
 ```sh
-sha256sum aduster-1.0.1.apk                  # Linux
-shasum -a 256 aduster-1.0.1.apk              # macOS
-certutil -hashfile aduster-1.0.1.apk SHA256  # Windows
+sha256sum aduster-1.1.0.apk                  # Linux
+shasum -a 256 aduster-1.1.0.apk              # macOS
+certutil -hashfile aduster-1.1.0.apk SHA256  # Windows
 ```
 
 </details>
