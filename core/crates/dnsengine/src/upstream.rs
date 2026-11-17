@@ -606,7 +606,9 @@ impl Doh {
                 Ok::<_, io::Error>(b.to_vec())
             };
             match tokio::time::timeout(TLS_TIMEOUT, attempt).await {
-                Ok(Ok(r)) if !answers(&msg, &r) => last = io::Error::new(ErrorKind::InvalidData, "doh answer to another question"),
+                // The server's own answer, just not to this question: asking again would get the
+                // same, so neither a retry nor a new connection.
+                Ok(Ok(r)) if !answers(&msg, &r) => return Err(io::Error::new(ErrorKind::InvalidData, "doh answer to another question")),
                 Ok(Ok(mut r)) => {
                     dns::set_id(&mut r, orig);
                     return Ok(r);
@@ -772,7 +774,8 @@ impl Dot {
                 continue;
             }
             match tokio::time::timeout(TLS_TIMEOUT, rx).await {
-                Ok(Ok(r)) if !answers(&msg[2..], &r) => last = io::Error::new(ErrorKind::InvalidData, "dot answer to another question"),
+                // As for DoH: not asked again, the connection kept.
+                Ok(Ok(r)) if !answers(&msg[2..], &r) => return Err(io::Error::new(ErrorKind::InvalidData, "dot answer to another question")),
                 Ok(Ok(mut r)) => {
                     dns::set_id(&mut r, orig);
                     return Ok(r);
@@ -1227,22 +1230,25 @@ mod tests {
     /// was read whole, however large.
     #[tokio::test]
     async fn encrypted_answers_must_answer_the_question() {
-        use std::sync::atomic::AtomicU8;
-        // 0: another name, 1: no QR bit, 2: 70,000 bytes, 3: a proper answer.
+        use std::sync::atomic::{AtomicU8, AtomicUsize};
+        // 0: another name, 1: no QR bit, 2: 70,000 bytes, 3: a proper answer, 4: a format error
+        // without the question (12 bytes).
         let mode = Arc::new(AtomicU8::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
         let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", b"h2").await;
         let port = l.local_addr().unwrap().port();
-        let m = mode.clone();
+        let (m, n) = (mode.clone(), asked.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((s, _)) = l.accept().await else { return };
-                let (a, m) = (acceptor.clone(), m.clone());
+                let (a, m, n) = (acceptor.clone(), m.clone(), n.clone());
                 tokio::spawn(async move {
                     let Ok(t) = a.accept(s).await else { return };
                     let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let m = m.clone();
+                        let (m, n) = (m.clone(), n.clone());
                         async move {
                             let mut r = req.into_body().collect().await?.to_bytes().to_vec();
+                            n.fetch_add(1, Ordering::SeqCst);
                             match m.load(Ordering::SeqCst) {
                                 0 => {
                                     r[2] |= 0x80;
@@ -1252,6 +1258,12 @@ mod tests {
                                 2 => {
                                     r[2] |= 0x80;
                                     r.resize(70_000, 0);
+                                }
+                                4 => {
+                                    r.truncate(12);
+                                    r[2] |= 0x80;
+                                    r[3] = (r[3] & 0xf0) | 1;
+                                    r[4..12].fill(0);
                                 }
                                 _ => r[2] |= 0x80,
                             }
@@ -1267,30 +1279,44 @@ mod tests {
         let mut doh = Doh::new(&format!("https://127.0.0.1:{port}/dns-query"), &[]).unwrap();
         doh.connector = connector;
         let doh = Arc::new(doh);
-        for (m, what) in [(0, "an answer to another name"), (1, "a message without QR"), (2, "a 70,000-byte body")] {
+        // A wrong answer is the server's answer, not a broken connection: asked once, the
+        // connection kept (asking again would get the same answer at the cost of a new dial).
+        for (m, what) in [(0, "an answer to another name"), (1, "a message without QR"), (4, "a format error without the question")] {
             mode.store(m, Ordering::SeqCst);
+            let before = asked.load(Ordering::SeqCst);
             assert!(doh.exchange(&dns::build_query(0x5151, "q.test", dns::TYPE_A)).await.is_err(), "DoH took {what}");
+            assert_eq!(asked.load(Ordering::SeqCst) - before, 1, "DoH asked again after {what}");
         }
+        assert_eq!(doh.dials.load(Ordering::Relaxed), 1, "DoH dialled again after a wrong answer");
+        mode.store(2, Ordering::SeqCst);
+        assert!(doh.exchange(&dns::build_query(0x5151, "q.test", dns::TYPE_A)).await.is_err(), "DoH took a 70,000-byte body");
         mode.store(3, Ordering::SeqCst);
         doh.exchange(&dns::build_query(0x5151, "q.test", dns::TYPE_A)).await.expect("a proper answer");
 
-        // DoT: the server answers another name.
+        // DoT: the server answers another name, then properly; one query each, one connection.
         let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", b"dot").await;
         let port = l.local_addr().unwrap().port();
+        let wrong = Arc::new(AtomicU8::new(1));
+        let (dot_asked, conns) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (w, n, c) = (wrong.clone(), dot_asked.clone(), conns.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((s, _)) = l.accept().await else { return };
-                let a = acceptor.clone();
+                let (a, w, n) = (acceptor.clone(), w.clone(), n.clone());
+                c.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let Ok(mut t) = a.accept(s).await else { return };
-                    while let Ok(n) = t.read_u16().await {
-                        let mut m = vec![0u8; n as usize];
+                    while let Ok(len) = t.read_u16().await {
+                        let mut m = vec![0u8; len as usize];
                         if t.read_exact(&mut m).await.is_err() {
                             return;
                         }
+                        n.fetch_add(1, Ordering::SeqCst);
                         m[2] |= 0x80;
-                        m[13] ^= 0x01;
-                        let mut out = n.to_be_bytes().to_vec();
+                        if w.load(Ordering::SeqCst) == 1 {
+                            m[13] ^= 0x01;
+                        }
+                        let mut out = len.to_be_bytes().to_vec();
                         out.extend_from_slice(&m);
                         let _ = t.write_all(&out).await;
                     }
@@ -1299,7 +1325,12 @@ mod tests {
         });
         let mut dot = Dot::new("127.0.0.1", port, &[]);
         dot.connector = connector;
-        assert!(Arc::new(dot).exchange(&dns::build_query(0x5152, "q.test", dns::TYPE_A)).await.is_err(), "DoT took an answer to another name");
+        let dot = Arc::new(dot);
+        assert!(dot.exchange(&dns::build_query(0x5152, "q.test", dns::TYPE_A)).await.is_err(), "DoT took an answer to another name");
+        assert_eq!(dot_asked.load(Ordering::SeqCst), 1, "DoT asked again after an answer to another name");
+        wrong.store(0, Ordering::SeqCst);
+        dot.exchange(&dns::build_query(0x5152, "q.test", dns::TYPE_A)).await.expect("DoT answers on after a wrong answer");
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "DoT dialled again after a wrong answer");
     }
 
     /// A DoT connection replaced by a new one (network change, a silent connection) is closed,
