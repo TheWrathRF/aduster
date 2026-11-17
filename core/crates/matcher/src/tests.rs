@@ -213,3 +213,17 @@ fn url_exception_lines_are_not_dns_rules() {
     let f = filters(&[("l", "||www.google.com^")], line);
     assert!(f.check("www.google.com").blocked());
 }
+
+/// A corrupted table whose header promises more entries than the file holds is a format error,
+/// never an allocation that aborts the process at every start.
+#[test]
+fn a_header_with_huge_counts_is_a_format_error() {
+    for (regex_n, src_n) in [(u32::MAX, 0), (0, u32::MAX), (u32::MAX, u32::MAX)] {
+        let mut b = vec![0u8; table::HEADER];
+        b[0..4].copy_from_slice(table::MAGIC);
+        b[4..8].copy_from_slice(&table::VERSION.to_le_bytes());
+        b[12..16].copy_from_slice(&regex_n.to_le_bytes());
+        b[16..20].copy_from_slice(&src_n.to_le_bytes());
+        assert!(matches!(Table::from_bytes(b), Err(TableError::Format(_))), "{regex_n} {src_n}");
+    }
+}

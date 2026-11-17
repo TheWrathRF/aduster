@@ -144,8 +144,10 @@ impl Table {
             return Err(TableError::Format("truncated hash section"));
         }
 
-        let mut regex_meta = Vec::with_capacity(regex_n);
-        let mut regex_patterns = Vec::with_capacity(regex_n);
+        // Capacities from the header only as far as the bytes left can hold such entries (7 and
+        // 2 bytes at least): a corrupted count is then a format error below, not an abort here.
+        let mut regex_meta = Vec::with_capacity(regex_n.min((b.len() - off) / 7));
+        let mut regex_patterns = Vec::with_capacity(regex_n.min((b.len() - off) / 7));
         for _ in 0..regex_n {
             if off + 7 > b.len() {
                 return Err(TableError::Format("truncated regex section"));
@@ -159,7 +161,7 @@ impl Table {
             regex_meta.push((class, src));
             off += len;
         }
-        let mut sources = Vec::with_capacity(src_n);
+        let mut sources = Vec::with_capacity(src_n.min((b.len() - off) / 2));
         for _ in 0..src_n {
             if off + 2 > b.len() {
                 return Err(TableError::Format("truncated sources"));
