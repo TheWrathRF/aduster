@@ -72,7 +72,7 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
     val s by vm.settings.collectAsStateWithLifecycle()
     var installed by remember { mutableStateOf<Boolean?>(null) }
     var fingerprint by remember { mutableStateOf<String?>(null) }
-    var keyUnreadable by remember { mutableStateOf(false) }
+    var needsNew by remember { mutableStateOf(false) }
     var savedAs by remember { mutableStateOf<String?>(null) }
     var recreateDialog by remember { mutableStateOf(false) }
     // Null until the stored list is read: the editor never starts from placeholder settings,
@@ -90,7 +90,7 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
             val was = installed
             installed = withContext(Dispatchers.IO) { vm.caInstalled() }
             fingerprint = withContext(Dispatchers.IO) { vm.caFingerprint() }
-            keyUnreadable = withContext(Dispatchers.IO) { vm.caKeyUnreadable() }
+            needsNew = withContext(Dispatchers.IO) { vm.caNeedsNew() }
             savedAs = withContext(Dispatchers.IO) { vm.caSavedName() }
             // Just installed: the core re-checks at once instead of trusting its cached "no".
             if (installed == true && was != true) vm.notifyCore()
@@ -149,9 +149,9 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
                 )
             }
             // The old certificate is never replaced silently; only this explicit action does it.
-            if (keyUnreadable) {
+            if (needsNew) {
                 Spacer(Modifier.height(12.dp))
-                Text("This certificate can no longer be read. Create a new one and install it.", style = Type.small, color = p.warn)
+                Text("This certificate can no longer be used. Create a new one and install it.", style = Type.small, color = p.warn)
                 Spacer(Modifier.height(12.dp))
                 PillButton("Create a new certificate", Modifier.fillMaxWidth()) { recreateDialog = true }
             }
@@ -246,8 +246,12 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
                 recreateDialog = false
                 scope.launch {
                     val name = vm.recreateCa()
+                    // The new certificate is not installed yet: say so, and let the protection
+                    // process see the new one at once.
+                    installed = withContext(Dispatchers.IO) { vm.caInstalled() }
+                    vm.notifyCore()
                     fingerprint = withContext(Dispatchers.IO) { vm.caFingerprint() }
-                    keyUnreadable = withContext(Dispatchers.IO) { vm.caKeyUnreadable() }
+                    needsNew = withContext(Dispatchers.IO) { vm.caNeedsNew() }
                     if (name != null) savedAs = name
                     Toast.makeText(ctx, if (name != null) "New certificate saved as Downloads/$name" else "Could not create it", Toast.LENGTH_LONG).show()
                 }

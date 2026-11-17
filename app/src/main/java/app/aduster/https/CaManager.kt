@@ -55,7 +55,7 @@ object CaManager {
      * The CA, created on first use. An existing certificate is never replaced here, even when
      * its key cannot be read (Keystore error, a device-to-device transfer): the user installed
      * that certificate, and a silent new one would leave browsers trusting the wrong one. Null
-     * then; [keyUnreadable] says why and [recreate] is the explicit way out.
+     * then; [needsNew] says so and [recreate] is the explicit way out.
      */
     @Synchronized
     fun ensure(ctx: Context): Ca? {
@@ -64,8 +64,21 @@ object CaManager {
         return generate(ctx)
     }
 
-    /** A certificate exists but its private key cannot be decrypted. */
-    fun keyUnreadable(ctx: Context): Boolean = certFile(ctx).exists() && load(ctx) == null
+    /**
+     * A certificate exists that cannot be used: its private key cannot be decrypted, or the key
+     * is not the certificate's own (a write cut short). Only a new pair helps ([recreate]).
+     */
+    fun needsNew(ctx: Context): Boolean = certFile(ctx).exists() && needsNew(true, load(ctx))
+
+    internal fun needsNew(certExists: Boolean, ca: Ca?): Boolean = certExists && (ca == null || !keyMatches(ca))
+
+    /**
+     * A remembered answer of the trust store for the certificate whose fingerprint is [current]:
+     * null when it was read for another certificate (a new one is not trusted until installed)
+     * or there is none.
+     */
+    fun rememberedTrust(remembered: Pair<String, Boolean>?, current: String?): Boolean? =
+        remembered?.takeIf { current != null && it.first == current }?.second
 
     /** The user asked for a new certificate: the old files go, a new pair is made. */
     @Synchronized
@@ -81,11 +94,23 @@ object CaManager {
         val o = runCatching { Json.parseToJsonElement(NativeCore.nativeGenerateCa()).jsonObject }.getOrNull() ?: return null
         val cert = o["cert"]?.jsonPrimitive?.content ?: return null
         val key = o["key"]?.jsonPrimitive?.content ?: return null
-        // Key first: a certificate is only ever on disk with its key next to it.
-        keyFile(ctx).writeBytes(encrypt(key.encodeToByteArray()))
-        certFile(ctx).writeText(cert)
+        // Key first: a certificate is only ever on disk with its key next to it. Each file whole
+        // or not at all; a kill between the two leaves a pair that does not match, which
+        // [needsNew] sees.
+        writeWhole(keyFile(ctx), encrypt(key.encodeToByteArray()))
+        writeWhole(certFile(ctx), cert.encodeToByteArray())
         cachedCert = null
         return Ca(cert, key)
+    }
+
+    /** [bytes] as [f]'s new content, through a synced temporary file renamed over it. */
+    internal fun writeWhole(f: File, bytes: ByteArray) {
+        val tmp = File(f.parentFile, f.name + ".tmp")
+        tmp.outputStream().use {
+            it.write(bytes)
+            it.fd.sync()
+        }
+        java.nio.file.Files.move(tmp.toPath(), f.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
     }
 
     /** The certificate and its private key, read together from disk; the caller must not keep the key. */

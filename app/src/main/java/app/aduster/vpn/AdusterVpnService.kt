@@ -187,8 +187,11 @@ class AdusterVpnService : VpnService() {
     private var proxyPort = 0
     /** What the running proxy was started with; unchanged config means no native call. */
     private var proxySignature: String? = null
-    /** Whether our CA is trusted; null = not checked yet. Invalidated by trust-store changes. */
-    private var caTrusted: Boolean? = null
+    /**
+     * Whether our CA is trusted, with the fingerprint of the certificate it was read for (a new
+     * certificate is read again); null = not checked yet. Invalidated by trust-store changes.
+     */
+    private var caTrusted: Pair<String, Boolean>? = null
     private var caCheckedAt = 0L
     /** "Block connections without VPN" is on for us (see [Notifications.showLockdown]). */
     @Volatile
@@ -249,7 +252,7 @@ class AdusterVpnService : VpnService() {
                     if (settings.httpsFiltering && running && SystemClock.elapsedRealtime() - caCheckedAt > CERT_RECHECK_MS) {
                         scope.launch {
                             caCheckedAt = SystemClock.elapsedRealtime()
-                            if (CaManager.stillInstalled(this@AdusterVpnService) != caTrusted) {
+                            if (CaManager.stillInstalled(this@AdusterVpnService) != caTrusted?.second) {
                                 caTrusted = null
                                 reconfigure()
                             }
@@ -548,8 +551,9 @@ class AdusterVpnService : VpnService() {
     private fun startProxy(s: Settings): Int {
         val enabled = s.httpsFiltering && HttpsConfig.available
         val uids = if (enabled) HttpsConfig.browsers(this).map { it.uid } else emptyList()
-        val trusted = enabled && (caTrusted ?: CaManager.isInstalled(this).also {
-            caTrusted = it
+        val fingerprint = if (enabled) CaManager.fingerprint(this) else null
+        val trusted = enabled && (CaManager.rememberedTrust(caTrusted, fingerprint) ?: CaManager.isInstalled(this).also {
+            caTrusted = fingerprint?.let { f -> f to it }
             caCheckedAt = SystemClock.elapsedRealtime()
         })
         // Every failure goes through the same stop: a proxy left running with an old config
@@ -823,7 +827,7 @@ class AdusterVpnService : VpnService() {
         initEngine()
         // The user may just have installed the certificate: a cached "not trusted" is checked
         // again on every settings change while it is false (cheap).
-        if (caTrusted == false && settings.httpsFiltering) caTrusted = null
+        if (caTrusted?.second == false && settings.httpsFiltering) caTrusted = null
         // List changes are compiled by a job in the main process, which then sends
         // FILTERS_CHANGED; compiling here (hundreds of thousands of lines) would hold this
         // process's memory and its command queue (Pause/Resume) for seconds. The user's rules

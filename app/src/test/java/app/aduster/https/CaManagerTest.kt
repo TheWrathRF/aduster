@@ -2,11 +2,12 @@ package app.aduster.https
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.KeyStoreException
 
-/** The trust check's answer when the system's CA store fails for a moment. */
+/** The certificate: the trust check, what it is remembered for, and its files. */
 class CaManagerTest {
     /**
      * An error reading the store keeps the last known answer: read as "not trusted", it would
@@ -19,6 +20,44 @@ class CaManagerTest {
         assertTrue("an error after trusted", CaManager.trustState(busy))
         assertFalse(CaManager.trustState { false })
         assertFalse("an error after not trusted", CaManager.trustState(busy))
+    }
+
+    /**
+     * A remembered "trusted" holds for the certificate it was read for: a new certificate (made
+     * after the old key became unreadable, not installed yet) is looked up in the store again,
+     * so page filtering never starts with a certificate the browsers do not trust.
+     */
+    @Test
+    fun trustIsRememberedPerCertificate() {
+        assertNull(CaManager.rememberedTrust(null, "AA:01"))
+        assertEquals(true, CaManager.rememberedTrust("AA:01" to true, "AA:01"))
+        assertEquals(false, CaManager.rememberedTrust("AA:01" to false, "AA:01"))
+        assertNull("another certificate", CaManager.rememberedTrust("AA:01" to true, "BB:02"))
+        assertNull("no certificate", CaManager.rememberedTrust("AA:01" to true, null))
+    }
+
+    /** A certificate whose key cannot be read, or whose key is not its own, offers a new one. */
+    @Test
+    fun aBrokenPairOffersANewCertificate() {
+        assertFalse("nothing made yet", CaManager.needsNew(certExists = false, ca = null))
+        assertTrue("the key cannot be read", CaManager.needsNew(certExists = true, ca = null))
+        val cut = CaManager.Ca("a certificate cut off mid-write", "a key")
+        assertTrue("a pair that does not match", CaManager.needsNew(certExists = true, ca = cut))
+    }
+
+    /** A file is replaced whole or not at all: a kill mid-write leaves the old one. */
+    @Test
+    fun filesAreReplacedWhole() {
+        val dir = java.nio.file.Files.createTempDirectory("ca-test").toFile()
+        try {
+            val f = java.io.File(dir, "ca.pem")
+            f.writeText("old")
+            CaManager.writeWhole(f, "new".encodeToByteArray())
+            assertEquals("new", f.readText())
+            assertEquals(listOf("ca.pem"), dir.list()!!.toList())
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     /** The whole SHA-256, as Android's certificate details show it, so the two can be compared. */

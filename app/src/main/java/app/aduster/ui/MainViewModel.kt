@@ -214,12 +214,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun caFingerprint(): String? = CaManager.fingerprint(ctx)
 
-    fun caKeyUnreadable(): Boolean = CaManager.keyUnreadable(ctx)
+    fun caNeedsNew(): Boolean = CaManager.needsNew(ctx)
 
     /** The name the certificate was last saved under in Downloads, or null. */
     fun caSavedName(): String? = CaManager.lastSavedName(ctx)
 
-    /** The user asked for a new certificate (the old key is unreadable); saved to Downloads. */
+    /** The user asked for a new certificate (the old one cannot be used); saved to Downloads. */
     suspend fun recreateCa(): String? = withContext(Dispatchers.IO) {
         runCatching { if (CaManager.recreate(ctx) == null) null else CaManager.exportToDownloads(ctx)?.let { CaManager.savedName(ctx, it) } }.getOrNull()
     }
