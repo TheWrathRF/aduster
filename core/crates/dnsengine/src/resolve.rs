@@ -1,5 +1,5 @@
 //! Hostname resolution for the HTTPS filter, through the same upstream and cache as the tunnel
-//! (so a DoH/DoT choice also applies to Chrome, and answers are shared both ways).
+//! (so a DoH/DoT choice also applies to the filtered browsers, and answers are shared both ways).
 //!
 //! Apps behind the proxy never send DNS themselves, so this path must keep its own answers
 //! fresh: an expired (stale) answer is used at once and refreshed in the background, the same
@@ -157,6 +157,9 @@ async fn both_families(a: Option<Pending>, aaaa: Option<Pending>) -> Vec<Family>
 /// [`Resolved::stale`]). `abandoned`: nobody waits for it any
 /// more, so a failure is counted, not recorded.
 async fn lookup(shared: &Arc<Shared>, name: &str, qtype: u16, fresh: bool, abandoned: &AtomicBool) -> io::Result<(Vec<u8>, bool, Option<u32>, u64, bool)> {
+    if !dns::askable(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a DNS name"));
+    }
     let key = Key { name: name.into(), qtype, qclass: dns::CLASS_IN, do_bit: false };
     if !fresh {
         let optimistic = shared.config.load().optimistic_cache;
@@ -369,6 +372,41 @@ mod tests {
         let r = resolve_with(&shared, "example.com", true).await.unwrap();
         assert!(r.cached && r.addrs == a);
         assert!(shared.health_json(10)["counts"]["dns_stale_served"].as_u64().unwrap() >= 1);
+    }
+
+    /// A name with a label longer than 63 bytes (or longer than 253 in all) is no DNS name: it
+    /// is refused, not asked as the name cut at 63 bytes (whose answer was cached under the
+    /// long one).
+    #[tokio::test]
+    async fn names_that_cannot_be_asked_are_refused() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, from) = server.recv_from(&mut buf).await.unwrap();
+                h.fetch_add(1, Ordering::SeqCst);
+                let q = dns::parse_query(&buf[..n]).unwrap();
+                let mut r = dns::blocked_response(&buf[..n], &q, dns::BlockMode::NullIp, 60);
+                let l = r.len();
+                let at = if q.edns { l - 11 - 4 } else { l - 4 };
+                r[at..at + 4].copy_from_slice(&[1, 2, 3, 4]);
+                server.send_to(&r, from).await.unwrap();
+            }
+        });
+        let shared = Shared::new(Config::default());
+        shared.set_network(vec![addr], true, false, 1);
+        let long_label = format!("{}.example.com", "a".repeat(64));
+        let long_name = format!("{}example.com", "abcdefghi.".repeat(25));
+        for name in [&long_label, &long_name] {
+            assert!(resolve_with(&shared, name, false).await.is_err(), "{name}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing asked");
+        let ok = format!("{}.example.com", "a".repeat(63));
+        assert!(resolve_with(&shared, &ok, false).await.is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     /// On an IPv6-only network without NAT64 (no IPv4 at all), the proxy's lookups ask AAAA

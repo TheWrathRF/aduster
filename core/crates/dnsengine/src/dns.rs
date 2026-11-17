@@ -268,6 +268,13 @@ pub fn rcode_of(b: &[u8]) -> u8 {
 }
 
 /// A/AAAA question for the proxy's own lookups.
+/// Whether `name` can be asked as it is: labels of at most 63 bytes, at most 253 in all
+/// ([`build_query`] would cut a longer label and ask another name).
+pub fn askable(name: &str) -> bool {
+    let name = name.trim_end_matches('.');
+    !name.is_empty() && name.len() <= 253 && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+}
+
 pub fn build_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len() + 18 + 11);
     out.extend_from_slice(&id.to_be_bytes());

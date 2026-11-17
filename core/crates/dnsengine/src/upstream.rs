@@ -291,6 +291,15 @@ fn short_user_timeout(_s: &TcpStream) {
     }
 }
 
+/// The longest DNS message (RFC 1035 over TCP, RFC 8484).
+const MAX_MESSAGE: usize = 65_535;
+
+/// Whether `r` is an answer (QR set) to the question of `q`, as UDP and TCP answers are checked
+/// (DoH and DoT answers used to be taken as they came).
+fn answers(q: &[u8], r: &[u8]) -> bool {
+    r.len() >= 12 && r[2] & 0x80 != 0 && same_question(q, r)
+}
+
 fn same_question(q: &[u8], r: &[u8]) -> bool {
     // Compare the question section (name, type, class), case-insensitively.
     let Some(end) = question_end(q) else { return false };
@@ -577,7 +586,7 @@ impl Doh {
         let orig = dns::id_of(q);
         let mut msg = q.to_vec();
         dns::set_id(&mut msg, 0); // RFC 8484: ID 0 keeps HTTP caches effective
-        let body = Bytes::from(msg);
+        let body = Bytes::from(msg.clone());
         let mut last = io::Error::other("doh failed");
         for _ in 0..2 {
             let (n, mut s) = self.sender().await?;
@@ -591,15 +600,17 @@ impl Doh {
                 if resp.status() != hyper::StatusCode::OK {
                     return Err(io::Error::other(format!("doh status {}", resp.status())));
                 }
-                let b = resp.into_body().collect().await.map_err(|e| io::Error::other(e.to_string()))?.to_bytes();
+                // No DNS message is longer (the body was read whole, however large).
+                let body = http_body_util::Limited::new(resp.into_body(), MAX_MESSAGE);
+                let b = body.collect().await.map_err(|e| io::Error::other(e.to_string()))?.to_bytes();
                 Ok::<_, io::Error>(b.to_vec())
             };
             match tokio::time::timeout(TLS_TIMEOUT, attempt).await {
-                Ok(Ok(mut r)) if r.len() >= 12 => {
+                Ok(Ok(r)) if !answers(&msg, &r) => last = io::Error::new(ErrorKind::InvalidData, "doh answer to another question"),
+                Ok(Ok(mut r)) => {
                     dns::set_id(&mut r, orig);
                     return Ok(r);
                 }
-                Ok(Ok(_)) => last = io::Error::new(ErrorKind::InvalidData, "short doh response"),
                 Ok(Err(e)) => last = e,
                 Err(_) => last = io::Error::new(ErrorKind::TimedOut, "doh timeout"),
             }
@@ -761,6 +772,7 @@ impl Dot {
                 continue;
             }
             match tokio::time::timeout(TLS_TIMEOUT, rx).await {
+                Ok(Ok(r)) if !answers(&msg[2..], &r) => last = io::Error::new(ErrorKind::InvalidData, "dot answer to another question"),
                 Ok(Ok(mut r)) => {
                     dns::set_id(&mut r, orig);
                     return Ok(r);
@@ -1207,6 +1219,87 @@ mod tests {
             let r = Arc::new(dot).exchange(&dns::build_query(0x6007, "v6.test", dns::TYPE_AAAA)).await.unwrap_or_else(|e| panic!("{host}: {e}"));
             assert_eq!(dns::id_of(&r), 0x6007);
         }
+    }
+
+    /// An encrypted resolver's answer is used only when it is an answer (QR set) to the question
+    /// asked and fits a DNS message (64 KB): as plain DNS over UDP and TCP already required. A
+    /// broken resolver's answer to another name was cached under the asked one, and a DoH body
+    /// was read whole, however large.
+    #[tokio::test]
+    async fn encrypted_answers_must_answer_the_question() {
+        use std::sync::atomic::AtomicU8;
+        // 0: another name, 1: no QR bit, 2: 70,000 bytes, 3: a proper answer.
+        let mode = Arc::new(AtomicU8::new(0));
+        let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", b"h2").await;
+        let port = l.local_addr().unwrap().port();
+        let m = mode.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                let (a, m) = (acceptor.clone(), m.clone());
+                tokio::spawn(async move {
+                    let Ok(t) = a.accept(s).await else { return };
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let m = m.clone();
+                        async move {
+                            let mut r = req.into_body().collect().await?.to_bytes().to_vec();
+                            match m.load(Ordering::SeqCst) {
+                                0 => {
+                                    r[2] |= 0x80;
+                                    r[13] ^= 0x01;
+                                }
+                                1 => {}
+                                2 => {
+                                    r[2] |= 0x80;
+                                    r.resize(70_000, 0);
+                                }
+                                _ => r[2] |= 0x80,
+                            }
+                            Ok::<_, hyper::Error>(
+                                hyper::Response::builder().header("content-type", "application/dns-message").body(Full::new(Bytes::from(r))).unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(t), svc).await;
+                });
+            }
+        });
+        let mut doh = Doh::new(&format!("https://127.0.0.1:{port}/dns-query"), &[]).unwrap();
+        doh.connector = connector;
+        let doh = Arc::new(doh);
+        for (m, what) in [(0, "an answer to another name"), (1, "a message without QR"), (2, "a 70,000-byte body")] {
+            mode.store(m, Ordering::SeqCst);
+            assert!(doh.exchange(&dns::build_query(0x5151, "q.test", dns::TYPE_A)).await.is_err(), "DoH took {what}");
+        }
+        mode.store(3, Ordering::SeqCst);
+        doh.exchange(&dns::build_query(0x5151, "q.test", dns::TYPE_A)).await.expect("a proper answer");
+
+        // DoT: the server answers another name.
+        let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", b"dot").await;
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut t) = a.accept(s).await else { return };
+                    while let Ok(n) = t.read_u16().await {
+                        let mut m = vec![0u8; n as usize];
+                        if t.read_exact(&mut m).await.is_err() {
+                            return;
+                        }
+                        m[2] |= 0x80;
+                        m[13] ^= 0x01;
+                        let mut out = n.to_be_bytes().to_vec();
+                        out.extend_from_slice(&m);
+                        let _ = t.write_all(&out).await;
+                    }
+                });
+            }
+        });
+        let mut dot = Dot::new("127.0.0.1", port, &[]);
+        dot.connector = connector;
+        assert!(Arc::new(dot).exchange(&dns::build_query(0x5152, "q.test", dns::TYPE_A)).await.is_err(), "DoT took an answer to another name");
     }
 
     /// A DoT connection replaced by a new one (network change, a silent connection) is closed,
