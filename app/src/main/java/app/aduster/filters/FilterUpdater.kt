@@ -28,7 +28,7 @@ object FilterUpdater {
      * Bumped whenever the native page-filter compiler changes what it produces, so an app
      * update rebuilds the engine even when no list changed.
      */
-    private const val WEB_FORMAT = 8
+    private const val WEB_FORMAT = 9
     private val INCLUDE = Regex("""^!#include\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*$""")
 
     /** [dnsCompiled]/[webCompiled]: which engines were rebuilt (and need reloading). */
