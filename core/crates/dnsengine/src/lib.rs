@@ -642,7 +642,7 @@ impl Shared {
         self.record_with(name, qtype, uid, action, rule, latency_us, None, None, true);
     }
 
-    /// A request blocked inside a Chrome page: to `host`, from a page of `page`, at `path`.
+    /// A request blocked inside a browser's page: to `host`, from a page of `page`, at `path`.
     pub fn record_request(&self, host: &str, uid: i32, rule: (String, String), page: &str, path: &str) {
         self.record_with(host, 0, uid, Action::Filtered, Some(rule), 0, Some(page), Some(path), false);
     }
@@ -662,7 +662,7 @@ impl Shared {
     ) {
         let cfg = self.config.load();
         self.resume_if_ran_out(&cfg);
-        // The proxy's records (Chrome's connections and in-page blocks) carry no DNS type.
+        // The proxy's records (browsers' connections and in-page blocks) carry no DNS type.
         let proxy_record = qtype == 0;
         let persist = {
             let mut s = self.stats.lock();
@@ -670,7 +670,7 @@ impl Shared {
             s.add_from(name, uid, action, (!proxy_record).then_some(latency_us), waited);
             self.persist_due()
         };
-        // The proxy's records are logged once per host, kind and minute (otherwise Chrome alone
+        // The proxy's records are logged once per host, kind and minute (otherwise one browser alone
         // pushes every other app's lines out of the log within minutes); the counts above stay
         // exact.
         if proxy_record {

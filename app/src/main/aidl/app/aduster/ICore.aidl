@@ -9,7 +9,7 @@ interface ICore {
     String logAfter(long since, int max);
     /** When this :core process started (elapsed realtime): a change means it restarted. */
     long startedAt();
-    /** How Chrome's connections to `host` are handled right now and why (for "Check a site"). */
+    /** How browsers' connections to `host` are handled right now and why (for "Check a site"). */
     String explainHost(String host);
     String diagnostics();
     String checkDomain(String name);

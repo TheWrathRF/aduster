@@ -261,7 +261,7 @@ extern "system" fn native_init(mut env: JNIEnv, _: JClass, config: JString) -> j
         let mut g = SHARED.lock();
         match g.as_ref() {
             Some(s) => {
-                // A pause that ends: Chrome connections opened during it are closed. Decided by
+                // A pause that ends: browser connections opened during it are closed. Decided by
                 // the config, not the clock: the end-of-pause alarm runs after the pause ran
                 // out, when a clock check already says "active".
                 let pause_ends = s.config.load().paused_until_ms != 0 && cfg.paused_until_ms == 0;
@@ -506,7 +506,7 @@ extern "system" fn native_log_after(mut env: JNIEnv, _: JClass, since: jlong, ma
     to_jstring(&mut env, &r)
 }
 
-/// How Chrome's connections to `host` are handled right now and why ("Check a site").
+/// How browsers' connections to `host` are handled right now and why ("Check a site").
 extern "system" fn native_explain_host(mut env: JNIEnv, _: JClass, host: JString) -> jni::sys::jstring {
     let h = jstr(&mut env, &host);
     let r = guard("explain", "{}".to_string(), || proxy::explain_host(&h));

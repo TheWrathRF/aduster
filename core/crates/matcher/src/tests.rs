@@ -205,7 +205,7 @@ fn real_lists() {
 }
 
 /// The URL exception for Google's AI Overview request is no DNS rule (it goes to
-/// Chrome's page filter, `UserRules.analyze`), and must never allow www.google.* for every app.
+/// the browsers' page filter, `UserRules.analyze`), and must never allow www.google.* for every app.
 #[test]
 fn url_exception_lines_are_not_dns_rules() {
     let line = "@@://www.google.*/async/folsrch?*&async=_basejs:*,_basecomb:*&q=$xhr";

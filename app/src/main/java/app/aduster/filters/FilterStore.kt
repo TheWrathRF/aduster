@@ -63,7 +63,7 @@ class FilterStore(context: Context) {
     val dnsTable = File(dir, "dns.admx")
     /** Serialized page-filtering engine for the browsers' page filter. */
     val webTable = File(dir, "web.dat")
-    /** The page engine's side table (exception hosts, HTML filters, regex cosmetics). */
+    /** The page engine's second file, which the DNS digest reads. */
     val webExtra = File(dir, "web.extra")
     /** uBlock Origin's scriptlets and redirect files, bundled in the APK. */
     val uboResources = File(builtinDir, "ubo-resources.json")

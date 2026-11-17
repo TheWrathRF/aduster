@@ -22,7 +22,7 @@ pub enum Action {
     BlockedCname = 3,
     Failed = 4,
     Stale = 5,
-    /// A request inside a page, blocked by the Chrome filter.
+    /// A request inside a page, blocked by the browsers' page filter.
     Filtered = 6,
     /// Query-log markers (never counted in the stats): filtering was paused / resumed here.
     Paused = 7,
@@ -97,12 +97,12 @@ pub struct Stats {
     pub history: VecDeque<DayStat>,
     pub top_blocked: HashMap<String, u64>,
     pub top_allowed: HashMap<String, u64>,
-    /// Of the blocked counts, those of requests a page rule stopped inside Chrome's pages (the
+    /// Of the blocked counts, those of requests a page rule stopped inside browsers' pages (the
     /// host itself is not blocked, only some of its addresses): the Home screen says so.
     #[serde(default)]
     pub top_in_pages: HashMap<String, u64>,
     /// Today's DNS lookups and DNS blocks alone: `queries`/`blocked` also count
-    /// Chrome's connections and in-page blocks, so their ratio mixes units.
+    /// browsers' connections and in-page blocks, so their ratio mixes units.
     #[serde(default)]
     pub dns_queries: u64,
     #[serde(default)]
@@ -157,7 +157,7 @@ impl Stats {
         self.dirty = true;
     }
 
-    /// `dns`: the latency of a DNS answer; None for the proxy's records (Chrome's connections and
+    /// `dns`: the latency of a DNS answer; None for the proxy's records (browsers' connections and
     /// page blocks): counted, but kept out of the DNS counts and the latency histograms, which
     /// would otherwise show zeros instead of the resolver's real speed.
     pub fn add(&mut self, name: &str, uid: i32, action: Action, dns: Option<u32>) {

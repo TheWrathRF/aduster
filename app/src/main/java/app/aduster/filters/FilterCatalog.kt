@@ -133,7 +133,7 @@ object FilterCatalog {
      * lists); AdGuard's full builds carry them in AdGuard syntax: 2,212 over our lists on
      * 2026-10-05, 1,399 of them in the cookie list, mostly pressing "reject" on consent platforms
      * (one reason a page can look cleaner under AdGuard). Each full build below is downloaded with
-     * its list and contributes only those rules, converted to uBO syntax by the page compiler.
+     * its list and contributes only those rules to the page filter.
      * Only lists with 30 or more such rules (Mobile, Tracking, Russian and Widgets have 3-15: not
      * worth a second download; Tracking's full build is 11 MB). Not shown as lists of their own.
      */

@@ -501,8 +501,8 @@ class AdusterVpnService : VpnService() {
 
     /**
      * Loads the compiled engines that changed: the DNS table (with the user's rules) and/or the
-     * page engine. Reloading the page engine for a DNS-only update would cost a 14 MB rebuild
-     * in memory for nothing.
+     * page engine. Reloading the page engine for a DNS-only update would rebuild it in memory
+     * for nothing.
      */
     private fun loadFilters(dns: Boolean, web: Boolean) {
         val store = FilterStore(this)

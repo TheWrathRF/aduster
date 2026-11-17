@@ -547,7 +547,7 @@ private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, o
             val page = e.page
             if (e.action == QueryAction.FILTERED && page != null) {
                 // Allowing a page request must not unfilter a whole site. The first action
-                // allows this host only on pages of that site (a Chrome rule); the second is
+                // allows this host only on pages of that site (a page rule); the second is
                 // the plain "everywhere" rule, explained.
                 PillButton("Allow ${e.name} on $page", Modifier.fillMaxWidth(), filled = true) {
                     Haptics.confirm(view)

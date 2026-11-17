@@ -333,9 +333,8 @@ object FilterUpdater {
         } + "|user=" + userWeb.hashCode() + "|format=$WEB_FORMAT"
         // Of the DNS table, the engine only depends on which hosts named by page-list exceptions
         // it blocks (native side): other DNS list updates leave the engine, and with it every
-        // cached page's revalidation marker, alone. Working that out reads and parses the
-        // engine's side table (~2 s of CPU on a test phone), so it is redone only when that file
-        // or the DNS table changed.
+        // cached page's revalidation marker, alone. Working that out takes ~2 s of CPU on a test
+        // phone, so it is redone only when the page engine's files or the DNS table changed.
         fun digestKey() = "${sig(store.webExtra)}|${sig(store.dnsTable)}"
         fun dnsDigest(): String {
             val key = digestKey()

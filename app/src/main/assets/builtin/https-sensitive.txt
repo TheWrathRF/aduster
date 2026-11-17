@@ -33,7 +33,7 @@ lastpass.com
 dashlane.com
 keepersecurity.com
 proton.me
-! Bot checks and CAPTCHAs: they judge the browser by its own TLS, so they must talk to Chrome
+! Bot checks and CAPTCHAs: they judge the browser by its own TLS, so they must talk to the browser
 ! directly (Cloudflare Turnstile, reCAPTCHA, hCaptcha, DataDome, Arkose).
 ! reCAPTCHA is served mostly from www.google.com/recaptcha and www.gstatic.com/recaptcha, which
 ! a host list cannot exclude without leaving Google unfiltered; recaptcha.net covers only its

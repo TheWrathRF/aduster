@@ -268,7 +268,7 @@ class UiLogicTest {
 
     /**
      * A shared settings file that sends every lookup to its own server, turns Block DNS bypass off
-     * and leaves Chrome out says so before it is applied; comment lines
+     * and leaves a browser out says so before it is applied; comment lines
      * are not counted as rules.
      */
     @Test

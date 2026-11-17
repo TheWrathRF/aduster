@@ -133,7 +133,7 @@ fun RulesScreen(vm: MainViewModel, onBack: () -> Unit) {
             }
         }
     }
-    // Leaving the app (Home, switching to Chrome) saves too: the rules apply at once, and an
+    // Leaving the app (Home, switching to a browser) saves too: the rules apply at once, and an
     // ended UI process loses nothing.
     LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
         if (latestDirty && activity?.isChangingConfigurations != true) vm.saveUserRules(latestText.trimEnd())

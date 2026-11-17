@@ -70,7 +70,7 @@ pub fn parse_line(raw: &str) -> Line {
                 // `$all` means every request type, which is what blocking the name does.
                 // (`$popup` and `$document` are not: they block only pages opened from or at the
                 // host, so at DNS level they would block the host for every app. Such rules
-                // are left to Chrome's page filter.)
+                // are left to the browsers' page filter.)
                 "all" => {}
                 "" => {}
                 _ => return Line::Unsupported("modifier not applicable at DNS level"),

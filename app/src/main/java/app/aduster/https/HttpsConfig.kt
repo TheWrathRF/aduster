@@ -32,8 +32,8 @@ object HttpsConfig {
     /**
      * The apps that open `https://` links of any site (a browsable view of a plain web address):
      * every browser, with no list of package names. Only their connections can be filtered, and
-     * the page engine decrypts only a Chromium handshake among them; every other app's traffic
-     * is tunnelled untouched. Custom Tabs run inside the browser's own app, so they are covered.
+     * only the Chromium browsers among them are; every other app's traffic is tunnelled
+     * untouched. Custom Tabs run inside the browser's own app, so they are covered.
      * Kept until [forgetBrowsers] (an app installed, removed or changed).
      */
     fun browsers(ctx: Context): List<Browser> = browsers ?: run {

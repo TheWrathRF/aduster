@@ -29,7 +29,7 @@ body:
     attributes:
       label: Browser and its version
       description: If the problem is in a browser.
-      placeholder: Chrome 141
+      placeholder: Name and version, from the browser's About page
   - type: dropdown
     id: pages
     attributes:

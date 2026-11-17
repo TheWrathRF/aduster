@@ -28,7 +28,7 @@ const UID_WAIT: Duration = Duration::from_millis(3);
 /// An answer from upstream waits at most this long for a UID asked when its query came.
 const UID_WAIT_UPSTREAM: Duration = Duration::from_millis(500);
 /// At most this many distinct names asked upstream at once; beyond, SERVFAIL at once (a
-/// burst of unique names would hold a socket each, from the budget every Chrome connection shares).
+/// burst of unique names would hold a socket each, from the budget every browser connection shares).
 const MAX_INFLIGHT: usize = 512;
 
 /// The app behind a query: known, or being looked up on the blocking pool.

@@ -28,16 +28,16 @@ pub enum Kind {
     NetworkChanged,
     /// A site answered with a bot check; it is left undecrypted for a while.
     ChallengeBypass,
-    /// Chrome's connection was handed to the real server undecrypted (certificate rejected, or
+    /// A browser's connection was handed to the real server undecrypted (certificate rejected, or
     /// the server refused the filtered handshake). The detail says why.
     Passthrough,
-    /// A public name resolved only to local addresses and Chrome's connection was refused
+    /// A public name resolved only to local addresses and a browser's connection was refused
     /// (DNS rebinding).
     RebindBlocked,
     /// A stretch without a usable network: one event for the whole stretch (updated when it
     /// ends: `ms` is its length, the detail how many connections and lookups failed in it).
     NetworkLost,
-    /// A site answered with a bot check that was let through to Chrome untouched (a first one:
+    /// A site answered with a bot check that was let through to the browser untouched (a first one:
     /// it may clear through the filter).
     ChallengePassed,
     /// A consent window came back after its "reject" was pressed twice in 10 minutes (its
