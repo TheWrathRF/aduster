@@ -1,9 +1,12 @@
 package app.aduster.filters
 
 import app.aduster.https.HttpsConfig
+import app.aduster.settings.BlockMode
+import app.aduster.settings.CustomList
 import app.aduster.settings.DeviceProfile
 import app.aduster.settings.Settings
 import app.aduster.settings.SettingsBackup
+import app.aduster.settings.ThemeMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -83,6 +86,48 @@ class GlobalDefaultsTest {
         // A bare settings object without the export marker, with the Off profile.
         val bare = SettingsBackup.decode("""{"xiaomiProfile":"off","userRules":"||ads.example^"}""", Settings())
         assertEquals(DeviceProfile.OFF, bare!!.settings.deviceProfile)
+    }
+
+    @Test
+    fun aFileFromAnOlderVersionKeepsEveryChoice() {
+        // Every field an older version wrote (no IPv4-only switch yet), each away from today's default.
+        val old = """{"format":"aduster-settings","version":1,"settings":{
+            "enabled":true,"upstream":"custom","customUpstream":"https://dns.example/dns-query",
+            "blockMode":"nxdomain","blockedTtl":300,"logEnabled":false,"logSize":5000,"resolveApps":false,
+            "cnameCheck":false,"optimisticCache":false,"blockDnsBypass":false,"pausedUntil":1700000000000,
+            "excludedApps":["com.example.bank","com.example.game"],
+            "listOverrides":{"adguard-russian":true,"adguard-german":false,"adguard-searchads":true,"a-removed-list":true},
+            "customLists":[{"id":"custom-0a1b2c3d","name":"Mine","url":"https://lists.example/mine.txt","web":true}],
+            "userRules":"! a note\n@@||search.example^\n||ads.example^",
+            "xiaomiProfile":"safe","autoUpdate":false,"updateIntervalHours":12,"updateWifiOnly":false,
+            "updateWhileCharging":true,"httpsFiltering":true,"httpsExclusions":"pay.example\nbank.example","theme":"light"}}"""
+        val expected = Settings(
+            enabled = true, upstream = "custom", customUpstream = "https://dns.example/dns-query",
+            blockMode = BlockMode.NXDOMAIN, blockedTtl = 300, logEnabled = false, logSize = 5000, resolveApps = false,
+            cnameCheck = false, optimisticCache = false, blockDnsBypass = false, pausedUntil = 1700000000000,
+            excludedApps = setOf("com.example.bank", "com.example.game"),
+            listOverrides = mapOf("adguard-russian" to true, "adguard-german" to false, "adguard-searchads" to true, "a-removed-list" to true),
+            customLists = listOf(CustomList("custom-0a1b2c3d", "Mine", "https://lists.example/mine.txt", web = true)),
+            userRules = "! a note\n@@||search.example^\n||ads.example^",
+            deviceProfile = DeviceProfile.SAFE, autoUpdate = false, updateIntervalHours = 12, updateWifiOnly = false,
+            updateWhileCharging = true, httpsFiltering = true, httpsExclusions = "pay.example\nbank.example", theme = ThemeMode.LIGHT,
+        )
+        val imported = SettingsBackup.decode(old, Settings())
+        assertNotNull(imported)
+        val s = imported!!.settings
+        assertEquals(expected, s)
+        assertFalse(s.ipv4Only)
+        // List switches set by hand win over the phone's languages, both ways.
+        val xiaomi = Device(listOf("de", "en"), "Xiaomi")
+        val web = webOn(s, xiaomi)
+        assertTrue("adguard-russian" in web)
+        assertFalse("adguard-german" in web)
+        assertTrue("adguard-searchads" in web)
+        assertTrue("custom-0a1b2c3d" in web)
+        assertEquals(DeviceProfile.SAFE, FilterCatalog.deviceProfile(s, xiaomi))
+        assertTrue(FilterCatalog.XIAOMI_LIST in dnsOn(s, xiaomi))
+        // Exported again by this version, it reads back the same.
+        assertEquals(s, SettingsBackup.decode(SettingsBackup.encode(s), Settings())!!.settings)
     }
 
     @Test

@@ -446,14 +446,19 @@ impl Shared {
     /// answers one of its search-domain names with a public address: that could be its forgery
     /// of a public name, so the encrypted resolver's answer wins unless it has none. Local
     /// addresses, no addresses and private reverse names stay the network's.
-    pub async fn upstream_exchange(&self, q: &[u8]) -> std::io::Result<Vec<u8>> {
-        // An answer that came, but after more than a second, is recorded: the resolver's p99 is
-        // tens of ms, so such a wait is worth a trace.
+    ///
+    /// `waited`, asked once the answer came: whether anyone waited for it (not a background
+    /// refresh, nor a lookup its caller gave up on).
+    pub async fn upstream_exchange(&self, q: &[u8], waited: impl Fn() -> bool) -> std::io::Result<Vec<u8>> {
+        // An answer someone waited for that came after more than a second is recorded: the
+        // resolver's p99 is tens of ms, so such a wait is worth a trace. Slow refreshes nobody
+        // waited for would only push real events out of the recorder.
         let t0 = std::time::Instant::now();
         let r = self.upstream_exchange_inner(q).await;
         let ms = t0.elapsed().as_millis();
         if r.is_ok()
             && ms > 1000
+            && waited()
             && let Some(p) = dns::parse_query(q)
         {
             self.event(health::Kind::DnsSlow, &p.name, ms.min(u32::MAX as u128) as u32, "answer came late");

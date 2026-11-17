@@ -37,7 +37,9 @@ struct Entry {
     local: bool,
     /// Names the answer went through (CNAME chain), checked for cloaking on every hit.
     cnames: Option<Arc<[Box<str>]>>,
-    /// Learned on another network: served as expired (refreshed on use) whatever its age.
+    /// Learned on another network and not yet asked on this one: a miss (see `mark_stale`).
+    moved: bool,
+    /// Served as expired whatever its age: a moved answer this network failed to replace.
     expired: bool,
 }
 
@@ -127,7 +129,9 @@ impl Cache {
         // change and can be served on an upstream failure.
         let local = info.rcode != dns::RCODE_NOERROR || info.answers == 0 || info.addrs.iter().any(is_local);
         let cnames = (!info.cnames.is_empty()).then(|| info.cnames.iter().map(|c| c.as_str().into()).collect());
-        self.lru.put(key, Entry { resp: stored, ttl_offsets: info.ttl_offsets.clone(), stored: crate::clock::boot_ms(), ttl, local, cnames, expired: false });
+        let entry =
+            Entry { resp: stored, ttl_offsets: info.ttl_offsets.clone(), stored: crate::clock::boot_ms(), ttl, local, cnames, moved: false, expired: false };
+        self.lru.put(key, entry);
         true
     }
 
@@ -153,10 +157,13 @@ impl Cache {
 
     /// After a network change: the public answers kept by [`Cache::evict_local`] were learned on
     /// the previous network (a campus name answered with its public address at home is reached
-    /// through its private one on campus). They are marked expired: still answered at once, and
-    /// refreshed in the background on their next use (one lookup per name actually used).
+    /// through its private one on campus; a CDN may hand each network nodes only its customers
+    /// reach). They are marked as moved: the next lookup of each asks the new network and waits
+    /// for it (one lookup per name actually used, as many as before), and they stay only as the
+    /// answer for when that lookup fails ([`Cache::get_stale_any`]).
     pub fn mark_stale(&mut self) {
         for (_, e) in self.lru.iter_mut() {
+            e.moved = true;
             e.expired = true;
         }
     }
@@ -164,11 +171,6 @@ impl Cache {
     /// The TTL an entry was stored with (not its remaining time): what its resolver meant.
     pub fn ttl_of(&self, key: &Key) -> Option<u32> {
         self.lru.peek(key).map(|e| e.ttl)
-    }
-
-    /// Whether the entry was learned on another network (see `mark_stale`).
-    pub fn moved_of(&self, key: &Key) -> bool {
-        self.lru.peek(key).is_some_and(|e| e.expired)
     }
 
     /// How long ago (boot-clock ms) the entry was stored; `now`: boot-clock milliseconds.
@@ -179,6 +181,9 @@ impl Cache {
     /// `now`: boot-clock milliseconds.
     pub fn get(&mut self, key: &Key, id: u16, optimistic: bool, now: u64) -> Lookup {
         let Some(e) = self.lru.get(key) else { return Lookup::Miss };
+        if e.moved {
+            return Lookup::Miss;
+        }
         let age = Duration::from_millis(now.saturating_sub(e.stored));
         let age_s = age.as_secs() as u32;
         if age_s < e.ttl && !e.expired {
@@ -191,14 +196,18 @@ impl Cache {
         Lookup::Miss
     }
 
-    /// Any stored positive answer younger than `max_age`, for when the upstream fails.
-    /// Negative and network-local answers are not served this way.
-    pub fn get_stale_any(&mut self, key: &Key, id: u16, max_age: Duration, now: u64) -> Option<Vec<u8>> {
-        let e = self.lru.peek(key)?;
+    /// Any stored positive answer younger than `max_age`, for when the upstream fails, with its
+    /// CNAME chain (checked for cloaking like every other cached answer). Negative and
+    /// network-local answers are not served this way. A moved answer served so is from then on
+    /// an expired one (served at once, refreshed on use): a network whose resolver fails costs
+    /// one wait per name, not one per lookup.
+    pub fn get_stale_any(&mut self, key: &Key, id: u16, max_age: Duration, now: u64) -> Option<(Vec<u8>, Cnames)> {
+        let e = self.lru.peek_mut(key)?;
         if e.local || Duration::from_millis(now.saturating_sub(e.stored)) > max_age {
             return None;
         }
-        Some(render(e, id, |_| STALE_TTL))
+        e.moved = false;
+        Some((render(e, id, |_| STALE_TTL), e.cnames.clone()))
     }
 }
 
@@ -252,7 +261,7 @@ mod tests {
 
         assert!(matches!(c.get(&key(), 5, false, at(Duration::from_secs(200))), Lookup::Miss));
         // Still there as a failure fallback, until it is a day old.
-        let s = c.get_stale_any(&key(), 9, FAILURE_STALE_MAX, at(Duration::from_secs(200))).unwrap();
+        let (s, _) = c.get_stale_any(&key(), 9, FAILURE_STALE_MAX, at(Duration::from_secs(200))).unwrap();
         assert_eq!((id_of(&s), inspect(&s).unwrap().ttl), (9, Some(STALE_TTL)));
         assert!(c.get_stale_any(&key(), 9, FAILURE_STALE_MAX, at(FAILURE_STALE_MAX + Duration::from_secs(1))).is_none());
     }
@@ -279,19 +288,28 @@ mod tests {
         assert!(matches!(c.get(&k2, 1, true, crate::clock::boot_ms()), Lookup::Miss));
     }
 
-    /// Public answers kept across a network change are served stale (refreshed on use), and
-    /// keep the TTL their resolver gave.
+    /// Public answers kept across a network change are asked again on their next use, even with
+    /// optimistic answers on; they stay as the answer for a failed lookup, with the TTL their
+    /// resolver gave.
     #[test]
-    fn network_change_marks_public_answers_stale() {
+    fn network_change_asks_public_answers_again() {
         let mut c = Cache::new(16);
         let r = response(300);
         assert!(c.insert(key(), &r, &inspect(&r).unwrap()));
         let now = crate::clock::boot_ms();
         assert!(matches!(c.get(&key(), 1, true, now), Lookup::Fresh(..)));
         c.mark_stale();
-        assert!(matches!(c.get(&key(), 1, true, now), Lookup::Stale(..)));
-        assert!(matches!(c.get(&key(), 1, false, now), Lookup::Miss), "without optimistic answers: asked again");
+        assert!(matches!(c.get(&key(), 1, true, now), Lookup::Miss), "the new network is asked first");
+        assert!(matches!(c.get(&key(), 1, false, now), Lookup::Miss));
         assert_eq!(c.ttl_of(&key()), Some(300));
+        assert!(c.get_stale_any(&key(), 1, FAILURE_STALE_MAX, now).is_some(), "still there for a failed lookup");
+        // Served once because this network failed: from then on an expired answer (at once,
+        // refreshed on use), not one more wait per lookup.
+        assert!(matches!(c.get(&key(), 1, true, now), Lookup::Stale(..)));
+        assert!(matches!(c.get(&key(), 1, false, now), Lookup::Miss));
+        // Answered again on the new network: served from the cache as usual.
+        assert!(c.insert(key(), &r, &inspect(&r).unwrap()));
+        assert!(matches!(c.get(&key(), 1, true, now), Lookup::Fresh(..)));
     }
 
     /// Hits carry the CNAME chain, so cloaking is checked on cached answers too.

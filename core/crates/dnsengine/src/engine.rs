@@ -22,11 +22,10 @@ use tokio::sync::Notify;
 
 /// Largest DNS payload we put into one packet (TUN MTU is 9000).
 const MAX_PAYLOAD: usize = 8900;
-/// How long an answer waits for its app's UID (a binder call, run on the blocking pool so that
-/// queries never queue behind it on the DNS thread) before it goes without one.
-const UID_WAIT: Duration = Duration::from_millis(3);
-/// An answer from upstream waits at most this long for a UID asked when its query came.
-const UID_WAIT_UPSTREAM: Duration = Duration::from_millis(500);
+/// How long the log waits for an app's UID (a binder call, run on the blocking pool so that
+/// queries never queue behind it on the DNS thread) before it records the query without one.
+/// The answer itself never waits for it.
+const UID_WAIT: Duration = Duration::from_millis(500);
 /// At most this many distinct names asked upstream at once; beyond, SERVFAIL at once (a
 /// burst of unique names would hold a socket each, from the budget every browser connection shares).
 const MAX_INFLIGHT: usize = 512;
@@ -228,8 +227,8 @@ fn reply<W: TunWrite>(ctx: &Ctx<W>, client: SocketAddr, resolver: SocketAddr, pa
     write_tun(ctx, &out);
 }
 
-/// Answers now, or once the app's UID is known (at most [`UID_WAIT`]), without holding up the
-/// loop.
+/// Answers now; the log records it once the app's UID is known (at most [`UID_WAIT`]), without
+/// holding up the loop.
 #[allow(clippy::too_many_arguments)]
 fn answer<W: TunWrite + 'static>(
     ctx: &Rc<Ctx<W>>,
@@ -241,17 +240,15 @@ fn answer<W: TunWrite + 'static>(
     why: Option<(String, String)>,
     t0: Instant,
 ) {
+    reply(ctx, u.src, u.dst, &resp, u.payload, q);
+    let us = micros(t0);
     match uid {
-        Uid::Known(uid) => {
-            reply(ctx, u.src, u.dst, &resp, u.payload, q);
-            ctx.shared.record(&q.name, q.qtype, uid, action, why, micros(t0));
-        }
+        Uid::Known(uid) => ctx.shared.record(&q.name, q.qtype, uid, action, why, us),
         pending => {
-            let (ctx, client, resolver, raw, q) = (ctx.clone(), u.src, u.dst, u.payload.to_vec(), q.clone());
+            let (shared, name, qtype) = (ctx.shared.clone(), q.name.clone(), q.qtype);
             tokio::task::spawn_local(async move {
                 let uid = pending.resolve(UID_WAIT).await;
-                reply(&ctx, client, resolver, &resp, &raw, &q);
-                ctx.shared.record(&q.name, q.qtype, uid, action, why, micros(t0));
+                shared.record(&name, qtype, uid, action, why, us);
             });
         }
     }
@@ -393,7 +390,9 @@ async fn forward<W: TunWrite>(ctx: Rc<Ctx<W>>, key: Key, raw: Vec<u8>) {
             Err(_) => Err(std::io::Error::other("lookup abandoned")),
         },
         crate::resolve::Coalesce::Lead(mut lead) => {
-            let r = shared.upstream_exchange(&raw).await;
+            // Waited for: an app's query (a background refresh has none) or a joined lookup.
+            let waited = || ctx.inflight.borrow().get(&key).is_some_and(|w| !w.is_empty()) || lead.joined();
+            let r = shared.upstream_exchange(&raw, waited).await;
             lead.done(&r);
             r
         }
@@ -419,10 +418,15 @@ async fn forward<W: TunWrite>(ctx: Rc<Ctx<W>>, key: Key, raw: Vec<u8>) {
         shared.counters.upstream_errors.fetch_add(1, Ordering::Relaxed);
         let now = crate::clock::boot_ms();
         let mut stale = false;
+        // The old answer's CNAME chain is checked as on every cache hit (an allowed name is not).
+        let allowed = shared.filters.load().check(&key.name).class.is_allow();
         let done = answer_all(&ctx, waiters, |w| {
             let old = shared.cache.lock().get_stale_any(&key, w.q.id, FAILURE_STALE_MAX, now);
             match (old, &result) {
-                (Some(r), _) => {
+                (Some((_, Some(cn))), _) if !allowed && let Some(why) = cname_blocked(&shared, &cfg, &cn[..]) => {
+                    (dns::blocked_response(&w.raw, &w.q, cfg.block_mode, cfg.blocked_ttl), Action::BlockedCname, why)
+                }
+                (Some((r, _)), _) => {
                     stale = true;
                     (r, Action::Stale, None)
                 }
@@ -497,11 +501,11 @@ fn answer_all<W: TunWrite>(ctx: &Ctx<W>, waiters: Vec<Pending>, mut f: impl FnMu
         .collect()
 }
 
-/// Records answered waiters, all within one shared [`UID_WAIT_UPSTREAM`] (not one each).
+/// Records answered waiters, all within one shared [`UID_WAIT`] (not one each).
 /// `waited`: their wait was the resolver's (see [`stats::Stats::add_from`]); not for a failure
 /// without a network, which fails at once and says nothing about any resolver.
 async fn record_all(shared: &Shared, done: Vec<Answered>, waited: bool) {
-    let deadline = tokio::time::Instant::now() + UID_WAIT_UPSTREAM;
+    let deadline = tokio::time::Instant::now() + UID_WAIT;
     for a in done {
         let uid = a.uid.resolve(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
         if waited {
@@ -704,6 +708,67 @@ mod tests {
         assert!(took < Duration::from_millis(280), "answers waited for the app lookups: {took:?}");
     }
 
+    /// A blocked answer goes out at once, before the app lookup ends; the log then still names
+    /// the app, and the answer's recorded time is its own, not the lookup's.
+    #[tokio::test]
+    async fn local_answers_do_not_wait_for_the_app_lookup() {
+        let (up, _) = fake_resolver(0).await;
+        let shared = Shared::new(Config { resolve_uids: true, ..Config::default() });
+        let (bytes, _) = matcher::compile(&[Source { name: "test", text: "||ads.test^\n", user: false, allow: false }]);
+        shared.set_filters(Filters { lists: Table::from_bytes(bytes).unwrap(), user: Table::empty() });
+        shared.set_network(vec![up], true, false, 1);
+        let _ = shared.uid_lookup.set(Box::new(|_, _, _| {
+            std::thread::sleep(Duration::from_millis(100));
+            10_123
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let out = VecWriter::default();
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(serve(shared.clone(), ChanReader(rx), out.clone(), Arc::new(Notify::new())));
+        local
+            .run_until(async {
+                tx.send(query_packet(1, "ads.test", 53)).unwrap();
+                wait_for(&out, 1).await;
+                assert_eq!(dns::inspect(&answer(&out.0.borrow()[0]).unwrap()).unwrap().addrs, vec!["0.0.0.0".parse::<IpAddr>().unwrap()]);
+                // The log's record, after the app lookup.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            })
+            .await;
+        let s = shared.stats.lock();
+        assert!(s.local_latency.percentile(0.99) < 3_000, "the answer waited: {} µs", s.local_latency.percentile(0.99));
+        assert!(s.apps.contains_key(&10_123), "the app was not named");
+    }
+
+    /// A slow answer nobody waited for (the background refresh of an answer the app already got)
+    /// is not recorded as a slow lookup; one an app waited for is.
+    #[tokio::test]
+    async fn only_waited_lookups_count_as_slow() {
+        let (up, hits) = fake_resolver(1100).await;
+        let shared = shared_with(up);
+        cache_answer(&shared, "bg.test", 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let out = VecWriter::default();
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(serve(shared.clone(), ChanReader(rx), out.clone(), Arc::new(Notify::new())));
+        local
+            .run_until(async {
+                tx.send(query_packet(1, "bg.test", 53)).unwrap();
+                wait_for(&out, 1).await;
+                assert_eq!(dns::inspect(&answer(&out.0.borrow()[0]).unwrap()).unwrap().addrs, vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
+                let (key, t0) = (Key { name: "bg.test".into(), qtype: dns::TYPE_A, qclass: dns::CLASS_IN, do_bit: false }, Instant::now());
+                while shared.cache.lock().age_ms_of(&key, crate::clock::boot_ms()).unwrap() > 1000 && t0.elapsed() < Duration::from_secs(3) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(hits.load(Ordering::SeqCst) >= 1, "refreshed (asked again after a second)");
+                assert_eq!(shared.health_json(10)["counts"]["dns_slow"].as_u64().unwrap_or(0), 0, "a refresh nobody waited for");
+                tx.send(query_packet(2, "new.test", 53)).unwrap();
+                wait_for(&out, 2).await;
+            })
+            .await;
+        assert_eq!(shared.health_json(10)["counts"]["dns_slow"].as_u64(), Some(1), "the app waited");
+    }
+
     /// A query in flight when the phone moves to another network is asked there at once, not
     /// after the old resolver's whole budget (3.5 s).
     #[tokio::test]
@@ -835,22 +900,6 @@ mod tests {
         assert!(shared.upstream.load().dial_failed_at() > 0, "the dial was cancelled, not recorded");
     }
 
-    /// Only an answer learned on another network counts as stale (the proxy's guard looks such a
-    /// name up again); one whose TTL ran out on this network is served as usual while refreshed.
-    #[tokio::test]
-    async fn only_answers_from_another_network_are_stale() {
-        let (up, _) = fake_resolver_with(0, [10, 1, 2, 3]).await;
-        let shared = shared_with(up);
-        cache_answer(&shared, "ttl.test", 1);
-        cache_answer(&shared, "moved.test", 300);
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        let r = crate::resolve_with(&shared, "ttl.test", false).await.unwrap();
-        assert!(r.cached && !r.stale, "TTL ran out on this network");
-        shared.set_network(vec![up], true, false, 2);
-        let r = crate::resolve_with(&shared, "moved.test", false).await.unwrap();
-        assert!(r.cached && r.stale, "learned on the network before");
-    }
-
     /// A resolver that answers every query with SERVFAIL after `delay_ms`.
     async fn failing_resolver(delay_ms: u64) -> SocketAddr {
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -881,6 +930,54 @@ mod tests {
         let info = dns::inspect(&r).unwrap();
         let key = Key { name: name.into(), qtype: dns::TYPE_A, qclass: dns::CLASS_IN, do_bit: false };
         assert!(shared.cache.lock().insert(key, &r, &info));
+    }
+
+    /// After a move to another network, an app's first lookup of a name cached on the old one is
+    /// asked on the new network (the old network's addresses may be CDN nodes that serve only
+    /// its customers); when the new network's resolver fails, the old answer still covers it.
+    #[tokio::test]
+    async fn after_a_move_the_new_network_answers_first() {
+        let (old, _) = fake_resolver(0).await;
+        let shared = shared_with(old);
+        cache_answer(&shared, "img.test", 300);
+        cache_answer(&shared, "other.test", 300);
+        let (new, hits) = fake_resolver_with(0, [5, 6, 7, 8]).await;
+        shared.set_network(vec![new], true, false, 2);
+        let got = run_loop(shared.clone(), vec![query_packet(1, "img.test", 53)], 1).await;
+        assert_eq!(dns::inspect(&got[0]).unwrap().addrs, vec!["5.6.7.8".parse::<IpAddr>().unwrap()], "the new network's address");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let r = crate::resolve_with(&shared, "other.test", false).await.unwrap();
+        assert_eq!((r.addrs, r.cached), (vec!["5.6.7.8".parse::<IpAddr>().unwrap()], false), "the proxy's lookups too");
+        // Fetched on this network: answered from the cache again.
+        run_loop(shared.clone(), vec![query_packet(2, "img.test", 53)], 1).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        // A network whose resolver fails: the answer from before covers it.
+        cache_answer(&shared, "kept.test", 300);
+        shared.set_network(vec![failing_resolver(0).await], true, false, 3);
+        let got = run_loop(shared.clone(), vec![query_packet(3, "kept.test", 53)], 1).await;
+        assert_eq!(dns::inspect(&got[0]).unwrap().addrs, vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
+    }
+
+    /// An expired answer served because the resolver failed is checked for CNAME cloaking like
+    /// every other cached answer: a name that went through a listed tracker stays blocked.
+    #[tokio::test]
+    async fn a_failure_answer_is_checked_for_cloaking() {
+        let shared = shared_with(failing_resolver(0).await);
+        let mut cfg = (**shared.config.load()).clone();
+        cfg.optimistic_cache = false;
+        shared.set_config(cfg);
+        let raw = dns::build_query(1, "shop.test", dns::TYPE_A);
+        let q = dns::parse_query(&raw).unwrap();
+        let mut r = dns::blocked_response(&raw, &q, dns::BlockMode::NullIp, 1);
+        let l = r.len();
+        r[l - 15..l - 11].copy_from_slice(&[9, 9, 9, 9]);
+        let mut info = dns::inspect(&r).unwrap();
+        info.cnames = vec!["x.ads.test".into()];
+        let key = Key { name: "shop.test".into(), qtype: dns::TYPE_A, qclass: dns::CLASS_IN, do_bit: false };
+        assert!(shared.cache.lock().insert(key, &r, &info));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let got = run_loop(shared.clone(), vec![query_packet(1, "shop.test", 53)], 1).await;
+        assert_eq!(dns::inspect(&got[0]).unwrap().addrs, vec!["0.0.0.0".parse::<IpAddr>().unwrap()], "the cloaked tracker's address was served");
     }
 
     /// The proxy's lookup joins an app's query in flight that gets SERVFAIL: it is
