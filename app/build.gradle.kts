@@ -28,8 +28,8 @@ android {
         applicationId = "app.aduster"
         minSdk = 33
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.1.2"
+        versionCode = 6
+        versionName = "1.1.3"
         ndk { abiFilters += "arm64-v8a" }
         // heapprofd from adb needs a profileable app; only the profiling build is one.
         manifestPlaceholders["profileableShell"] = project.hasProperty("keepNativeSymbols").toString()
