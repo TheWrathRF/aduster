@@ -109,10 +109,6 @@ object HttpsConfig {
     @Volatile
     private var downloaded: Pair<String, List<String>>? = null
 
-    fun forgetDownloaded() {
-        downloaded = null
-    }
-
     /**
      * Built-in sensitive sites, AdGuard's maintained never-decrypt lists (banks and
      * sensitive sites worldwide, when downloaded) and the user's own list, with [GOVERNMENT].

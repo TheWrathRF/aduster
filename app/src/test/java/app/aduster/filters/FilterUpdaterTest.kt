@@ -113,6 +113,23 @@ class FilterUpdaterTest {
     }
 
     /**
+     * A failed download keeps a shrunk list's hold-back (its size, rule count and start), so the
+     * 7-day limit does not start over after every failure; a whole download ends it.
+     */
+    @Test
+    fun aFailedDownloadKeepsTheHoldBack() {
+        val url = "https://lists.test/a.txt"
+        val held = ListMeta(rules = 5000, url = url, heldBack = 1234, heldRules = 900, heldSince = 1_000L)
+        val failed = FilterUpdater.nextMeta(held, FilterUpdater.Fetch.Failed("HTTP 500"), null, url, now = 2_000L)
+        assertEquals(Triple(1234L, 900, 1_000L), Triple(failed.heldBack, failed.heldRules, failed.heldSince))
+        assertEquals("HTTP 500", failed.error)
+        assertEquals(2_000L, failed.checkedAt)
+        val whole = FilterUpdater.nextMeta(failed, FilterUpdater.Fetch.Updated("e1", null, 10), null, url, now = 3_000L)
+        assertEquals(Triple(0L, 0, 0L), Triple(whole.heldBack, whole.heldRules, whole.heldSince))
+        assertNull(whole.error)
+    }
+
+    /**
      * Without the part's metadata (a catalog URL change, an unreadable meta.json), a failed
      * download keeps the good copy, so the list does not compile without that part.
      */

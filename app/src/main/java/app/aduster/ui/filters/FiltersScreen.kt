@@ -121,9 +121,11 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
     val view = FilterTab.entries[tab]
     val groups = tabGroups(view, all, device.brandList, HttpsConfig.available)
     val onChange = { l: FilterList, on: Boolean -> vm.setListEnabled(l.id, on) }
+    // The lists an update fetches (with page filtering on: its certificate is not checked here).
+    val inUse = remember(s) { app.aduster.filters.FilterUpdater.downloaded(s, s.httpsFiltering && HttpsConfig.available) }
 
     LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)) {
-        item(key = "header") { Header(meta, progress, s.httpsFiltering && HttpsConfig.available) { vm.updateFiltersNow() } }
+        item(key = "header") { Header(meta, inUse, progress, s.httpsFiltering && HttpsConfig.available) { vm.updateFiltersNow() } }
         item(key = "chips") {
             ChipTabs(FilterTab.entries.map { it.label }, tab, { tab = it }, Modifier.padding(top = 8.dp, bottom = 4.dp))
         }
@@ -250,7 +252,7 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
  * card's bottom edge.
  */
 @Composable
-private fun Header(meta: app.aduster.filters.FilterMeta, progress: FilterJobs.Progress?, pageRules: Boolean, onUpdate: () -> Unit) {
+private fun Header(meta: app.aduster.filters.FilterMeta, inUse: List<String>, progress: FilterJobs.Progress?, pageRules: Boolean, onUpdate: () -> Unit) {
     val p = LocalPalette.current
     Box(
         Modifier
@@ -274,7 +276,7 @@ private fun Header(meta: app.aduster.filters.FilterMeta, progress: FilterJobs.Pr
                         buildAnnotatedString {
                             withStyle(SpanStyle(fontFamily = GoogleSansCode, color = p.accent)) { append(fmt(meta.compiledRules)) }
                             append(" DNS rules · ")
-                            append(if (meta.lastRun > 0) "updated ${ago(meta.lastRun)}" else "not updated yet")
+                            append(updateLine(meta, inUse))
                         },
                         style = Type.body,
                         color = p.text2,
@@ -337,6 +339,20 @@ private fun ProgressLine(progress: FilterJobs.Progress?) {
     }
 }
 
+/**
+ * When the lists were last updated, for the header, and how many of the lists in use ([ids])
+ * failed their last download (as their rows say): when every one did, nothing was updated, only
+ * checked.
+ */
+internal fun updateLine(m: app.aduster.filters.FilterMeta, ids: List<String>, now: Long = System.currentTimeMillis()): String {
+    if (m.lastRun <= 0) return "not updated yet"
+    val n = app.aduster.filters.FilterUpdater.failedOf(m, ids)
+    if (n <= 0) return "updated ${ago(m.lastRun, now)}"
+    // No-break spaces: the line wraps before "1 list failed", never inside it.
+    val failed = "$n\u00A0list${if (n == 1) "" else "s"}\u00A0failed"
+    return if (n >= ids.size) "checked ${ago(m.lastRun, now)} · $failed" else "updated ${ago(m.lastRun, now)} · $failed"
+}
+
 private fun listDetail(m: ListMeta): String {
     // Hostname rules the DNS layer already enforces are not duplicated in the page filter; the
     // count includes them, as the list itself does.
@@ -373,9 +389,9 @@ private fun AddListDialog(known: Set<String>, onDismiss: () -> Unit, onAdd: (Str
         confirmEnabled = valid,
         onConfirm = { if (valid) onAdd(name.trim(), url.trim(), web == 1) },
     ) {
-        InputField(name, { name = it }, "Name", Modifier.fillMaxWidth(), color = p.bg)
+        InputField(name, { name = it }, "Name", Modifier.fillMaxWidth(), label = "List name", color = p.bg)
         Spacer(Modifier.height(10.dp))
-        InputField(url, { url = it }, "https://…", Modifier.fillMaxWidth(), error = duplicate, color = p.bg)
+        InputField(url, { url = it }, "https://…", Modifier.fillMaxWidth(), label = "List address", error = duplicate, color = p.bg)
         if (duplicate) Text("This list is already added", style = Type.small, color = p.warn, modifier = Modifier.padding(start = 18.dp, top = 6.dp))
         // A list for web pages is of no use in a build without the page engine. The same names
         // as the views it will show under.

@@ -2,7 +2,6 @@ package app.aduster.filters
 
 import android.content.Context
 import app.aduster.core.NativeCore
-import app.aduster.https.HttpsConfig
 import app.aduster.settings.Settings
 import app.aduster.settings.DeviceProfile
 import kotlinx.serialization.json.Json
@@ -39,7 +38,7 @@ object FilterUpdater {
     /** [allow]: every rule of the list allows instead of blocks (Xiaomi profile Off). */
     private data class Source(val name: String, val file: File, val allow: Boolean = false)
 
-    private sealed interface Fetch {
+    internal sealed interface Fetch {
         data class Updated(val etag: String?, val lastModified: String?, val bytes: Long) : Fetch
         data object NotModified : Fetch
         /** Downloaded in full, but identical to the stored copy (kept as it is). */
@@ -50,7 +49,7 @@ object FilterUpdater {
     }
 
     /** A shrunk download held back: its size, its rule count and when the first was held. */
-    private data class Held(val bytes: Long = 0, val rules: Int = 0, val since: Long = 0)
+    internal data class Held(val bytes: Long = 0, val rules: Int = 0, val since: Long = 0)
 
     /** How long shrunk downloads are held back at most: a list really cut stays cut. */
     private const val HOLD_MAX_MS = 7 * 24 * 3600 * 1000L
@@ -123,26 +122,8 @@ object FilterUpdater {
             val inc = if (r !is Fetch.Failed && r !is Fetch.Shrunk && store.raw(l.id).exists()) fetchIncludes(store.raw(l.id), store.includes(l.id), l.url, prev?.parts.orEmpty()) else null
             store.locked {
                 val meta = store.readMeta()
-                val old = meta.lists[l.id] ?: ListMeta()
                 val changed = r is Fetch.Updated || inc?.changed == true
-                val next = when (r) {
-                    is Fetch.Updated -> old.copy(etag = r.etag, lastModified = r.lastModified, bytes = r.bytes)
-                    is Fetch.Same -> old.copy(etag = r.etag, lastModified = r.lastModified)
-                    Fetch.NotModified -> old
-                    is Fetch.Failed -> old
-                    is Fetch.Shrunk -> old
-                }.let { m ->
-                    m.copy(
-                        url = if (r is Fetch.Failed || r is Fetch.Shrunk) m.url else l.url,
-                        parts = inc?.parts ?: m.parts,
-                        checkedAt = now,
-                        updatedAt = if (changed) now else m.updatedAt,
-                        error = (r as? Fetch.Failed)?.reason ?: (r as? Fetch.Shrunk)?.reason ?: inc?.error,
-                        heldBack = (r as? Fetch.Shrunk)?.held?.bytes ?: 0,
-                        heldRules = (r as? Fetch.Shrunk)?.held?.rules ?: 0,
-                        heldSince = (r as? Fetch.Shrunk)?.held?.since ?: 0,
-                    )
-                }
+                val next = nextMeta(meta.lists[l.id] ?: ListMeta(), r, inc, l.url, now)
                 when {
                     r is Fetch.Failed || r is Fetch.Shrunk -> failed += l.name
                     changed -> {
@@ -173,7 +154,6 @@ object FilterUpdater {
         // A changed never-decrypt list reaches the proxy through a settings reload (:core reads
         // the files when it builds the proxy config).
         if (FilterCatalog.exclusionLists.any { it.id in changedIds }) {
-            HttpsConfig.forgetDownloaded()
             app.aduster.vpn.AdusterVpnService.notifySettingsChanged(context)
         }
         android.util.Log.i(
@@ -182,6 +162,38 @@ object FilterUpdater {
                 "DNS ${if (dnsCompiled) "compiled" else "unchanged"} ${t2 - t1} ms, web ${if (webCompiled) "compiled" else "unchanged"} ${t3 - t2} ms",
         )
         return Result(downloaded, unchanged, failed, dnsCompiled, webCompiled)
+    }
+
+    /** How many of the lists [ids] have a failed download (their rows say why). */
+    internal fun failedOf(meta: FilterMeta, ids: List<String>): Int = ids.count { meta.lists[it]?.error != null }
+
+    /** The lists an update downloads ([web]: page filtering runs); the app's own come with it. */
+    fun downloaded(settings: Settings, web: Boolean): List<String> =
+        (FilterCatalog.enabledDns(settings) + if (web) FilterCatalog.enabledWeb(settings) + FilterCatalog.exclusionLists else emptyList())
+            .filter { it.asset == null }.map { it.id }
+
+    /** A list's metadata after one download ([r]) of it and its parts ([inc]) from [url]. */
+    internal fun nextMeta(old: ListMeta, r: Fetch, inc: Includes?, url: String, now: Long): ListMeta {
+        val changed = r is Fetch.Updated || inc?.changed == true
+        val m = when (r) {
+            is Fetch.Updated -> old.copy(etag = r.etag, lastModified = r.lastModified, bytes = r.bytes)
+            is Fetch.Same -> old.copy(etag = r.etag, lastModified = r.lastModified)
+            Fetch.NotModified -> old
+            is Fetch.Failed -> old
+            is Fetch.Shrunk -> old
+        }
+        return m.copy(
+            url = if (r is Fetch.Failed || r is Fetch.Shrunk) m.url else url,
+            parts = inc?.parts ?: m.parts,
+            checkedAt = now,
+            updatedAt = if (changed) now else m.updatedAt,
+            error = (r as? Fetch.Failed)?.reason ?: (r as? Fetch.Shrunk)?.reason ?: inc?.error,
+            // A failed download says nothing about the list: a hold-back goes on as it was (its
+            // 7 days do not start over), as a part's does.
+            heldBack = (r as? Fetch.Shrunk)?.held?.bytes ?: if (r is Fetch.Failed) old.heldBack else 0,
+            heldRules = (r as? Fetch.Shrunk)?.held?.rules ?: if (r is Fetch.Failed) old.heldRules else 0,
+            heldSince = (r as? Fetch.Shrunk)?.held?.since ?: if (r is Fetch.Failed) old.heldSince else 0,
+        )
     }
 
     /**

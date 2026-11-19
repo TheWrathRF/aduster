@@ -33,10 +33,41 @@ object UserRules {
 
     private fun looksLikeWebRule(l: String) = COSMETIC.any { l.contains(it) } || l.contains('/') || l.contains('$') || l.contains('*') || l.startsWith("|")
 
-    /** One pass over the rules with a single call into the DNS matcher. */
-    fun analyze(text: String): Analysis {
+    /** A `||` rule's host part: letters, digits, `.-_`, wildcards, an encoded byte or a port. */
+    private val HOST_PART = Regex("""^[A-Za-z0-9._*%:-]+$""")
+
+    /**
+     * Whether a line the DNS matcher rejected (for [dnsReason]) is a page rule the page filter
+     * can use: it has what DNS cannot take (a path, `$` options, a wildcard, a regex that
+     * compiles) and nothing malformed. Anything else would be dropped there without a word, so
+     * it is shown as an error instead.
+     */
+    private fun pageRule(l: String, dnsReason: String): Boolean {
+        if (!looksLikeWebRule(l)) return false
+        // Wrong for both layers: a bad regex, a non-ASCII host, $badfilter (lists only).
+        if (dnsReason == "invalid regular expression" || dnsReason == "regular expression too large" || dnsReason == "non-ASCII rule" || dnsReason.startsWith("\$badfilter")) return false
+        val body = l.removePrefix("@@")
+        // A regex: /…/, options after it if any.
+        val end = body.lastIndexOf('/')
+        if (body.startsWith("/") && end > 0 && (end == body.lastIndex || body[end + 1] == '$')) {
+            return runCatching { Regex(body.substring(1, end)) }.isSuccess
+        }
+        val pattern = body.substringBefore('$')
+        if (pattern.any { it.isWhitespace() } || body.substringAfter('$', "").any { it.isWhitespace() }) return false
+        if (pattern.startsWith("||")) {
+            val host = pattern.removePrefix("||").takeWhile { it != '/' && it != '^' && it != '|' && it != '?' }
+            if (!HOST_PART.matches(host)) return false
+        }
+        return true
+    }
+
+    /**
+     * One pass over the rules with a single call into the DNS matcher ([validate]: its
+     * `[[line, reason], ...]` for the lines it rejects).
+     */
+    fun analyze(text: String, validate: (String) -> String = { NativeCore.nativeValidateRules(it) }): Analysis {
         val rejected: Map<Int, String> = runCatching {
-            Json.parseToJsonElement(NativeCore.nativeValidateRules(text)).jsonArray.associate { item ->
+            Json.parseToJsonElement(validate(text)).jsonArray.associate { item ->
                 val a = item.jsonArray
                 a[0].jsonPrimitive.int to a[1].jsonPrimitive.content
             }
@@ -48,7 +79,7 @@ object UserRules {
             layers[i + 1] = when {
                 COSMETIC.any { l.contains(it) } -> Layer.CHROME
                 (i + 1) !in rejected -> Layer.DNS
-                looksLikeWebRule(l) -> Layer.CHROME
+                pageRule(l, rejected.getValue(i + 1)) -> Layer.CHROME
                 else -> Layer.INVALID
             }
         }
@@ -60,10 +91,12 @@ object UserRules {
     fun classify(text: String): Map<Int, Layer> = analyze(text).layers
 
     /** The lines for the browsers' page filter. */
-    fun webPart(text: String): String {
-        val layers = classify(text)
+    fun webPart(text: String): String = webLines(text, analyze(text))
+
+    /** The lines of [text] that [a] gives to the page filter. */
+    internal fun webLines(text: String, a: Analysis): String {
         val lines = text.lines()
-        return layers.filterValues { it == Layer.CHROME }.keys.joinToString("\n") { lines[it - 1].trim() }
+        return a.layers.filterValues { it == Layer.CHROME }.keys.joinToString("\n") { lines[it - 1].trim() }
     }
 
     /** A site rule: `||host^` (block) or `@@||host^` (allow), with nothing else on the line. */
