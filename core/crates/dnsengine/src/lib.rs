@@ -265,31 +265,38 @@ impl Shared {
         }
         self.cache.lock().resize(config.cache_size);
         self.log.lock().set_capacity(config.log_capacity);
-        self.mark_pause(self.config.load().paused_until_ms, config.paused_until_ms);
+        self.mark_pause(&self.config.load(), &config);
         self.config.store(Arc::new(config));
     }
 
     /// Puts pause and resume markers into the query log (a pause is then seen as a stretch there,
-    /// not guessed from a gap). `old`/`new`: pause ends in unix ms (0 = not paused).
-    fn mark_pause(&self, old: u64, new: u64) {
-        if old == new {
+    /// not guessed from a gap). Whether a pause runs or ran out is read on the boot clock, as the
+    /// pause itself is (a wall-clock change moves neither); the markers carry wall times.
+    fn mark_pause(&self, old: &Config, new: &Config) {
+        if old.paused_until_ms == new.paused_until_ms {
             return;
         }
         self.rules_watch.send_modify(|g| *g += 1);
-        let now = now_ms();
+        let (now, boot) = (now_ms(), clock::boot_ms());
+        let running = |c: &Config| c.pause_until_boot > boot;
         // Unless a record already marked it (`resume_if_ran_out`).
-        if old != 0 && !self.resume_logged.swap(true, Ordering::Relaxed) {
-            // A timed pause that already ran out ended at its own time.
-            if old <= now {
-                self.log_marker(Action::Resumed, old);
-            } else if new == 0 || new <= now {
+        if old.paused_until_ms != 0 && !self.resume_logged.swap(true, Ordering::Relaxed) {
+            if !running(old) {
+                // A timed pause that already ran out ended at its own time (one sent already
+                // over has no boot-clock end: its own wall time, as sent).
+                let end = match old.pause_until_boot {
+                    0 => old.paused_until_ms.min(now),
+                    b => now.saturating_sub(boot - b),
+                };
+                self.log_marker(Action::Resumed, end);
+            } else if !running(new) {
                 self.log_marker(Action::Resumed, now);
             }
         }
-        if new != 0 {
+        if new.paused_until_ms != 0 {
             self.resume_logged.store(false, Ordering::Relaxed);
         }
-        if new > now && (old == 0 || old <= now) {
+        if running(new) && (old.paused_until_ms == 0 || !running(old)) {
             self.log_marker(Action::Paused, now);
         }
     }
@@ -1142,6 +1149,20 @@ mod tests {
         let kinds: Vec<&str> = log.iter().map(|e| e["a"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["Paused", "Resumed", "Resumed"]);
         assert_eq!(log[2]["t"].as_u64(), Some(now - 5000));
+    }
+
+    /// The markers follow the boot clock as the pause does: a wall time already past a running
+    /// pause's end neither drops its "Paused" marker nor dates its "Resumed" back to that end.
+    #[test]
+    fn pause_markers_follow_the_boot_clock() {
+        let s = Shared::new(Config::default());
+        let now = now_ms();
+        s.set_config(Config { paused_until_ms: now - 3_600_000, pause_left_ms: Some(60_000), ..Config::default() });
+        s.set_config(Config::default());
+        let log: Vec<serde_json::Value> = serde_json::from_str(&s.log_json(0, 10)).unwrap();
+        let kinds: Vec<&str> = log.iter().map(|e| e["a"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["Paused", "Resumed"]);
+        assert!(log[1]["t"].as_u64().unwrap() >= now, "resumed now, not at the wall-clock end");
     }
 
     /// A timed pause that runs out is marked "Resumed" when the next lookup is recorded, so the
