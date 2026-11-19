@@ -459,7 +459,8 @@ fun AdDialog(
  */
 @Composable
 fun ClearLogDialog(scope: kotlinx.coroutines.CoroutineScope, clear: suspend () -> Boolean, onDismiss: () -> Unit) {
-    // [scope]: the screen's, which outlives this dialog (closed before the clear finishes).
+    // [scope]: the view model's, which outlives this dialog and the screen (closed before the
+    // clear finishes, or left at once).
     val ctx = androidx.compose.ui.platform.LocalContext.current
     AdDialog(
         "Clear the log?",

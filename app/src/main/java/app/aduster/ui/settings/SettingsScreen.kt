@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
 import app.aduster.BuildConfig
 import app.aduster.core.Upstreams
 import app.aduster.https.HttpsConfig
@@ -248,7 +249,7 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
                 }
             },
         )
-        Dialog.CLEAR_LOG -> app.aduster.ui.common.ClearLogDialog(scope, { vm.clearLog() }) { dialog = null }
+        Dialog.CLEAR_LOG -> app.aduster.ui.common.ClearLogDialog(vm.viewModelScope, { vm.clearLog() }) { dialog = null }
         Dialog.LICENCES -> LicencesDialog { dialog = null }
         null -> {}
     }

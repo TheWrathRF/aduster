@@ -40,7 +40,7 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
     var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
     var query by rememberSaveable { mutableStateOf("") }
-    var showSystem by remember { mutableStateOf(false) }
+    var showSystem by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { apps = vm.installedApps() }
 

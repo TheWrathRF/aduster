@@ -484,6 +484,9 @@ class AdusterVpnService : VpnService() {
         pausedUntil = settings.pausedUntil
         initEngine()
         engineReady = true
+        // This process starts: if the last one ended while protecting, the timeline says so now
+        // (Home explains why it is off), not only at the next start of protection.
+        noteUnrecordedStop()
     }
 
     /**

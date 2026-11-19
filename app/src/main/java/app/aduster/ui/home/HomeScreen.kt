@@ -106,7 +106,8 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
     var pauseDialog by remember { mutableStateOf(false) }
     var offDialog by remember { mutableStateOf(false) }
     // The top lists' share lines rise once, like the chart's bars, not each time Home is shown.
-    var risen by rememberSaveable { mutableStateOf(false) }
+    // By row: each rises the first time it shows (rows further down compose only when scrolled to).
+    val risen = rememberSaveable(saver = androidx.compose.runtime.saveable.listSaver<MutableSet<String>, String>({ it.toList() }, { it.toMutableSet() })) { mutableSetOf() }
 
     // Until the core answers, the state comes from what the user last chose and the
     // buttons wait: no false "Off" and no tap on a "Turn on" that is not real.
@@ -121,10 +122,13 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
     }
     // Why it is off, when the user did not turn it off (read from the timeline while off).
     var stopped by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(running, unknown) {
+    // Read again with every status poll while off: a start that failed leaves it off, with a new
+    // reason, and the note's "5 min ago" moves on.
+    LaunchedEffect(known) {
         stopped = if (unknown || running) null else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { stopNote(vm.timeline()) }
     }
-    val warnings = if (unknown) emptyList() else listOfNotNull(stopped?.let { Warning(it, Fix.DIAGNOSTICS) }) + homeWarnings(stats, s.httpsFiltering)
+    val note = stopped?.takeIf { !running }
+    val warnings = if (unknown) emptyList() else listOfNotNull(note?.let { Warning(it, Fix.DIAGNOSTICS) }) + homeWarnings(stats, s.httpsFiltering)
 
     LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 16.dp, bottom = 28.dp)) {
         item(key = "status") {
@@ -218,7 +222,7 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
             item(key = "top-label") { SectionHeading("Top blocked today") }
             val max = stats.topBlocked.maxOf { it.second }.coerceAtLeast(1)
             groupItems(stats.topBlocked.take(8), key = { "b" + it.first }) { (name, n) ->
-                CountRow(name, fmt(n), share = n.toFloat() / max, rise = !risen) { risen = true }
+                CountRow(name, fmt(n), share = n.toFloat() / max, rise = "b$name" !in risen) { risen += "b$name" }
             }
         }
 
@@ -230,9 +234,9 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
                 CountRow(
                     appName(labels, a.uid), "${fmt(a.blocked)} of ${fmt(a.queries)}",
                     share = if (a.queries > 0) a.blocked.toFloat() / a.queries else 0f,
-                    rise = !risen,
+                    rise = "a${a.uid}" !in risen,
                     leading = { AppIcon(icon) },
-                ) { risen = true }
+                ) { risen += "a${a.uid}" }
             }
         }
 

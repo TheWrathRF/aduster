@@ -68,6 +68,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.viewModelScope
 import app.aduster.ui.LogItem
 import app.aduster.ui.MainViewModel
 import app.aduster.ui.QueryAction
@@ -153,7 +154,7 @@ fun LogScreen(vm: MainViewModel) {
     // pill counts them instead.
     val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val scope = rememberCoroutineScope()
-    if (clearDialog) ClearLogDialog(scope, { vm.clearLog() }) { clearDialog = false }
+    if (clearDialog) ClearLogDialog(vm.viewModelScope, { vm.clearLog() }) { clearDialog = false }
     val undoBar = remember { androidx.compose.material3.SnackbarHostState() }
     var pinnedTop by remember { mutableStateOf(true) }
     var seenSeq by remember { mutableLongStateOf(0L) }
