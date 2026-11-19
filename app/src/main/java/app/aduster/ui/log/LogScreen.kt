@@ -75,6 +75,7 @@ import app.aduster.ui.appName
 import app.aduster.ui.clock
 import app.aduster.ui.common.ChipTabs
 import app.aduster.ui.common.ChoiceDialog
+import app.aduster.ui.common.ClearLogDialog
 import app.aduster.ui.common.GroupSegment
 import app.aduster.ui.common.PillButton
 import app.aduster.ui.common.Gutter
@@ -109,6 +110,7 @@ fun LogScreen(vm: MainViewModel) {
     var filter by rememberSaveable { mutableIntStateOf(0) }
     var app by rememberSaveable { mutableStateOf<Int?>(null) }
     var appDialog by remember { mutableStateOf(false) }
+    var clearDialog by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<LogLine.Query?>(null) }
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
 
@@ -151,6 +153,7 @@ fun LogScreen(vm: MainViewModel) {
     // pill counts them instead.
     val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val scope = rememberCoroutineScope()
+    if (clearDialog) ClearLogDialog(scope, { vm.clearLog() }) { clearDialog = false }
     val undoBar = remember { androidx.compose.material3.SnackbarHostState() }
     var pinnedTop by remember { mutableStateOf(true) }
     var seenSeq by remember { mutableLongStateOf(0L) }
@@ -181,7 +184,7 @@ fun LogScreen(vm: MainViewModel) {
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         ScreenTitle("Log") {
-            TextAction("Clear", color = p.muted) { scope.launch { vm.clearLog() } }
+            TextAction("Clear", color = p.muted) { clearDialog = true }
         }
         InputField(query, { query = it }, "Filter by domain or app", Modifier.fillMaxWidth().padding(horizontal = Gutter), icon = AdIcons.Search)
         Spacer(Modifier.height(4.dp))
@@ -392,9 +395,9 @@ internal fun ledgerOf(shown: List<LogItem>): List<LogLine> {
 }
 
 /** Each row's place in its run between two headings or markers: [index] within the run, and the run's [count]. */
-private class Runs(val index: IntArray, val count: IntArray)
+internal class Runs(val index: IntArray, val count: IntArray)
 
-private fun runsOf(rows: List<LogLine>): Runs {
+internal fun runsOf(rows: List<LogLine>): Runs {
     val index = IntArray(rows.size)
     val count = IntArray(rows.size)
     var start = 0

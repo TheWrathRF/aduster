@@ -47,8 +47,10 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -84,6 +86,8 @@ import app.aduster.ui.percent
 import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
+import app.aduster.ui.theme.pastBar
+import app.aduster.ui.theme.shareLine
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -101,6 +105,8 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
     var pauseDialog by remember { mutableStateOf(false) }
     var offDialog by remember { mutableStateOf(false) }
+    // The top lists' share lines rise once, like the chart's bars, not each time Home is shown.
+    var risen by rememberSaveable { mutableStateOf(false) }
 
     // Until the core answers, the state comes from what the user last chose and the
     // buttons wait: no false "Off" and no tap on a "Turn on" that is not real.
@@ -113,7 +119,12 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
         running -> Protection.ON
         else -> Protection.OFF
     }
-    val warnings = if (unknown) emptyList() else homeWarnings(stats, s.httpsFiltering)
+    // Why it is off, when the user did not turn it off (read from the timeline while off).
+    var stopped by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(running, unknown) {
+        stopped = if (unknown || running) null else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { stopNote(vm.timeline()) }
+    }
+    val warnings = if (unknown) emptyList() else listOfNotNull(stopped?.let { Warning(it, Fix.DIAGNOSTICS) }) + homeWarnings(stats, s.httpsFiltering)
 
     LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 16.dp, bottom = 28.dp)) {
         item(key = "status") {
@@ -139,6 +150,8 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
                             Protection.ON -> "Protected"
                             Protection.OFF -> "Off"
                         },
+                        // TalkBack says the new state when it changes, also when a tap elsewhere changed it.
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                         style = Type.display,
                         color = when (st) {
                             Protection.ON -> p.text
@@ -205,7 +218,7 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
             item(key = "top-label") { SectionHeading("Top blocked today") }
             val max = stats.topBlocked.maxOf { it.second }.coerceAtLeast(1)
             groupItems(stats.topBlocked.take(8), key = { "b" + it.first }) { (name, n) ->
-                CountRow(name, fmt(n), share = n.toFloat() / max)
+                CountRow(name, fmt(n), share = n.toFloat() / max, rise = !risen) { risen = true }
             }
         }
 
@@ -217,8 +230,9 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
                 CountRow(
                     appName(labels, a.uid), "${fmt(a.blocked)} of ${fmt(a.queries)}",
                     share = if (a.queries > 0) a.blocked.toFloat() / a.queries else 0f,
+                    rise = !risen,
                     leading = { AppIcon(icon) },
-                )
+                ) { risen = true }
             }
         }
 
@@ -229,7 +243,7 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
                 // count adds page rules while they are in use).
                 row { ListRow("DNS server", onClick = openSettings) { ValueText(Upstreams.label(s.upstream, s.customUpstream)) } }
                 val rules = meta.compiledRules + if (s.httpsFiltering && HttpsConfig.available) meta.webRules else 0
-                row { ListRow("Rules", onClick = openFilters) { ValueText("${fmt(rules)} · ${ago(meta.compiledAt)}") } }
+                row { ListRow("Rules", onClick = openFilters) { ValueText("${fmt(rules)} · ${ago(rulesAge(meta))}") } }
             }
         }
     }
@@ -330,12 +344,18 @@ private fun WarningRow(text: String, onClick: () -> Unit) {
     }
 }
 
-/** One row of a top list: name, count and a thin line showing its share. */
+/**
+ * One row of a top list: name, count and a thin line showing its share, which rises from nothing
+ * when [rise] (the first time the list shows) and else starts where it is.
+ */
 @Composable
-private fun CountRow(name: String, value: String, share: Float, leading: (@Composable () -> Unit)? = null) {
+private fun CountRow(name: String, value: String, share: Float, rise: Boolean, leading: (@Composable () -> Unit)? = null, onRisen: () -> Unit) {
     val p = LocalPalette.current
-    var shown by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { shown = true }
+    var shown by remember { mutableStateOf(!rise) }
+    LaunchedEffect(Unit) {
+        shown = true
+        onRisen()
+    }
     val w by animateFloatAsState(if (shown) share.coerceIn(0f, 1f) else 0f, tween(Motion.LONG * 2, easing = Motion.Emphasized), label = "share")
     Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 10.dp)) {
         Row(Modifier.heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -350,7 +370,7 @@ private fun CountRow(name: String, value: String, share: Float, leading: (@Compo
         Spacer(Modifier.height(8.dp))
         Canvas(Modifier.fillMaxWidth().height(2.dp)) {
             drawRect(p.line)
-            drawRect(p.faint, size = Size(size.width * w, size.height))
+            drawRect(p.shareLine, size = Size(size.width * w, size.height))
         }
     }
 }
@@ -451,8 +471,8 @@ private fun History(stats: Stats) {
                 val color = when {
                     selected == i -> p.text
                     i == days.lastIndex -> p.accent
-                    selected != null -> p.accent.copy(alpha = 0.25f)
-                    else -> p.accent.copy(alpha = 0.5f)
+                    // Also while a day is picked: its own colour sets it apart.
+                    else -> p.pastBar()
                 }
                 drawRoundRect(color, Offset(x, size.height - h), Size(w, h), round)
             }
@@ -515,6 +535,22 @@ internal fun httpsProblem(state: String): String = when (state) {
     "start_failed" -> "Page filtering failed"
     else -> "Pages not filtered"
 }
+
+/**
+ * Why protection is off when the user did not turn it off (another VPN took over, the engine
+ * failed, the process ended), from the protection timeline, newest last; null otherwise.
+ */
+internal fun stopNote(entries: List<app.aduster.vpn.Timeline.Entry>, now: Long = System.currentTimeMillis()): String? {
+    val last = entries.lastOrNull() ?: return null
+    if (last.event != app.aduster.vpn.Timeline.STOPPED) return null
+    // Turned off in the app; entries from before codes existed by their text.
+    if (last.code == "user_off" || (last.code == null && last.reason == "turned off in the app")) return null
+    val why = last.reason?.takeIf { it.isNotBlank() } ?: return "Stopped ${ago(last.time, now)}"
+    return "Stopped ${ago(last.time, now)}: $why"
+}
+
+/** When the rules were last checked for updates (as Filters says), else when they were built. */
+internal fun rulesAge(meta: app.aduster.filters.FilterMeta): Long = if (meta.lastRun > 0) meta.lastRun else meta.compiledAt
 
 /** Where a problem on Home is fixed. */
 internal enum class Fix { HTTPS, DIAGNOSTICS, VPN_SETTINGS, RELEASE }

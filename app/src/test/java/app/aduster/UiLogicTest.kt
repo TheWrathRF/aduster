@@ -17,6 +17,9 @@ import app.aduster.ui.historySlots
 import app.aduster.ui.parseDomainCheck
 import app.aduster.ui.parseSiteCheck
 import app.aduster.ui.settings.timelineLines
+import app.aduster.ui.theme.pastBar
+import app.aduster.ui.theme.shareLine
+import app.aduster.ui.theme.switchEdge
 import app.aduster.vpn.Timeline
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -559,6 +562,110 @@ class UiLogicTest {
         assertEquals(shape(18, 8), segmentShape(0, 3))
         assertEquals(shape(8, 8), segmentShape(1, 3))
         assertEquals(shape(8, 18), segmentShape(2, 3))
+    }
+
+    /**
+     * WCAG's 3:1 for graphics that carry meaning: a past day's bar in Home's chart against its
+     * track and the card around it, a top list's share line against its track, an unchecked
+     * switch's edge against the row and the page.
+     */
+    @Test
+    fun graphicsContrastAtLeast3() {
+        fun over(fg: androidx.compose.ui.graphics.Color, bg: androidx.compose.ui.graphics.Color) =
+            androidx.compose.ui.graphics.Color(
+                fg.red * fg.alpha + bg.red * (1 - fg.alpha),
+                fg.green * fg.alpha + bg.green * (1 - fg.alpha),
+                fg.blue * fg.alpha + bg.blue * (1 - fg.alpha),
+            )
+        for (p in listOf(app.aduster.ui.theme.BlackPalette, app.aduster.ui.theme.LightPalette)) {
+            val theme = if (p.dark) "black" else "light"
+            val checks = listOf(
+                "past bar on its track" to contrast(over(p.pastBar(), p.surfaceHigh), p.surfaceHigh),
+                "past bar on the card" to contrast(over(p.pastBar(), p.surfaceHigh), p.surface),
+                "today's bar on its track" to contrast(p.accent, p.surfaceHigh),
+                "share line on its track" to contrast(p.shareLine, p.line),
+                "share line on the card" to contrast(p.shareLine, p.surface),
+                "switch edge on a row" to contrast(p.switchEdge, p.surface),
+                "switch edge on the page" to contrast(p.switchEdge, p.bg),
+            )
+            for ((what, ratio) in checks) assertTrue("$theme $what: ${"%.2f".format(ratio)}", ratio >= 3.0)
+        }
+    }
+
+    /** Filters' header: an update whose downloads failed says so, never just "updated". */
+    @Test
+    fun filtersHeaderSaysWhenDownloadsFailed() {
+        val now = 10_000_000L
+        val ok = app.aduster.filters.ListMeta()
+        val bad = app.aduster.filters.ListMeta(error = "HTTP 500")
+        fun line(vararg lists: Pair<String, app.aduster.filters.ListMeta>, inUse: List<String> = lists.map { it.first }) =
+            app.aduster.ui.filters.updateLine(app.aduster.filters.FilterMeta(lists = mapOf(*lists), lastRun = now - 30_000), inUse, now).replace('\u00A0', ' ')
+        assertEquals("updated just now", line("a" to ok, "b" to ok))
+        assertEquals("updated just now · 1 list failed", line("a" to bad, "b" to ok))
+        assertEquals("checked just now · 2 lists failed", line("a" to bad, "b" to bad))
+        // A list no longer in use (switched off, removed) does not count, though its meta is still there.
+        assertEquals("updated just now", line("a" to ok, "gone" to bad, inUse = listOf("a")))
+        assertEquals("not updated yet", app.aduster.ui.filters.updateLine(app.aduster.filters.FilterMeta(), listOf("a"), now))
+    }
+
+    /** Home's Rules row: when the lists were last checked, as Filters says, not when they last changed. */
+    @Test
+    fun homeRulesAgeIsTheLastCheck() {
+        assertEquals(9L, app.aduster.ui.home.rulesAge(app.aduster.filters.FilterMeta(compiledAt = 5, lastRun = 9)))
+        assertEquals(5L, app.aduster.ui.home.rulesAge(app.aduster.filters.FilterMeta(compiledAt = 5)))
+    }
+
+    /** Home says why protection is off when the user did not turn it off. */
+    @Test
+    fun homeSaysWhyProtectionStopped() {
+        val now = 100_000_000L
+        fun e(t: Long, ev: String, r: String? = null, c: String? = null) = Timeline.Entry(t, ev, r, c)
+        fun note(vararg es: Timeline.Entry) = app.aduster.ui.home.stopNote(es.toList(), now)
+        assertNull(note())
+        assertEquals(
+            "Stopped 2 h ago: turned off in system settings, or another VPN took over",
+            note(e(1, Timeline.STARTED), e(now - 2 * 3_600_000, Timeline.STOPPED, "turned off in system settings, or another VPN took over", "revoked")),
+        )
+        assertEquals("Stopped just now: the DNS engine kept stopping", note(e(now - 1000, Timeline.STOPPED, "the DNS engine kept stopping", "failure")))
+        assertEquals("Stopped 5 min ago: the filtering process ended (crash)", note(e(now - 300_000, Timeline.STOPPED, "the filtering process ended (crash)", "failure")))
+        // Turned off by the user (also an entry from before codes existed), or started again: nothing to explain.
+        assertNull(note(e(1, Timeline.STARTED), e(2, Timeline.STOPPED, "turned off in the app", "user_off")))
+        assertNull(note(e(2, Timeline.RESUMED, "turned off", "off"), e(3, Timeline.STOPPED, "turned off in the app", "user_off")))
+        assertNull(note(e(2, Timeline.STOPPED, "turned off in the app")))
+        assertNull(note(e(2, Timeline.STOPPED, "the tunnel could not be set up", "failure"), e(3, Timeline.STARTED)))
+    }
+
+    /** The never-decrypt list takes hosts however they were pasted; what is no host is left out. */
+    @Test
+    fun exclusionHostsFromPastedLines() {
+        val h = app.aduster.https.HttpsConfig::exclusionHost
+        assertEquals("bank.example", h("https://Bank.example/login?x=1"))
+        assertEquals("bank.example", h("*.bank.example"))
+        assertNull(h("not a host"))
+        assertNull(h(""))
+    }
+
+    /** A settings file with one bad field keeps every other field; text that is no JSON object gives nothing. */
+    @Test
+    fun settingsSalvageKeepsGoodFields() {
+        val s = app.aduster.settings.salvageSettings("""{"userRules":"||a.example^","logSize":"many","blockDnsBypass":false}""")
+        assertEquals("||a.example^", s?.userRules)
+        assertEquals(false, s?.blockDnsBypass)
+        assertEquals(Settings().logSize, s?.logSize)
+        assertNull(app.aduster.settings.salvageSettings("[1,2]"))
+        assertNull(app.aduster.settings.salvageSettings("not json"))
+    }
+
+    /** The Log's rows are grouped in runs between minute headings and markers. */
+    @Test
+    fun logRuns() {
+        val t = 1_700_000_040_000L - 1_700_000_040_000L % 60_000
+        fun e(seq: Long, at: Long, name: String) = LogItem(seq, t + at, name, 1, 10, QueryAction.UPSTREAM, null, null, 0)
+        val rows = app.aduster.ui.log.ledgerOf(listOf(e(4, 65_000, "a.test"), e(3, 30_000, "b.test"), e(2, 20_000, "c.test"), e(1, 10_000, "d.test")))
+        val runs = app.aduster.ui.log.runsOf(rows)
+        // minute 1, a.test | minute 0, b, c, d
+        assertEquals(listOf(0, 0, 0, 0, 1, 2), runs.index.toList())
+        assertEquals(listOf(0, 1, 0, 3, 3, 3), runs.count.toList())
     }
 
     private fun contrast(a: androidx.compose.ui.graphics.Color, b: androidx.compose.ui.graphics.Color): Double {

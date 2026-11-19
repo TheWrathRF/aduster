@@ -34,6 +34,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -211,7 +213,8 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
                 .background(p.surface)
                 .padding(16.dp)
                 // Grows with its lines and with large fonts.
-                .heightIn(min = 120.dp),
+                .heightIn(min = 120.dp)
+                .semantics { contentDescription = "Never decrypted sites" },
             decorationBox = { inner ->
                 if (exclusions.isEmpty()) Text("mybank.example\nwork.example", style = Type.mono, color = p.muted)
                 inner()

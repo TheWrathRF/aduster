@@ -43,7 +43,7 @@ import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
 import kotlinx.coroutines.launch
 
-private enum class Dialog { UPSTREAM, CUSTOM_UPSTREAM, BLOCK_MODE, INTERVAL, LOG_SIZE, THEME, RESET, LICENCES }
+private enum class Dialog { UPSTREAM, CUSTOM_UPSTREAM, BLOCK_MODE, INTERVAL, LOG_SIZE, THEME, RESET, CLEAR_LOG, LICENCES }
 
 @Composable
 fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
@@ -127,12 +127,7 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
                 }
             }
             row {
-                ListRow("Clear log", onClick = {
-                    scope.launch {
-                        val ok = vm.clearLog()
-                        Toast.makeText(ctx, if (ok) "Log cleared" else "Could not clear the log", Toast.LENGTH_SHORT).show()
-                    }
-                })
+                ListRow("Clear log", onClick = { dialog = Dialog.CLEAR_LOG })
             }
             row { ListRow("Reset statistics", onClick = { dialog = Dialog.RESET }, titleColor = p.warn) }
         }
@@ -219,7 +214,7 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
                     }
                 },
             ) {
-                InputField(value, { value = it.trim() }, "https://dns.example/dns-query", Modifier.fillMaxWidth(), color = p.bg)
+                InputField(value, { value = it.trim() }, "https://dns.example/dns-query", Modifier.fillMaxWidth(), label = "DNS server address", color = p.bg)
                 Text("https://… for DoH, tls://… for DoT", style = Type.small, color = p.muted, modifier = Modifier.padding(start = 18.dp, top = 8.dp))
             }
         }
@@ -253,6 +248,7 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
                 }
             },
         )
+        Dialog.CLEAR_LOG -> app.aduster.ui.common.ClearLogDialog(scope, { vm.clearLog() }) { dialog = null }
         Dialog.LICENCES -> LicencesDialog { dialog = null }
         null -> {}
     }

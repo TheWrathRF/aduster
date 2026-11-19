@@ -39,6 +39,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
@@ -152,7 +154,7 @@ fun RulesScreen(vm: MainViewModel, onBack: () -> Unit) {
             // Every layer for one site: DNS (all apps) and how browsers' pages on it are
             // handled right now (never decrypted, bot-check bypass with its end, media, …).
             SectionHeading("Check a site")
-            InputField(domain, { domain = it }, "ads.example.com", Modifier.fillMaxWidth().padding(horizontal = Gutter), icon = AdIcons.Search)
+            InputField(domain, { domain = it }, "ads.example.com", Modifier.fillMaxWidth().padding(horizontal = Gutter), label = "Site to check", icon = AdIcons.Search)
             AnimatedContent(
                 targetState = verdict to site,
                 transitionSpec = { fadeIn(tween(Motion.MEDIUM)) togetherWith fadeOut(tween(Motion.SHORT)) },
@@ -221,7 +223,8 @@ fun RulesScreen(vm: MainViewModel, onBack: () -> Unit) {
                     modifier = Modifier
                         .weight(1f)
                         .padding(end = 14.dp)
-                        .heightIn(min = 240.dp),
+                        .heightIn(min = 240.dp)
+                        .semantics { contentDescription = "My rules" },
                     decorationBox = { inner ->
                         if (text.isEmpty()) Text(HELP, style = Type.mono, color = p.muted)
                         inner()

@@ -161,6 +161,17 @@ suspend fun DataStore<Settings>.updateOrKeep(current: Settings, change: (Setting
         change(current)
     }
 
+/** The fields of [text] that decode on their own, or null when it is not a JSON object. */
+internal fun salvageSettings(text: String): Settings? {
+    val obj = runCatching { SettingsJson.parseToJsonElement(text) as? kotlinx.serialization.json.JsonObject }.getOrNull() ?: return null
+    val kept = LinkedHashMap<String, kotlinx.serialization.json.JsonElement>()
+    for ((k, v) in obj) {
+        val trial = kotlinx.serialization.json.JsonObject(kept + (k to v))
+        if (runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), trial) }.isSuccess) kept[k] = v
+    }
+    return runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), kotlinx.serialization.json.JsonObject(kept)).sanitized() }.getOrNull()
+}
+
 private object SettingsSerializer : Serializer<Settings> {
     override val defaultValue = Settings()
 
@@ -177,19 +188,8 @@ private object SettingsSerializer : Serializer<Settings> {
             // One bad field must not cost every rule and list: the file is kept
             // as settings.corrupt-<time>.json and every field that still reads is kept.
             file?.let { f -> runCatching { File(f.parentFile, "settings.corrupt-${System.currentTimeMillis()}.json").writeText(text) } }
-            salvage(text) ?: throw CorruptionException("settings", e)
+            salvageSettings(text) ?: throw CorruptionException("settings", e)
         }
-    }
-
-    /** The fields of [text] that decode on their own, or null when it is not a JSON object. */
-    private fun salvage(text: String): Settings? {
-        val obj = runCatching { SettingsJson.parseToJsonElement(text) as? kotlinx.serialization.json.JsonObject }.getOrNull() ?: return null
-        val kept = LinkedHashMap<String, kotlinx.serialization.json.JsonElement>()
-        for ((k, v) in obj) {
-            val trial = kotlinx.serialization.json.JsonObject(kept + (k to v))
-            if (runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), trial) }.isSuccess) kept[k] = v
-        }
-        return runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), kotlinx.serialization.json.JsonObject(kept)).sanitized() }.getOrNull()
     }
 
     override suspend fun writeTo(t: Settings, output: OutputStream) {

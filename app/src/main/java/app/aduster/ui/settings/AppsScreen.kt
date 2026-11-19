@@ -17,6 +17,7 @@ import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -38,7 +39,7 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
     val p = LocalPalette.current
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
     var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
-    var query by remember { mutableStateOf("") }
+    var query by rememberSaveable { mutableStateOf("") }
     var showSystem by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { apps = vm.installedApps() }
@@ -48,10 +49,12 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
     // Null until the stored set is read: after the main process was killed this screen is
     // restored before DataStore's first read, and starting from the placeholder settings would
     // save an empty set over the user's exclusions (the same guard as My rules).
-    var excluded by remember { mutableStateOf<Set<String>?>(null) }
+    // Kept across a rotation: read again from the store, a toggle whose save had not landed yet
+    // would come back as the old set and be saved over the new one a second later.
+    var excluded by rememberSaveable(stateSaver = NullableSetSaver) { mutableStateOf<Set<String>?>(null) }
     // The exclusions as the screen opened: the order follows them, so a row does not jump away
     // from under the finger that toggled it.
-    var opened by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var opened by rememberSaveable(stateSaver = SetSaver) { mutableStateOf<Set<String>>(emptySet()) }
     LaunchedEffect(Unit) {
         if (excluded == null) excluded = vm.storedSettings().excludedApps.also { opened = it }
     }
@@ -105,3 +108,14 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
         }
     }
 }
+
+/** A set of package names in the saved state, as a list (null: not read yet, nothing saved). */
+private val NullableSetSaver = androidx.compose.runtime.saveable.Saver<Set<String>?, ArrayList<String>>(
+    save = { it?.let(::ArrayList) },
+    restore = { it.toSet() },
+)
+
+private val SetSaver = androidx.compose.runtime.saveable.Saver<Set<String>, ArrayList<String>>(
+    save = { ArrayList(it) },
+    restore = { it.toSet() },
+)

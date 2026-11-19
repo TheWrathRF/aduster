@@ -66,7 +66,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
+import app.aduster.ui.theme.switchEdge
 import app.aduster.ui.theme.Type
+import kotlinx.coroutines.launch
 
 val Gutter = 16.dp
 
@@ -348,7 +350,7 @@ fun AdusterSwitch(checked: Boolean, enabled: Boolean = true, label: String? = nu
             checkedBorderColor = p.accent,
             uncheckedThumbColor = p.muted,
             uncheckedTrackColor = p.bg,
-            uncheckedBorderColor = p.faint,
+            uncheckedBorderColor = p.switchEdge,
         ),
     )
 }
@@ -451,6 +453,30 @@ fun AdDialog(
     )
 }
 
+/**
+ * Clearing the log asks first (it cannot be undone), from the Log and from Settings alike, and
+ * then says what happened.
+ */
+@Composable
+fun ClearLogDialog(scope: kotlinx.coroutines.CoroutineScope, clear: suspend () -> Boolean, onDismiss: () -> Unit) {
+    // [scope]: the screen's, which outlives this dialog (closed before the clear finishes).
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    AdDialog(
+        "Clear the log?",
+        onDismiss = onDismiss,
+        text = "Every entry in it is removed. Statistics stay.",
+        confirm = "Clear",
+        destructive = true,
+        onConfirm = {
+            onDismiss()
+            scope.launch {
+                val ok = clear()
+                android.widget.Toast.makeText(ctx, if (ok) "Log cleared" else "Could not clear the log", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        },
+    )
+}
+
 /** Single choice: a row per option, the selected one on a pill with its radio filled. */
 @Composable
 fun <T> ChoiceDialog(
@@ -494,13 +520,18 @@ fun <T> ChoiceDialog(
     }
 }
 
-/** A one-line pill field: on the card colour on screens, on the page colour ([color]) inside a dialog's card. */
+/**
+ * A one-line pill field: on the card colour on screens, on the page colour ([color]) inside a
+ * dialog's card. [label]: its name for TalkBack (the placeholder when that names it; an example
+ * value such as "example.com" does not).
+ */
 @Composable
 fun InputField(
     value: String,
     onChange: (String) -> Unit,
     placeholder: String,
     modifier: Modifier = Modifier,
+    label: String = placeholder,
     style: TextStyle = Type.body,
     icon: ImageVector? = null,
     error: Boolean = false,
@@ -529,7 +560,7 @@ fun InputField(
                 singleLine = true,
                 textStyle = style.copy(color = p.text),
                 cursorBrush = SolidColor(p.accent),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().semantics { contentDescription = label },
             )
         }
         if (icon != null && value.isNotEmpty()) {

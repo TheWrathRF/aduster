@@ -71,7 +71,7 @@ fun SitesScreen(vm: MainViewModel, onBack: () -> Unit) {
             color = p.muted,
             modifier = Modifier.padding(horizontal = Gutter, vertical = 8.dp),
         )
-        InputField(input, { input = it }, "example.com", Modifier.fillMaxWidth().padding(horizontal = Gutter), error = input.isNotBlank() && host == null)
+        InputField(input, { input = it }, "example.com", Modifier.fillMaxWidth().padding(horizontal = Gutter), label = "Site", error = input.isNotBlank() && host == null)
         Spacer(Modifier.height(10.dp))
         Row(Modifier.padding(horizontal = Gutter), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             // Both wait for a valid site, so bad input never fails silently.
