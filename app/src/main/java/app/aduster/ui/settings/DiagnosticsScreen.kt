@@ -256,7 +256,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                 row {
                     ListRow(
                         "Export report",
-                        "Saved to Downloads",
+                        "Saved to Downloads; the newest ${app.aduster.vpn.Reports.KEEP} are kept",
                         onClick = {
                             scope.launch {
                                 val name = withContext(Dispatchers.IO) { vm.saveReport() }

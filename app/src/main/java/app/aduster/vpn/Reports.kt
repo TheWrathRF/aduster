@@ -38,6 +38,7 @@ object Reports {
             values.clear()
             values.put(MediaStore.Downloads.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
+            prune(ctx)
             name
         } catch (_: Exception) {
             // No half-written pending entry left behind.
@@ -80,6 +81,35 @@ object Reports {
                 arrayOf(likeLiteral("Aduster_report_") + "%.json"),
             )
         }.getOrDefault(0)
+
+    /** Of the saved reports' [names], those beyond the newest [keep] (the name holds the time). */
+    internal fun beyondNewest(names: List<String>, keep: Int = KEEP): List<String> =
+        names.filter { REPORT.matches(it) }.sortedDescending().drop(keep)
+
+    /** A report's name, also as the system renames a second one of the same second ("… (1).json"). */
+    private val REPORT = Regex("""^Aduster_report_\d{8}-\d{6}( \(\d+\))?\.json$""")
+
+    /** Deletes this install's reports beyond the newest [KEEP]. */
+    private fun prune(ctx: Context) {
+        val resolver = ctx.contentResolver
+        val found = HashMap<String, Long>()
+        runCatching {
+            resolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME),
+                "${MediaStore.Downloads.DISPLAY_NAME} LIKE ? ESCAPE '\\'",
+                arrayOf(likeLiteral("Aduster_report_") + "%.json"),
+                null,
+            )?.use { c -> while (c.moveToNext()) found[c.getString(1)] = c.getLong(0) }
+        }
+        for (name in beyondNewest(found.keys.toList())) {
+            val id = found[name] ?: continue
+            runCatching { resolver.delete(android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id), null, null) }
+        }
+    }
+
+    /** Reports kept in Downloads: older ones go when a new one is saved (they name visited hosts). */
+    const val KEEP = 10
 
     /** [s] matched as written in a LIKE pattern with `ESCAPE '\'` (`_` and `%` are wildcards). */
     internal fun likeLiteral(s: String): String = s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
