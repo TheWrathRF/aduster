@@ -264,9 +264,9 @@ extern "system" fn native_init(mut env: JNIEnv, _: JClass, config: JString) -> j
                 // A pause that ends: browser connections opened during it are closed. Decided by
                 // the config, not the clock: the end-of-pause alarm runs after the pause ran
                 // out, when a clock check already says "active".
-                let pause_ends = s.config.load().paused_until_ms != 0 && cfg.paused_until_ms == 0;
+                let was_paused = s.config.load().paused();
                 s.set_config(cfg);
-                if pause_ends {
+                if was_paused && !s.config.load().paused() {
                     proxy::refilter();
                 }
             }

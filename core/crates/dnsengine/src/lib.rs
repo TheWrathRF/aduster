@@ -67,6 +67,11 @@ pub struct Config {
 }
 
 impl Config {
+    /// Whether this config holds a pause (running or run out), by either clock.
+    pub fn paused(&self) -> bool {
+        self.paused_until_ms != 0 || self.pause_until_boot != 0
+    }
+
     /// Fills [`Config::pause_until_boot`] from what the app sent.
     fn with_pause_deadline(mut self) -> Config {
         let left = match self.pause_left_ms {
@@ -273,14 +278,16 @@ impl Shared {
     /// not guessed from a gap). Whether a pause runs or ran out is read on the boot clock, as the
     /// pause itself is (a wall-clock change moves neither); the markers carry wall times.
     fn mark_pause(&self, old: &Config, new: &Config) {
-        if old.paused_until_ms == new.paused_until_ms {
+        // The same pause sent again (a pause can come without its wall-clock end, once the wall
+        // time moved past it while the boot clock leaves time: `paused`).
+        if old.paused_until_ms == new.paused_until_ms && old.paused() == new.paused() {
             return;
         }
         self.rules_watch.send_modify(|g| *g += 1);
         let (now, boot) = (now_ms(), clock::boot_ms());
         let running = |c: &Config| c.pause_until_boot > boot;
         // Unless a record already marked it (`resume_if_ran_out`).
-        if old.paused_until_ms != 0 && !self.resume_logged.swap(true, Ordering::Relaxed) {
+        if old.paused() && !self.resume_logged.swap(true, Ordering::Relaxed) {
             if !running(old) {
                 // A timed pause that already ran out ended at its own time (one sent already
                 // over has no boot-clock end: its own wall time, as sent).
@@ -293,10 +300,10 @@ impl Shared {
                 self.log_marker(Action::Resumed, now);
             }
         }
-        if new.paused_until_ms != 0 {
+        if new.paused() {
             self.resume_logged.store(false, Ordering::Relaxed);
         }
-        if running(new) && (old.paused_until_ms == 0 || !running(old)) {
+        if running(new) && (!old.paused() || !running(old)) {
             self.log_marker(Action::Paused, now);
         }
     }
@@ -1163,6 +1170,22 @@ mod tests {
         let kinds: Vec<&str> = log.iter().map(|e| e["a"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["Paused", "Resumed"]);
         assert!(log[1]["t"].as_u64().unwrap() >= now, "resumed now, not at the wall-clock end");
+    }
+
+    /// A pause the app re-sends with no wall-clock end (the wall time moved past it) but time left
+    /// on the boot clock is the same pause: it still ends with "Resumed".
+    #[test]
+    fn a_pause_resent_without_its_wall_end_still_resumes() {
+        let s = Shared::new(Config::default());
+        let now = now_ms();
+        s.set_config(Config { paused_until_ms: now + 60_000, pause_left_ms: Some(60_000), ..Config::default() });
+        s.set_config(Config { paused_until_ms: 0, pause_left_ms: Some(30_000), ..Config::default() });
+        assert!(s.config.load().paused(), "still paused");
+        s.set_config(Config::default());
+        assert!(!s.config.load().paused());
+        let log: Vec<serde_json::Value> = serde_json::from_str(&s.log_json(0, 10)).unwrap();
+        let kinds: Vec<&str> = log.iter().map(|e| e["a"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["Paused", "Resumed"]);
     }
 
     /// A timed pause that runs out is marked "Resumed" when the next lookup is recorded, so the
