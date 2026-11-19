@@ -48,6 +48,19 @@ class UserRulesTest {
         assertEquals("##.ad\n||x.test/ads/\n||x.test^\$script\n/banner\\d+/\n|https://x.test/ad.js\n@@||x.test/ok/", UserRules.webLines(lines.joinToString("\n"), a))
     }
 
+    /** Option values may hold spaces (`$csp=script-src 'self'`): such a rule is a page rule, not an error. */
+    @Test
+    fun optionValuesMayHoldSpaces() {
+        val reasons = mapOf(
+            "||x.test^\$csp=script-src 'self'" to "modifier not applicable at DNS level",
+            "||x.test/a b/" to "pattern is not hostname-level",
+        )
+        val lines = reasons.keys.toList()
+        val a = UserRules.analyze(lines.joinToString("\n"), matcher(reasons))
+        assertEquals(Layer.CHROME, a.layers[1])
+        assertEquals(Layer.INVALID, a.layers[2])
+    }
+
     /** The Sites screen: the host a person typed or pasted, and the whole-site rules it lists and sets. */
     @Test
     fun siteHelpers() {

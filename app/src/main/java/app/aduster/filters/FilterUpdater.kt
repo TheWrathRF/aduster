@@ -167,10 +167,16 @@ object FilterUpdater {
     /** How many of the lists [ids] have a failed download (their rows say why). */
     internal fun failedOf(meta: FilterMeta, ids: List<String>): Int = ids.count { meta.lists[it]?.error != null }
 
-    /** The lists an update downloads ([web]: page filtering runs); the app's own come with it. */
-    fun downloaded(settings: Settings, web: Boolean): List<String> =
-        (FilterCatalog.enabledDns(settings) + if (web) FilterCatalog.enabledWeb(settings) + FilterCatalog.exclusionLists else emptyList())
-            .filter { it.asset == null }.map { it.id }
+    /**
+     * The lists in use that an update downloads ([web]: page filtering runs) and that have a row
+     * on Filters, which says why one failed: not the app's own lists (they come with it), the
+     * never-decrypt lists or the lists that ride along with another.
+     */
+    fun downloaded(settings: Settings, web: Boolean): List<String> {
+        val rows = FilterCatalog.all(settings).map { it.id }.toSet()
+        return (FilterCatalog.enabledDns(settings) + if (web) FilterCatalog.enabledWeb(settings) else emptyList())
+            .filter { it.asset == null && it.id in rows }.map { it.id }
+    }
 
     /** A list's metadata after one download ([r]) of it and its parts ([inc]) from [url]. */
     internal fun nextMeta(old: ListMeta, r: Fetch, inc: Includes?, url: String, now: Long): ListMeta {

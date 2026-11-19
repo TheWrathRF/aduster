@@ -130,6 +130,19 @@ class FilterUpdaterTest {
     }
 
     /**
+     * Filters' header counts failed lists among those with a row of their own: the never-decrypt
+     * lists and the lists that ride along with another have none.
+     */
+    @Test
+    fun theHeaderCountsOnlyListsWithARow() {
+        val s = app.aduster.settings.Settings(httpsFiltering = true)
+        val rows = FilterCatalog.all(s).map { it.id }.toSet()
+        val counted = FilterUpdater.downloaded(s, web = true)
+        assertEquals(emptyList<String>(), counted.filter { it !in rows })
+        assertEquals(true, counted.isNotEmpty())
+    }
+
+    /**
      * Without the part's metadata (a catalog URL change, an unreadable meta.json), a failed
      * download keeps the good copy, so the list does not compile without that part.
      */

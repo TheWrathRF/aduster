@@ -53,7 +53,8 @@ object UserRules {
             return runCatching { Regex(body.substring(1, end)) }.isSuccess
         }
         val pattern = body.substringBefore('$')
-        if (pattern.any { it.isWhitespace() } || body.substringAfter('$', "").any { it.isWhitespace() }) return false
+        // Option values may hold spaces (`$csp=script-src 'self'`); the pattern never does.
+        if (pattern.any { it.isWhitespace() }) return false
         if (pattern.startsWith("||")) {
             val host = pattern.removePrefix("||").takeWhile { it != '/' && it != '^' && it != '|' && it != '?' }
             if (!HOST_PART.matches(host)) return false
