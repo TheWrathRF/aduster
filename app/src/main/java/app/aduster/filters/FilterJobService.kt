@@ -271,8 +271,26 @@ object FilterJobs {
         return if (here == null && there == null) null else here == true || there == true
     }
 
-    /** "Update now" is tried again when every list it checked failed. */
-    internal fun retryAfter(r: FilterUpdater.Result): Boolean = r.failed.isNotEmpty() && r.failed.size == r.checked
+    /**
+     * "Update now" is tried again when every list it checked could not be downloaded (not when
+     * one was held back because it shrank: the same copy again, 30 s later, would pass).
+     */
+    internal fun retryAfter(r: FilterUpdater.Result): Boolean = r.checked > 0 && r.unreachable == r.checked
+
+    private fun waitingSince(ctx: Context): Long = ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE).getLong("waiting_since", 0L)
+
+    /**
+     * Whether "Update now" goes on retrying: for 30 minutes from its first retry (the start is
+     * kept until a run gets through, or gives up).
+     */
+    private fun keepTrying(ctx: Context): Boolean {
+        val prefs = ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val since = waitingSince(ctx).takeIf { it > 0 } ?: now.also { prefs.edit().putLong("waiting_since", it).apply() }
+        if (now - since <= GIVE_UP_AFTER_MS) return true
+        prefs.edit().remove("waiting_since").apply()
+        return false
+    }
 
     /** Rebuilds the engines whose inputs changed and tells :core which ones to load. */
     private fun compileNow(ctx: Context, id: Int, settings: Settings, forceWeb: Boolean) {
@@ -303,22 +321,17 @@ object FilterJobs {
                             if (id != ID_NOW) return true
                             // A fetch of missing lists also stands for the compile its settings
                             // change needed (a profile, a list already on disk beside it): that
-                            // is done now, the download when a network comes.
-                            if (!force) compileNow(ctx, id, settings, forceWeb = false)
+                            // is done now (once, not at every retry), the download when a
+                            // network comes.
+                            if (!force && waitingSince(ctx) == 0L) compileNow(ctx, id, settings, forceWeb = false)
                             // "Update now" without a network: the screen says so while it retries,
                             // for at most 30 minutes (backoff 30 s, 1, 2, 4, 8, 16 min); then the
                             // periodic update or the next app open catches up.
-                            val prefs = ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE)
-                            val since = prefs.getLong("waiting_since", 0L).takeIf { it > 0 } ?: System.currentTimeMillis().also { prefs.edit().putLong("waiting_since", it).apply() }
-                            if (System.currentTimeMillis() - since > GIVE_UP_AFTER_MS) {
-                                prefs.edit().remove("waiting_since").apply()
-                                return false
-                            }
+                            if (!keepTrying(ctx)) return false
                             waiting = true
                             publish(id, Progress("Waiting for network"))
                             return true
                         }
-                        ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE).edit().remove("waiting_since").apply()
                         publish(id, Progress("Starting"))
                         val check = when {
                             id == ID_PERIODIC -> FilterUpdater.Check.STALE
@@ -333,8 +346,14 @@ object FilterJobs {
                         if (r.webCompiled) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
                         FilterUpdater.noteAppVersion(ctx)
                         // Retry (with backoff) only if no list it checked came through, e.g. flaky
-                        // network (lists it did not need to check do not count).
-                        id == ID_NOW && retryAfter(r)
+                        // network (lists it did not need to check do not count), and for 30
+                        // minutes at most, as without a network (a dead URL is not asked forever).
+                        if (id == ID_NOW && retryAfter(r)) {
+                            keepTrying(ctx)
+                        } else {
+                            ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE).edit().remove("waiting_since").apply()
+                            false
+                        }
                     }
                 }
                 // Asked for again while this ran (here, or from :core): once more, with what

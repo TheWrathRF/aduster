@@ -4,6 +4,7 @@ import android.content.Context
 import app.aduster.core.NativeCore
 import app.aduster.settings.Settings
 import app.aduster.settings.DeviceProfile
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -39,8 +40,18 @@ object FilterUpdater {
     /**
      * [dnsCompiled]/[webCompiled]: which engines were rebuilt (and need reloading). [checked]:
      * the lists this update downloaded or asked about; [unchanged] also counts those it left.
+     * [failed] names the lists that failed or were held back (they shrank); [unreachable] counts
+     * those that failed.
      */
-    data class Result(val downloaded: Int, val unchanged: Int, val failed: List<String>, val dnsCompiled: Boolean, val webCompiled: Boolean, val checked: Int = 0) {
+    data class Result(
+        val downloaded: Int,
+        val unchanged: Int,
+        val failed: List<String>,
+        val dnsCompiled: Boolean,
+        val webCompiled: Boolean,
+        val checked: Int = 0,
+        val unreachable: Int = 0,
+    ) {
         val compiled get() = dnsCompiled || webCompiled
     }
 
@@ -146,7 +157,16 @@ object FilterUpdater {
      * while the page lists are still downloading; the page engine follows. [progress] gets the
      * last list checked, how many are done and how many there are.
      */
-    fun update(context: Context, settings: Settings, check: Check, onDns: (Boolean) -> Unit = {}, progress: (String, Int, Int) -> Unit = { _, _, _ -> }): Result {
+    fun update(context: Context, settings: Settings, check: Check, onDns: (Boolean) -> Unit = {}, progress: (String, Int, Int) -> Unit = { _, _, _ -> }): Result =
+        // One update at a time (the periodic one and "Update now" may overlap): each reads what
+        // meta.json knows of the files before it downloads and records it after, and two at once
+        // would record each other's files with the wrong facts or remove each other's parts. The
+        // second waits; it then finds the lists just checked.
+        updating.withLock { updateNow(context, settings, check, onDns, progress) }
+
+    private val updating = java.util.concurrent.locks.ReentrantLock()
+
+    private fun updateNow(context: Context, settings: Settings, check: Check, onDns: (Boolean) -> Unit, progress: (String, Int, Int) -> Unit): Result {
         val store = FilterStore(context)
         store.locked { cleanup(store, settings) }
         val web = webWanted(context, settings)
@@ -218,7 +238,7 @@ object FilterUpdater {
             "update: $all lists, ${changedIds.size} changed $changedIds, ${failed.size} failed in ${lastDone - t0} ms ($total checked); " +
                 "DNS ${if (dnsCompiled) "compiled" else "unchanged"} $dnsMs ms, ready at $dnsReady ms, web ${if (webCompiled) "compiled" else "unchanged"} $webMs ms",
         )
-        return Result(changedIds.size, all - changedIds.size - failed.size, failed, dnsCompiled, webCompiled, checked = total)
+        return Result(changedIds.size, all - changedIds.size - failed.size, failed, dnsCompiled, webCompiled, checked = total, unreachable = checked.count { it.fetch is Fetch.Failed })
     }
 
     /** Downloads list [l] and its parts ([prev]: what its last check stored). */
@@ -329,12 +349,13 @@ object FilterUpdater {
     /** Recompiles only if the set of sources or their contents changed (or [force]). */
     fun compile(context: Context, settings: Settings, force: Boolean = false): Boolean {
         val store = FilterStore(context)
-        return store.locked { compileLocked(context, store, settings, force) }
+        // A compile job also clears what a cut-short write left (an update does it in cleanup).
+        return store.locked { store.removeLeftovers(); compileLocked(context, store, settings, force) }
     }
 
     fun compileWeb(context: Context, settings: Settings, force: Boolean = false): Boolean {
         val store = FilterStore(context)
-        return store.locked { compileWebLocked(context, store, settings, force) }
+        return store.locked { store.removeLeftovers(); compileWebLocked(context, store, settings, force) }
     }
 
     /**
@@ -422,7 +443,7 @@ object FilterUpdater {
     }
 
     /** [stored] if it still describes [f] (same size), else [f] read once. */
-    private fun scanOf(f: File, stored: FileScan?): FileScan = stored?.takeIf { it.size == f.length() } ?: scanFile(f)
+    private fun scanOf(f: File, stored: FileScan?): FileScan = stored?.takeIf { it.describes(f) } ?: scanFile(f)
 
     /** Reads a stored file once for its [FileScan] (a file stored before these facts were kept). */
     internal fun scanFile(f: File): FileScan {
@@ -435,7 +456,7 @@ object FilterUpdater {
                 s.feed(buf, n)
             }
         }
-        return s.finish()
+        return s.finish().copy(mtime = f.lastModified())
     }
 
     /** Builds the browsers' page-filtering engine from the enabled web lists. */
@@ -493,7 +514,9 @@ object FilterUpdater {
         // phone, so it is done only when it decides something: the page lists are unchanged
         // and the DNS table (or the engine's side table) is not the one it was worked out for.
         // A compile hands back the digest of what it built.
-        fun digestKey() = "${sig(store.webExtra)}|${sig(store.dnsTable)}"
+        // The engine file too: one replaced without its side table (a compile cut short between
+        // its renames) is asked about again, and the engine says the pair does not match.
+        fun digestKey() = "${sig(store.webTable)}|${sig(store.webExtra)}|${sig(store.dnsTable)}"
         if (!force && store.webTable.exists() && meta.webSignature.substringBeforeLast("|dns=", "") == base) {
             val key = digestKey()
             val digest = if (key == meta.webDigestKey && meta.webDigest.isNotEmpty()) meta.webDigest else native.digest(store.webTable.path, if (store.dnsTable.exists()) store.dnsTable.path else "")
@@ -644,7 +667,7 @@ object FilterUpdater {
             when (val code = conn.responseCode) {
                 // A stored file whose facts are not known yet (meta.json of an older version) is
                 // read this once.
-                HttpURLConnection.HTTP_NOT_MODIFIED -> Fetch.NotModified(if (target.exists() && stored?.size != target.length()) scanFile(target) else null)
+                HttpURLConnection.HTTP_NOT_MODIFIED -> Fetch.NotModified(if (target.exists() && stored?.describes(target) != true) scanFile(target) else null)
                 HttpURLConnection.HTTP_OK -> {
                     // One pass: written to the temporary file while its hash, rule lines and
                     // includes are taken.
@@ -684,11 +707,11 @@ object FilterUpdater {
                     // mtime decide whether the engines are rebuilt.
                     if (old != null && target.length() == scan.size && old.value.sha256 == scan.sha256) {
                         tmp.delete()
-                        return Fetch.Same(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), scan)
+                        return Fetch.Same(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), scan.copy(mtime = target.lastModified()))
                     }
                     // rename(2) on Android; also replaces the stored copy on a PC's JVM (the tests).
                     java.nio.file.Files.move(tmp.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
-                    Fetch.Updated(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), scan.size, scan)
+                    Fetch.Updated(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), scan.size, scan.copy(mtime = target.lastModified()))
                 }
                 else -> Fetch.Failed("HTTP $code")
             }
@@ -719,7 +742,7 @@ internal class ListScanner {
 
     // The line being read: what its first non-blank characters say it is.
     private var state = START
-    private val bang = java.io.ByteArrayOutputStream(128)
+    private val bang = java.io.ByteArrayOutputStream(256)
 
     fun feed(buf: ByteArray, n: Int) {
         digest.update(buf, 0, n)
@@ -733,7 +756,8 @@ internal class ListScanner {
     }
 
     private fun step(b: Byte) {
-        if (b == NL) {
+        // A line ends at LF, CR or CRLF, as the line reader split it.
+        if (b == NL || b == CR) {
             endLine()
             return
         }
@@ -752,7 +776,8 @@ internal class ListScanner {
                 else -> OTHER
             }
             HASH2 -> { if (b == HASH) lines++; OTHER }
-            BANG_LINE -> { if (bang.size() < 512) bang.write(b.toInt()); BANG_LINE }
+            // A `!` line too long for any include name (4 KB) is a comment, never a cut-off name.
+            BANG_LINE -> if (bang.size() < 4096) { bang.write(b.toInt()); BANG_LINE } else OTHER
             else -> OTHER
         }
     }

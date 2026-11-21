@@ -8,12 +8,14 @@ import java.io.RandomAccessFile
 
 /**
  * What an update needs to know about a stored list file, taken while it was downloaded, so a
- * check that finds it unchanged reads nothing: its [size] (the facts hold only while the file
- * still has it), SHA-256, rule lines (the shrink guard's measure) and the names it pulls in with
- * `!#include`.
+ * check that finds it unchanged reads nothing: SHA-256, rule lines (the shrink guard's measure)
+ * and the names it pulls in with `!#include`. They hold only while the file still has its [size]
+ * and [mtime] (another update, or one cut short before it saved this, may have replaced it).
  */
 @Serializable
-data class FileScan(val size: Long, val sha256: String, val lines: Int, val includes: List<String> = emptyList())
+data class FileScan(val size: Long, val sha256: String, val lines: Int, val includes: List<String> = emptyList(), val mtime: Long = 0) {
+    fun describes(f: java.io.File): Boolean = size == f.length() && mtime == f.lastModified()
+}
 
 /**
  * Validators of one downloaded file, for conditional requests, and the size of a download held

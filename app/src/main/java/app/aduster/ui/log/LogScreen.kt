@@ -85,6 +85,7 @@ import app.aduster.ui.common.InputField
 import app.aduster.ui.common.Motion
 import app.aduster.ui.common.ScreenTitle
 import app.aduster.ui.common.TextAction
+import app.aduster.ui.counted
 import app.aduster.ui.fmt
 import app.aduster.ui.micros
 import app.aduster.ui.theme.AdIcons
@@ -275,7 +276,7 @@ fun LogScreen(vm: MainViewModel) {
             apps,
             app ?: Int.MIN_VALUE,
             label = { appName(labels, it) },
-            detail = { uid -> "${fmt(entries.count { it.uid == uid })} entries" },
+            detail = { uid -> counted(entries.count { it.uid == uid }, "entry", "entries") },
             onDismiss = { appDialog = false },
         ) {
             appDialog = false

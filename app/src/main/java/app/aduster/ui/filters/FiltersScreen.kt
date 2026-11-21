@@ -286,7 +286,7 @@ private fun Header(meta: app.aduster.filters.FilterMeta, inUse: List<String>, pr
             }
             if (pageRules) {
                 Text(
-                    meta.webError?.let { "Page rules failed to build: $it" } ?: "${fmt(meta.webRules)} page rules",
+                    meta.webError?.let { "Page rules failed to build: $it" } ?: counted(meta.webRules, "page rule"),
                     style = Type.small,
                     color = if (meta.webError != null) p.warn else p.muted,
                 )
@@ -358,7 +358,7 @@ private fun listDetail(m: ListMeta): String {
     // Hostname rules the DNS layer already enforces are not duplicated in the page filter; the
     // count includes them, as the list itself does.
     val n = m.rules + m.dnsCovered
-    val rules = if (n > 0) "${fmt(n)} rules" else "not compiled"
+    val rules = if (n > 0) counted(n, "rule") else "not compiled"
     val when_ = if (m.updatedAt > 0) ago(m.updatedAt) else "built in"
     return if (m.error != null) "$rules · update failed: ${m.error}" else "$rules · $when_"
 }

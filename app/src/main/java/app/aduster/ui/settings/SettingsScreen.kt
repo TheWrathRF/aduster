@@ -87,7 +87,7 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
             row { ListRow("Reply to blocked lookups", onClick = { dialog = Dialog.BLOCK_MODE }) { ValueText(s.blockMode.label) } }
             row { ToggleRow("Block disguised trackers", "Trackers hidden under a site's own name", s.cnameCheck) { v -> vm.update { it.copy(cnameCheck = v) } } }
             row { ToggleRow("Optimistic cache", "Answers from cache while it refreshes", s.optimisticCache) { v -> vm.update { it.copy(optimisticCache = v) } } }
-            row { ToggleRow("Block DNS bypass", "Stops apps from using their own encrypted DNS", s.blockDnsBypass) { v -> vm.update { it.copy(blockDnsBypass = v) } } }
+            row { ToggleRow("Block DNS bypass", "Stops apps from using their own encrypted DNS", s.blockDnsBypass) { v -> vm.update(fetch = v) { it.copy(blockDnsBypass = v) } } }
             row { ToggleRow("IPv4-only answers", "Leaves out IPv6 addresses; helps where IPv6 is broken", s.ipv4Only) { v -> vm.update { it.copy(ipv4Only = v) } } }
         }
 

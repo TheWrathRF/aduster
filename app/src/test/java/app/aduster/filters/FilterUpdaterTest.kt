@@ -255,7 +255,55 @@ class FilterUpdaterTest {
             assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
             assertEquals(2, native.digests)
             assertEquals(3, native.compiles)
+            // The engine file replaced on its own (a compile cut short between its renames): the
+            // digest is asked again, and the engine says the pair does not match.
+            store.webTable.writeText("the engine of another compile")
+            native.dnsDigest = "mismatch"
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
+            assertEquals(3, native.digests)
         } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    /**
+     * What a download stored about a list holds only for that file: one replaced by a file of the
+     * same size (a second update, or one cut short before it saved what it found) is read again,
+     * so its own includes are fetched.
+     */
+    @Test
+    fun aStoredFileReplacedWithTheSameSizeIsReadAgain() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val body = "! Title: l\n!#include pa.txt\n||x.test^\n"
+        server.createContext("/") { ex ->
+            val name = ex.requestURI.path.removePrefix("/")
+            val text = if (name == "l.txt") body else "||$name.test^\n"
+            val tag = "\"${text.hashCode()}\""
+            ex.responseHeaders.add("ETag", tag)
+            if (ex.requestHeaders.getFirst("If-None-Match") == tag) {
+                ex.sendResponseHeaders(304, -1)
+            } else {
+                val b = text.toByteArray()
+                ex.sendResponseHeaders(200, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            }
+            ex.close()
+        }
+        server.start()
+        val tmp = Files.createTempDirectory("aduster-same-size").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("l", "L", "http://127.0.0.1:${server.address.port}/l.txt", false, Group.ADS, true, "")
+            FilterUpdater.checkAll(store, listOf(l), FilterUpdater.Check.ALL)
+            val raw = store.raw("l")
+            val stamp = raw.lastModified()
+            raw.writeText(body.replace("pa.txt", "pb.txt"))
+            raw.setLastModified(stamp + 2_000)
+            val r = FilterUpdater.checkAll(store, listOf(l), FilterUpdater.Check.ALL).single()
+            assertEquals(listOf("pb.txt"), (r.fetch as FilterUpdater.Fetch.NotModified).scan?.includes)
+            assertEquals(true, java.io.File(store.includes("l"), "pb.txt").exists())
+        } finally {
+            server.stop(0)
             tmp.deleteRecursively()
         }
     }
@@ -281,6 +329,16 @@ class FilterUpdaterTest {
         val scan = s.finish()
         assertEquals(old(text), scan.lines)
         assertEquals(listOf("sub.txt", "other-part_1.txt"), scan.includes)
+        // Lines ended by a bare CR (as the line reader split them), a `!` line too long to be an
+        // include, and an include on the last line without a newline.
+        val odd = "! Title\r||a.test^\r||b.test^\r!#include cr.txt\r!#include foo.txt" + " ".repeat(500) + "junk\n" +
+            "!#include " + "a".repeat(505) + "\n! " + "x".repeat(5000) + "\n!#include last.txt"
+        val s2 = ListScanner()
+        odd.toByteArray().let { s2.feed(it, it.size) }
+        val scan2 = s2.finish()
+        assertEquals(old(odd), scan2.lines)
+        val reader = odd.lines().mapNotNull { Regex("""^!#include\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*$""").matchEntire(it.trim())?.groupValues?.get(1) }
+        assertEquals(reader, scan2.includes)
         assertEquals(bytes.size.toLong(), scan.size)
         val sha = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         assertEquals(sha, scan.sha256)
@@ -336,8 +394,11 @@ class FilterUpdaterTest {
      */
     @Test
     fun aFailedFetchOfAMissingListIsTriedAgain() {
-        val oneMissing = FilterUpdater.Result(0, 25, listOf("HaGeZi Threat Intelligence"), false, false, checked = 1)
+        val oneMissing = FilterUpdater.Result(0, 25, listOf("HaGeZi Threat Intelligence"), false, false, checked = 1, unreachable = 1)
         assertEquals(true, FilterJobs.retryAfter(oneMissing))
+        // Held back because it shrank: not asked again 30 s later (the same copy again would
+        // pass the shrink guard); the next scheduled update decides.
+        assertEquals(false, FilterJobs.retryAfter(oneMissing.copy(unreachable = 0)))
         assertEquals(false, FilterJobs.retryAfter(oneMissing.copy(downloaded = 1, checked = 2)))
         assertEquals(false, FilterJobs.retryAfter(FilterUpdater.Result(3, 23, emptyList(), true, true, checked = 26)))
     }

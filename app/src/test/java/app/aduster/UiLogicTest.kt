@@ -82,6 +82,19 @@ class UiLogicTest {
         // A background part found by search; an excluded one stays listed without the switch.
         assertEquals(listOf("com.google.android.safetycore"), shownApps(rows, "safety", background = false, excluded = emptySet()).map { it.pkg })
         assertTrue("com.example.back" in pkgs(shownApps(rows, "", background = false, excluded = setOf("com.example.back"))))
+        // An app switched on keeps its place in the list (the screen puts only those excluded
+        // when it opened first).
+        assertEquals(main.map { it.pkg }, shownApps(rows, "", background = false, excluded = setOf("com.google.android.googlequicksearchbox")).map { it.pkg })
+        // Android's own apps on a core system UID (Settings runs as UID 1000, with the system
+        // server): behind the switch and in search, not in the main list.
+        val system = appRows(facts + PackageFacts("com.android.settings", "Settings", system = true, uid = 1000, internet = true, launchable = true))
+        assertFalse("com.android.settings" in pkgs(shownApps(system, "", background = false, excluded = emptySet())))
+        assertTrue("com.android.settings" in pkgs(shownApps(system, "", background = true, excluded = emptySet())))
+        assertTrue("com.android.settings" in pkgs(shownApps(system, "settings", background = false, excluded = emptySet())))
+        // An excluded package that no longer has a network or a launcher entry can still be
+        // found and switched back.
+        val gone = PackageFacts("com.example.gone", "Gone", system = false, uid = 10300, internet = false, launchable = false)
+        assertTrue("com.example.gone" in pkgs(shownApps(appRows(facts + gone, keep = setOf("com.example.gone")), "", background = false, excluded = setOf("com.example.gone"))))
     }
 
     @Test
@@ -338,9 +351,11 @@ class UiLogicTest {
             Settings(
                 upstream = "custom", customUpstream = "https://dns.other.example/q", blockDnsBypass = false,
                 excludedApps = setOf("com.android.chrome"), userRules = "# a\n||b.example^",
+                listOverrides = mapOf("adguard-base" to false),
             ),
         )
         val lines = SettingsBackup.decode(file, Settings())!!.summary
+        assertTrue(lines.toString(), "0 custom lists, 1 list switch" in lines)
         assertTrue(lines.toString(), "DNS server: https://dns.other.example/q (now Network default)" in lines)
         assertTrue(lines.toString(), "Block DNS bypass: off (now on)" in lines)
         assertTrue(lines.toString(), "1 rule of your own (now 0)" in lines)
@@ -355,6 +370,8 @@ class UiLogicTest {
         assertEquals("0 rules", app.aduster.ui.counted(0, "rule"))
         assertEquals("1,234 rules", app.aduster.ui.counted(1234, "rule"))
         assertEquals("1 day", app.aduster.ui.counted(1, "day"))
+        assertEquals("1 entry", app.aduster.ui.counted(1, "entry", "entries"))
+        assertEquals("3 entries", app.aduster.ui.counted(3, "entry", "entries"))
     }
 
     /**

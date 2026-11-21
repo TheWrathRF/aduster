@@ -470,7 +470,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     launchable = pi.packageName in launchable,
                 )
             }
-        app.aduster.ui.settings.appRows(facts)
+        app.aduster.ui.settings.appRows(facts, keep = storedSettings().excludedApps)
     }
 
     // ---- backup ----
