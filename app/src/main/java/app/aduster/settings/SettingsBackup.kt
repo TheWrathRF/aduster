@@ -1,9 +1,9 @@
 package app.aduster.settings
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 /**
@@ -20,32 +20,47 @@ object SettingsBackup {
     /** An import that was read but not applied: what it holds, and in words what changes. */
     data class Preview(val settings: Settings, val summary: List<String>)
 
+    /** What a picked file turned out to be. */
+    sealed interface Read {
+        data class Ok(val preview: Preview) : Read
+        /** An Aduster settings file of a newer format than this app reads. */
+        data object Newer : Read
+        data object NotSettings : Read
+    }
+
+    /**
+     * What [text] is: settings to preview, a file of a newer Aduster, or not a settings file (a
+     * marker or version of the wrong shape included). Files exported before the marker existed
+     * (a bare settings object) are accepted only if they set something away from the defaults
+     * and carry none of a report's fields. [appName]: an excluded app's name from its package.
+     */
+    fun read(text: String, current: Settings, pages: Boolean = true, appName: (String) -> String = { it }): Read {
+        val o = runCatching { SettingsJson.parseToJsonElement(text) as? JsonObject }.getOrNull() ?: return Read.NotSettings
+        val format = o["format"]
+        val inner: JsonObject = when {
+            format != null -> {
+                if ((format as? JsonPrimitive)?.takeIf { it.isString }?.content != FORMAT) return Read.NotSettings
+                val version = o["version"]?.let { (it as? JsonPrimitive)?.intOrNull ?: return Read.NotSettings } ?: 0
+                if (version > VERSION) return Read.Newer
+                o["settings"] as? JsonObject ?: return Read.NotSettings
+            }
+            o.keys.any { it in REPORT_KEYS } -> return Read.NotSettings
+            else -> o
+        }
+        val s = runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), inner) }.getOrNull()?.sanitized() ?: return Read.NotSettings
+        if (format == null && s.copy(enabled = false, pausedUntil = 0) == Settings()) return Read.NotSettings
+        return Read.Ok(Preview(s, summary(current, s, pages, appName)))
+    }
+
     fun encode(s: Settings): String = buildJsonObject {
         put("format", FORMAT)
         put("version", VERSION)
         put("settings", SettingsJson.encodeToJsonElement(Settings.serializer(), s))
     }.toString()
 
-    /**
-     * [text] as settings, or null when it is not an Aduster settings file. Files exported before
-     * the marker existed (a bare settings object) are accepted only if they set something away
-     * from the defaults and carry none of a report's fields. [appName]: an excluded app's name
-     * from its package.
-     */
-    fun decode(text: String, current: Settings, pages: Boolean = true, appName: (String) -> String = { it }): Preview? {
-        val o = runCatching { SettingsJson.parseToJsonElement(text) as? JsonObject }.getOrNull() ?: return null
-        val inner: JsonObject = when {
-            o["format"]?.jsonPrimitive?.content == FORMAT -> {
-                if ((o["version"]?.jsonPrimitive?.intOrNull ?: 0) > VERSION) return null
-                o["settings"] as? JsonObject ?: return null
-            }
-            o.keys.any { it in REPORT_KEYS } -> return null
-            else -> o
-        }
-        val s = runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), inner) }.getOrNull()?.sanitized() ?: return null
-        if (o["format"] == null && s.copy(enabled = false, pausedUntil = 0) == Settings()) return null
-        return Preview(s, summary(current, s, pages, appName))
-    }
+    /** [text] as settings, or null when it is not settings this app can import (see [read]). */
+    fun decode(text: String, current: Settings, pages: Boolean = true, appName: (String) -> String = { it }): Preview? =
+        (read(text, current, pages, appName) as? Read.Ok)?.preview
 
     /** Keys of a saved report (and of other JSON the picker may offer) that settings never have. */
     private val REPORT_KEYS = setOf("engine", "proxy", "timeline", "process_exits", "problems", "build", "time_ms")

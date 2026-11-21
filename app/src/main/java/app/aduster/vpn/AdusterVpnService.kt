@@ -49,6 +49,14 @@ import kotlinx.serialization.json.putJsonArray
 internal enum class PauseAtStart { NONE, STILL_PAUSED, ENDED }
 
 /**
+ * The wall-clock end a timed pause shows ([pausedUntil], read by Home, the tile, the widget and
+ * the card), realigned to its boot-clock end ([deadlineBoot], 0 = none) when the wall clock
+ * moved: now plus what is left. A pause until Resume, or none, keeps its value.
+ */
+internal fun realignedPauseEnd(pausedUntil: Long, deadlineBoot: Long, nowWall: Long, nowBoot: Long): Long =
+    if (pausedUntil == 0L || pausedUntil == Long.MAX_VALUE || deadlineBoot <= 0) pausedUntil else nowWall + (deadlineBoot - nowBoot).coerceAtLeast(0)
+
+/**
  * What a start does with the pause saved before it ([over]: a timed pause's end has passed). A
  * pause until Resume, or a timed one still running, is "still paused" in the timeline; a timed
  * one that ran out while protection was stopped is cleared without an entry (as "still paused"
@@ -784,10 +792,23 @@ class AdusterVpnService : VpnService() {
 
     /** [auto]: the end-of-pause alarm or a screen-on after it ran out, not the user. */
     private suspend fun resume(auto: Boolean) {
-        // A late alarm for a pause that was already resumed, or an early one (the wall clock
-        // was moved forward), changes nothing.
-        if (auto && (pausedUntil == 0L || !pauseOver())) {
-            if (pausedUntil != 0L && pauseDeadlineBoot > 0) scheduleResume(System.currentTimeMillis() + (pauseDeadlineBoot - SystemClock.elapsedRealtime()))
+        // A late alarm for a pause that was already resumed changes nothing. An early one (the
+        // wall clock was moved forward past the end) leaves the pause running to its boot-clock
+        // end, and the end every screen shows moves with the clock, so none says "Protected"
+        // while filtering is still paused.
+        // Both clocks read once: a pause that ends between two readings must not be realigned to
+        // "now" (an alarm at once, cancelled as past) instead of resumed.
+        val (nowWall, nowBoot) = System.currentTimeMillis() to SystemClock.elapsedRealtime()
+        val over = if (pauseDeadlineBoot > 0) nowBoot >= pauseDeadlineBoot else nowWall >= pausedUntil
+        if (auto && (pausedUntil == 0L || !over)) {
+            val end = realignedPauseEnd(pausedUntil, pauseDeadlineBoot, nowWall, nowBoot)
+            if (end != pausedUntil) {
+                settings = store.updateOrKeep(settings) { it.copy(pausedUntil = end) }
+                pausedUntil = end
+                scheduleResume(end)
+                if (running) showProtectionNotification()
+                refreshSurfaces()
+            }
             return
         }
         if (pausedUntil != 0L) Timeline.add(this, Timeline.RESUMED, if (auto) "the pause ran out" else "by you")

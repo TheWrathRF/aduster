@@ -8,6 +8,7 @@ import app.aduster.settings.ThemeMode
 import app.aduster.settings.coreKey
 import app.aduster.settings.sanitized
 import app.aduster.settings.updateOrKeep
+import app.aduster.settings.trySave
 import app.aduster.ui.DayStat
 import app.aduster.ui.LogItem
 import app.aduster.ui.QueryAction
@@ -18,9 +19,11 @@ import app.aduster.ui.parseDomainCheck
 import app.aduster.ui.parseSiteCheck
 import app.aduster.ui.settings.timelineLines
 import app.aduster.ui.theme.pastBar
+import app.aduster.ui.theme.radioRing
 import app.aduster.ui.theme.shareLine
 import app.aduster.ui.theme.switchEdge
 import app.aduster.vpn.Timeline
+import app.aduster.vpn.realignedPauseEnd
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -231,6 +234,23 @@ class UiLogicTest {
         assertEquals(listOf("a"), SettingsBackup.decode(twice, Settings())!!.settings.customLists.map { it.name })
     }
 
+    /**
+     * A file whose marker or version has the wrong shape is not ours (and does not crash the
+     * import); a file from a newer Aduster is told apart from one that is not a settings file.
+     */
+    @Test
+    fun importOfAWrongShapeOrNewerFile() {
+        for (bad in listOf("""{"format":[]}""", """{"format":{"a":1}}""", """{"format":"aduster-settings","version":[2]}""", """{"format":7,"settings":{}}""")) {
+            assertNull(bad, SettingsBackup.decode(bad, Settings()))
+            assertEquals(bad, SettingsBackup.Read.NotSettings, SettingsBackup.read(bad, Settings()))
+        }
+        val newer = """{"format":"aduster-settings","version":2,"settings":{"userRules":"||a.example^"}}"""
+        assertNull(SettingsBackup.decode(newer, Settings()))
+        assertEquals(SettingsBackup.Read.Newer, SettingsBackup.read(newer, Settings()))
+        val ok = SettingsBackup.read(SettingsBackup.encode(Settings(userRules = "||a.example^")), Settings())
+        assertTrue(ok is SettingsBackup.Read.Ok)
+    }
+
     /** A build without the page engine says nothing about page filtering when importing. */
     @Test
     fun importSummaryFollowsTheBuild() {
@@ -311,6 +331,56 @@ class UiLogicTest {
         val ok = Store(fail = false)
         assertEquals(5L, ok.updateOrKeep(now) { it.copy(pausedUntil = 5) }.pausedUntil)
         assertEquals(5L, ok.saved.pausedUntil)
+    }
+
+    /** A change made in the app's screens on a full disk is reported as not saved, not thrown. */
+    @Test
+    fun aSettingsChangeOnAFullDiskIsNotSaved() = kotlinx.coroutines.runBlocking {
+        class Store(val fail: Boolean) : androidx.datastore.core.DataStore<Settings> {
+            var saved = Settings()
+            override val data = kotlinx.coroutines.flow.flowOf(saved)
+            override suspend fun updateData(transform: suspend (t: Settings) -> Settings): Settings {
+                if (fail) throw java.io.IOException("No space left on device")
+                return transform(saved).also { saved = it }
+            }
+        }
+        val full = Store(fail = true)
+        assertNull(full.trySave { it.copy(ipv4Only = true) })
+        assertEquals(Settings(), full.saved)
+        val ok = Store(fail = false)
+        assertEquals(true, ok.trySave { it.copy(ipv4Only = true) }?.ipv4Only)
+        assertEquals(true, ok.saved.ipv4Only)
+    }
+
+    /**
+     * A timed pause runs on the boot clock: when the wall clock jumps forward past its end, the
+     * end every screen shows moves to now plus what is left, so nothing says "Protected" while
+     * filtering is still paused; a pause until Resume, or one without a boot-clock end, keeps its end.
+     */
+    @Test
+    fun aClockJumpDuringATimedPauseKeepsItShownAsPaused() {
+        val boot = 1_000_000L
+        // Paused at wall 100 000 for 10 min; 4 min later the wall clock jumped forward one hour.
+        val end = 100_000L + 600_000
+        val deadline = boot + 600_000
+        val nowWall = 100_000L + 240_000 + 3_600_000
+        val nowBoot = boot + 240_000
+        assertEquals(nowWall + 360_000, realignedPauseEnd(end, deadline, nowWall, nowBoot))
+        assertEquals(Long.MAX_VALUE, realignedPauseEnd(Long.MAX_VALUE, 0, nowWall, nowBoot))
+        assertEquals(end, realignedPauseEnd(end, 0, nowWall, nowBoot))
+        assertEquals(0L, realignedPauseEnd(0, 0, nowWall, nowBoot))
+    }
+
+    /**
+     * Diagnostics' "Today" counts today, as Home does: browsers from the day's stats, not the
+     * page engine's count since it started; the DNS bypass count, kept since protection started,
+     * is not in it.
+     */
+    @Test
+    fun diagnosticsTodayCountsOnlyToday() {
+        val stats = Stats.EMPTY.copy(running = true, blocked = 50, dnsQueries = 400, dnsBlocked = 20)
+        assertEquals(listOf("DNS lookups" to 400L, "DNS lookups blocked" to 20L, "Blocked in browsers" to 30L), app.aduster.ui.settings.DiagnosticsStates.today(stats, pages = true))
+        assertEquals(listOf("DNS lookups" to 400L, "DNS lookups blocked" to 20L), app.aduster.ui.settings.DiagnosticsStates.today(stats, pages = false))
     }
 
     /**
@@ -587,6 +657,7 @@ class UiLogicTest {
                 "share line on the card" to contrast(p.shareLine, p.surface),
                 "switch edge on a row" to contrast(p.switchEdge, p.surface),
                 "switch edge on the page" to contrast(p.switchEdge, p.bg),
+                "unselected radio ring in a dialog" to contrast(p.radioRing, p.surface),
             )
             for ((what, ratio) in checks) assertTrue("$theme $what: ${"%.2f".format(ratio)}", ratio >= 3.0)
         }

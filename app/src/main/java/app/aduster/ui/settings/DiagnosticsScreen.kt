@@ -55,6 +55,17 @@ internal object DiagnosticsStates {
         else -> "Running"
     }
 
+    /**
+     * The Today section's rows, label and count: today's numbers as Home counts them (the page
+     * engine's own count runs since it started, and so does the DNS bypass count, which Protection
+     * shows beside "Running for").
+     */
+    fun today(stats: app.aduster.ui.Stats?, pages: Boolean): List<Pair<String, Long>> = buildList {
+        add("DNS lookups" to (stats?.dnsQueries ?: 0))
+        add("DNS lookups blocked" to (stats?.dnsBlocked ?: 0))
+        if (pages) add("Blocked in browsers" to (stats?.blockedInBrowsers ?: 0))
+    }
+
     /** Page filtering: running, or why it does not run while switched on (Home's words), or off. */
     fun pages(available: Boolean, pagesRunning: Boolean, httpsOn: Boolean, stats: app.aduster.ui.Stats?): String = when {
         !available -> "Not in this build"
@@ -101,7 +112,6 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
     fun n(k: String) = d?.get(k)?.jsonPrimitive?.longOrNull ?: 0L
     fun list(k: String) = (d?.get(k) as? JsonArray)?.joinToString(", ") { it.jsonPrimitive.content }.orEmpty()
     val px = d?.get("proxy") as? JsonObject
-    fun pn(k: String) = px?.get(k)?.jsonPrimitive?.longOrNull ?: 0L
     val pagesRunning = px?.get("running")?.jsonPrimitive?.content == "true"
 
     // A lazy list: the screen polls every 2 s, and only the sections on screen are
@@ -114,6 +124,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
             Group {
                 row { ListRow("State") { ValueText(DiagnosticsStates.protection(stats, s.isPaused())) } }
                 row { ListRow("Running for") { ValueText(uptime(n("uptime_s"))) } }
+                row { ListRow("DNS bypass attempts blocked") { ValueText(fmt(n("rst_sent"))) } }
                 d?.get("network")?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() }?.let { net ->
                     val domains = list("search_domains")
                     row { ListRow("Network", if (domains.isNotEmpty()) "Names under $domains count as local" else null) { ValueText(net) } }
@@ -150,10 +161,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         item(key = "today") { Column {
             SectionHeading("Today")
             Group {
-                row { ListRow("DNS lookups") { ValueText(fmt(stats?.dnsQueries ?: 0)) } }
-                row { ListRow("DNS lookups blocked") { ValueText(fmt(stats?.dnsBlocked ?: 0)) } }
-                if (HttpsConfig.available) row { ListRow("Blocked in browsers") { ValueText(fmt(pn("blocked_requests"))) } }
-                row { ListRow("DNS bypass attempts blocked") { ValueText(fmt(n("rst_sent"))) } }
+                for ((label, count) in DiagnosticsStates.today(stats, HttpsConfig.available)) row { ListRow(label) { ValueText(fmt(count)) } }
             }
         } }
 

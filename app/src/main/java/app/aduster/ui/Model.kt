@@ -44,6 +44,9 @@ data class Stats(
     /** False: this copy is not the released one and protection refuses to start. */
     val intact: Boolean = true,
 ) {
+    /** Today's requests blocked inside browser pages: the day's blocks that were not DNS blocks. */
+    val blockedInBrowsers: Long get() = (blocked - dnsBlocked).coerceAtLeast(0)
+
     /** Share of DNS lookups blocked: one unit (the totals mix connections and page requests). */
     val dnsRatio: Double get() = if (dnsQueries == 0L) 0.0 else dnsBlocked.toDouble() / dnsQueries
 

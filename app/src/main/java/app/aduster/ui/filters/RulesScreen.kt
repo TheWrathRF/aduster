@@ -1,6 +1,5 @@
 package app.aduster.ui.filters
 
-import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
@@ -130,8 +129,7 @@ fun RulesScreen(vm: MainViewModel, onBack: () -> Unit) {
     DisposableEffect(Unit) {
         onDispose {
             if (latestDirty && activity?.isChangingConfigurations != true) {
-                vm.saveUserRules(latestText.trimEnd())
-                Toast.makeText(ctx, "Rules saved", Toast.LENGTH_SHORT).show()
+                vm.saveUserRules(latestText.trimEnd(), saved = "Rules saved")
             }
         }
     }

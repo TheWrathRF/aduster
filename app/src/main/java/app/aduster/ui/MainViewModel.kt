@@ -42,6 +42,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
 import app.aduster.settings.coreKey
+import app.aduster.settings.trySave
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -162,7 +163,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // "Before" is what the transform really saw (the StateFlow can lag or still hold
             // the placeholder at start-up).
             var before = Settings()
-            val after = store.updateData { cur -> before = cur; transform(cur) }
+            val after = save { cur -> before = cur; transform(cur) } ?: return@launch
             // :core is told only when something it reads changed: the theme or the log size
             // would otherwise re-initialise its engine.
             if (before.coreKey() != after.coreKey()) AdusterVpnService.notifySettingsChanged(ctx)
@@ -180,6 +181,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+
+    /** Saves a change, or says it could not be saved (a full disk) and returns null. */
+    private suspend fun save(transform: (Settings) -> Settings): Settings? =
+        store.trySave(transform) ?: null.also { withContext(Dispatchers.Main) { android.widget.Toast.makeText(ctx, NOT_SAVED, android.widget.Toast.LENGTH_LONG).show() } }
 
     fun setListEnabled(id: String, on: Boolean) {
         // A newly enabled list is fetched if needed; unchanged lists are not re-downloaded.
@@ -232,10 +237,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * Changes the user's rules. The DNS part is loaded by :core at once; when the part for
      * the browsers' page filter changed, a compile job rebuilds it.
      */
-    private fun setUserRules(transform: (String) -> String) {
+    private fun setUserRules(saved: String? = null, transform: (String) -> String) {
         viewModelScope.launch(Dispatchers.IO) {
             var before = Settings()
-            val after = store.updateData { cur -> before = cur; cur.copy(userRules = transform(cur.userRules)) }
+            val after = save { cur -> before = cur; cur.copy(userRules = transform(cur.userRules)) } ?: return@launch
+            if (saved != null) withContext(Dispatchers.Main) { android.widget.Toast.makeText(ctx, saved, android.widget.Toast.LENGTH_SHORT).show() }
             AdusterVpnService.notifySettingsChanged(ctx)
             if (after.httpsFiltering && UserRules.webPart(before.userRules) != UserRules.webPart(after.userRules)) FilterJobs.compile(ctx)
         }
@@ -255,7 +261,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Saves the user's rules; the browser part is recompiled into the page filter right away. */
-    fun saveUserRules(text: String) = setUserRules { text }
+    /** [saved]: what to say once the rules are on disk (never before: a full disk says so instead). */
+    fun saveUserRules(text: String, saved: String? = null) = setUserRules(saved) { text }
 
     /** Allowed (true) or blocked (false) everywhere, or no rule (null), for a whole site. */
     fun setSite(host: String, allow: Boolean?) = setUserRules { UserRules.withSite(it, host, allow) }
@@ -459,10 +466,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * as a saved report, would decode to all-default settings and wipe every rule); nothing is
      * applied before the user confirms the summary.
      */
-    suspend fun readImport(uri: android.net.Uri): SettingsBackup.Preview? = withContext(Dispatchers.IO) {
+    suspend fun readImport(uri: android.net.Uri): SettingsBackup.Read = withContext(Dispatchers.IO) {
         val text = runCatching { ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() } }.getOrNull().orEmpty()
         val pm = ctx.packageManager
-        SettingsBackup.decode(text, storedSettings(), pages = HttpsConfig.available) { pkg ->
+        SettingsBackup.read(text, storedSettings(), pages = HttpsConfig.available) { pkg ->
             runCatching { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
         }
     }
@@ -476,27 +483,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * user's cosmetic rules and page lists too), and lists the imported settings enable but were
      * never downloaded are fetched. The settings before it are kept for "Undo import".
      */
-    suspend fun applyImport(imported: Settings) = withContext(Dispatchers.IO) {
+    suspend fun applyImport(imported: Settings): Boolean = withContext(Dispatchers.IO) {
         val before = storedSettings()
         runCatching { java.io.File(ctx.filesDir, SettingsBackup.BEFORE_IMPORT).writeText(SettingsBackup.encode(before)) }
-        replaceSettings(imported)
-        _undoImport.value = true
+        replaceSettings(imported).also { if (it) _undoImport.value = true }
     }
 
     suspend fun undoImport(): Boolean = withContext(Dispatchers.IO) {
         val f = java.io.File(ctx.filesDir, SettingsBackup.BEFORE_IMPORT)
         val prev = runCatching { SettingsBackup.decode(f.readText(), storedSettings())?.settings }.getOrNull() ?: return@withContext false
-        replaceSettings(prev)
+        if (!replaceSettings(prev)) return@withContext false
         f.delete()
         _undoImport.value = false
         true
     }
 
-    private suspend fun replaceSettings(next: Settings) {
-        val after = store.updateData { current -> next.copy(enabled = current.enabled, pausedUntil = current.pausedUntil) }
+    /** False when the settings could not be saved (a full disk): nothing else is done. */
+    private suspend fun replaceSettings(next: Settings): Boolean {
+        val after = store.trySave { current -> next.copy(enabled = current.enabled, pausedUntil = current.pausedUntil) } ?: return false
         AdusterVpnService.notifySettingsChanged(ctx)
         FilterJobs.schedule(ctx, after)
         FilterJobs.compile(ctx)
         if (FilterUpdater.missingLists(ctx, after)) FilterJobs.runNow(ctx, force = false)
+        return true
+    }
+
+    companion object {
+        /** What a screen says when a change could not be written. */
+        const val NOT_SAVED = "Could not save: storage is full"
     }
 }

@@ -161,6 +161,18 @@ suspend fun DataStore<Settings>.updateOrKeep(current: Settings, change: (Setting
         change(current)
     }
 
+/**
+ * Saves a change made in the app's screens: the saved settings, or null when the file could not
+ * be written (a full disk); the screen says so instead of the app ending on the exception.
+ */
+suspend fun DataStore<Settings>.trySave(change: (Settings) -> Settings): Settings? =
+    try {
+        updateData(change)
+    } catch (e: java.io.IOException) {
+        android.util.Log.w("Aduster", "settings not saved: $e")
+        null
+    }
+
 /** The fields of [text] that decode on their own, or null when it is not a JSON object. */
 internal fun salvageSettings(text: String): Settings? {
     val obj = runCatching { SettingsJson.parseToJsonElement(text) as? kotlinx.serialization.json.JsonObject }.getOrNull() ?: return null

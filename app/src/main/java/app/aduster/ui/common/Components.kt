@@ -66,6 +66,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
+import app.aduster.ui.theme.radioRing
 import app.aduster.ui.theme.switchEdge
 import app.aduster.ui.theme.Type
 import kotlinx.coroutines.launch
@@ -505,7 +506,7 @@ fun <T> ChoiceDialog(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Box(
-                        Modifier.size(20.dp).border(2.dp, if (on) p.accent else p.faint, CircleShape),
+                        Modifier.size(20.dp).border(2.dp, if (on) p.accent else p.radioRing, CircleShape),
                         contentAlignment = Alignment.Center,
                     ) {
                         if (on) Box(Modifier.size(10.dp).clip(CircleShape).background(p.accent))

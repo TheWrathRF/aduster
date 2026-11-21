@@ -68,8 +68,11 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
         if (uri != null) {
             scope.launch {
                 // Nothing changes until the summary is confirmed.
-                preview = vm.readImport(uri)
-                if (preview == null) Toast.makeText(ctx, "Not an Aduster settings file", Toast.LENGTH_SHORT).show()
+                when (val r = vm.readImport(uri)) {
+                    is app.aduster.settings.SettingsBackup.Read.Ok -> preview = r.preview
+                    app.aduster.settings.SettingsBackup.Read.Newer -> Toast.makeText(ctx, "Made by a newer Aduster: update the app to import it", Toast.LENGTH_LONG).show()
+                    app.aduster.settings.SettingsBackup.Read.NotSettings -> Toast.makeText(ctx, "Not an Aduster settings file", Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }
@@ -173,8 +176,8 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
             onConfirm = {
                 preview = null
                 scope.launch {
-                    vm.applyImport(pv.settings)
-                    Toast.makeText(ctx, "Settings imported", Toast.LENGTH_SHORT).show()
+                    val ok = vm.applyImport(pv.settings)
+                    Toast.makeText(ctx, if (ok) "Settings imported" else MainViewModel.NOT_SAVED, Toast.LENGTH_SHORT).show()
                 }
             },
         ) {

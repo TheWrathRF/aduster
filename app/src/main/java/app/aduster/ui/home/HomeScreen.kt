@@ -523,8 +523,7 @@ internal fun homeNumbers(stats: Stats, pages: Boolean): List<HomeNumber> = build
     add(HomeNumber(fmt(stats.dnsQueries), "DNS lookups", stats.dnsQueries))
     add(HomeNumber(percent(stats.dnsRatio), "DNS lookups blocked", (stats.dnsRatio * 1000).toLong()))
     if (pages) {
-        val inBrowsers = (stats.blocked - stats.dnsBlocked).coerceAtLeast(0)
-        add(HomeNumber(fmt(inBrowsers), "Blocked in browsers", inBrowsers))
+        add(HomeNumber(fmt(stats.blockedInBrowsers), "Blocked in browsers", stats.blockedInBrowsers))
     }
 }
 
