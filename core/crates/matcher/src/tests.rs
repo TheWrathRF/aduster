@@ -222,6 +222,29 @@ fn real_lists() {
         std::hint::black_box(f.check(n));
     }
     println!("fresh-name lookup={}ns", t3.elapsed().as_nanos() / fresh.len() as u128);
+    // Real host names (ADUSTER_NAMES: one per line, e.g. the hosts page-list exceptions name):
+    // made-up names leave the regexes nothing to work on, real ones do. Each name twice, so the
+    // second pass shows the cost once the regexes' caches are warm; the verdicts as a fingerprint.
+    if let Ok(path) = std::env::var("ADUSTER_NAMES") {
+        let text = std::fs::read_to_string(path).unwrap();
+        let real: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        for pass in 1..=2 {
+            let t = std::time::Instant::now();
+            let mut verdicts = std::collections::hash_map::DefaultHasher::new();
+            for n in &real {
+                use std::hash::{Hash, Hasher};
+                let h = f.check(n);
+                (h.blocked(), h.class as u8).hash(&mut verdicts);
+            }
+            use std::hash::Hasher;
+            println!(
+                "real-name lookup pass {pass}: {} names, {}ns each, verdicts={:016x}",
+                real.len(),
+                t.elapsed().as_nanos() / real.len().max(1) as u128,
+                verdicts.finish()
+            );
+        }
+    }
     for n in names {
         let h = f.check(n);
         println!("{n:40} blocked={} {:?}", h.blocked(), f.describe(n, &h));
