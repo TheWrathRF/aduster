@@ -6,7 +6,7 @@
 //! applying it at DNS level would over-block.
 
 /// How a rule matches a hostname.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pattern {
     /// `||example.com^` and plain `example.com`: the domain and all of its subdomains.
     Suffix(String),

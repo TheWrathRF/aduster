@@ -1,5 +1,5 @@
 use crate::Class;
-use crate::rule::{Line, Pattern, badfilter_key, parse_line};
+use crate::rule::{Line, Pattern, badfilter_key, is_domain, parse_line};
 use crate::table::{HEADER, MAGIC, VERSION, build_regex, exact_hash, subdomain_hash, suffix_hash};
 use std::collections::HashSet;
 
@@ -35,13 +35,25 @@ struct Entry {
 pub fn compile(sources: &[Source]) -> (Vec<u8>, CompileStats) {
     let mut stats = CompileStats { per_source: vec![0; sources.len()], ..Default::default() };
 
-    // Pass 1: `$badfilter` rules disable identical rules from any list.
+    // Pass 1: `$badfilter` rules disable identical rules from any list. A rule is compared by
+    // its parsed pattern first, so the key text (sorted modifiers, a new string) is built only
+    // for the few rules whose pattern a `$badfilter` names, not for every rule.
     let mut bad: HashSet<String> = HashSet::new();
+    let mut bad_patterns: HashSet<Pattern> = HashSet::new();
+    let mut bad_suffixes: HashSet<String> = HashSet::new();
     for s in sources {
         for line in s.text.lines() {
             if line.contains("badfilter")
                 && let Line::BadFilter(key) = parse_line(line)
             {
+                // The key is the rule it disables, written without `$badfilter`; one that is no
+                // DNS rule can never match a rule taken here.
+                if let Line::Rule(r) = parse_line(&key) {
+                    if let Pattern::Suffix(d) = &r.pattern {
+                        bad_suffixes.insert(d.clone());
+                    }
+                    bad_patterns.insert(lowercase_regex(r.pattern));
+                }
                 bad.insert(key);
             }
         }
@@ -59,8 +71,26 @@ pub fn compile(sources: &[Source]) -> (Vec<u8>, CompileStats) {
             stats.per_source[si] += 1;
         };
         for line in s.text.lines() {
+            // Most list lines are `||name^` in lower case: hashed from the line itself, without
+            // the two strings the full parser builds (the same rule it would give).
+            if let Some(d) = plain_suffix(line) {
+                if bad_suffixes.contains(d) && bad.contains(&badfilter_key(line)) {
+                    stats.badfiltered += 1;
+                } else {
+                    add(suffix_hash(d.as_bytes()), Class::of(s.allow, false, s.user), &mut stats);
+                }
+                continue;
+            }
             let parsed = parse_line(line);
-            if !bad.is_empty() && matches!(parsed, Line::Rule(_)) && bad.contains(&badfilter_key(line)) {
+            if let Line::Rule(r) = &parsed
+                && !bad_patterns.is_empty()
+                && (if let Pattern::Regex(re) = &r.pattern {
+                    bad_patterns.contains(&Pattern::Regex(re.to_ascii_lowercase()))
+                } else {
+                    bad_patterns.contains(&r.pattern)
+                })
+                && bad.contains(&badfilter_key(line))
+            {
                 stats.badfiltered += 1;
                 continue;
             }
@@ -151,6 +181,23 @@ pub fn compile(sources: &[Source]) -> (Vec<u8>, CompileStats) {
         out.extend_from_slice(name);
     }
     (out, stats)
+}
+
+/// The name of a `||name^` line (spaces around it allowed) whose name is already a valid lower-case
+/// domain, which [`parse_line`] reads as `Pattern::Suffix(name)`, a plain block rule; None for
+/// anything else.
+fn plain_suffix(line: &str) -> Option<&str> {
+    let d = line.trim().strip_prefix("||")?.strip_suffix('^')?;
+    is_domain(d).then_some(d)
+}
+
+/// A regex pattern in lower case, as a `$badfilter` key holds it (a rule's regex keeps its case;
+/// the key is written in lower case).
+fn lowercase_regex(p: Pattern) -> Pattern {
+    match p {
+        Pattern::Regex(re) => Pattern::Regex(re.to_ascii_lowercase()),
+        other => other,
+    }
 }
 
 /// Checks user-entered rules; returns (1-based line number, reason) for each rejected line.

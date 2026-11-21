@@ -133,6 +133,31 @@ fn badfilter_disables_rule_across_lists() {
     assert!(f.check("keep.ua").blocked());
 }
 
+/// Every form a `$badfilter` matches by its key still meets its rule: a plain domain against
+/// `||d^`, modifiers in another order, an allow rule, and a regex written with capitals (the key
+/// is lowercased, the rule's regex keeps its case).
+#[test]
+fn badfilter_meets_its_rule_in_every_written_form() {
+    let lists = [
+        ("a", "plain.ua\n||mods.ua^$all,important\n@@||allow.ua^\n/^Caps\\.ua$/\n||kept.ua^$important\n  ||fast.ua^"),
+        (
+            "b",
+            "||plain.ua^$badfilter\n||mods.ua^$important,all,badfilter\n@@||allow.ua^$badfilter\n/^Caps\\.ua$/$badfilter\n||kept.ua^$badfilter\nfast.ua$badfilter",
+        ),
+        ("c", "||allow.ua^"),
+    ];
+    let f = filters(&lists, "");
+    assert!(!f.check("plain.ua").blocked());
+    assert!(!f.check("mods.ua").blocked());
+    // The allow rule is gone, so list c's block holds.
+    assert!(f.check("allow.ua").blocked());
+    assert!(!f.check("caps.ua").blocked());
+    // A plain `||name^` line (read without the full parser) meets a `$badfilter` too.
+    assert!(!f.check("fast.ua").blocked());
+    // A `$badfilter` without `$important` does not disable the `$important` rule.
+    assert!(f.check("kept.ua").blocked());
+}
+
 #[test]
 fn describe_hit() {
     let f = filters(&[("hagezi", "||doubleclick.net^")], "");
@@ -201,7 +226,14 @@ fn real_lists() {
         let h = f.check(n);
         println!("{n:40} blocked={} {:?}", h.blocked(), f.describe(n, &h));
     }
-    println!("{stats:?}\nsize={} KiB compile={compile_ms}ms load={load_ms}ms lookup={ns}ns", bytes.len() / 1024);
+    // The table's bytes as a fingerprint: a faster compiler must give the same table.
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    };
+    println!("{stats:?}\nsize={} KiB compile={compile_ms}ms load={load_ms}ms lookup={ns}ns table={fingerprint:016x}", bytes.len() / 1024);
 }
 
 /// The URL exception for Google's AI Overview request is no DNS rule (it goes to

@@ -385,7 +385,8 @@ fn compile(sources: &str, out: &str) -> String {
     let mut texts: Vec<(String, String, bool)> = Vec::with_capacity(specs.len());
     for s in specs {
         match std::fs::read(&s.path) {
-            Ok(bytes) => texts.push((s.name, String::from_utf8_lossy(&bytes).into_owned(), s.allow)),
+            // Valid UTF-8 (every list in practice) becomes the text without a copy.
+            Ok(bytes) => texts.push((s.name, String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()), s.allow)),
             Err(e) => return serde_json::json!({"ok": false, "error": format!("{}: {e}", s.name)}).to_string(),
         }
     }
