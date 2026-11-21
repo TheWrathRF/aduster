@@ -331,11 +331,20 @@ impl Shared {
     /// would cover a whole top-level domain. So are public suffixes (`co.uk`, `github.io`): a
     /// network handing one out would take a whole public zone off encrypted DNS and make every
     /// name under it count as local.
+    ///
+    /// Names under a search domain the network no longer hands out leave the cache: the old
+    /// network answered them itself (a hotspot's answer for a name under its domain may be
+    /// forged), and on the next network they are asked of the encrypted resolver again.
     pub fn set_network_info(&self, label: &str, domains: Vec<String>) {
         *self.net_label.lock() = label.to_string();
         let domains: Vec<String> =
             domains.into_iter().map(|d| d.trim().trim_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.') && !public_suffix(d)).collect();
-        self.search_domains.store(Arc::new(domains));
+        let new = Arc::new(domains);
+        let old = self.search_domains.swap(new.clone());
+        let gone: Vec<&String> = old.iter().filter(|d| !new.contains(d)).collect();
+        if !gone.is_empty() {
+            self.cache.lock().evict_names(|n| gone.iter().any(|d| under_domain(n, d)));
+        }
     }
 
     /// A stable key for the current network: its kind ("Wi-Fi", "Mobile data"), its search
@@ -359,10 +368,20 @@ impl Shared {
 
     /// True if `host` is one of the network's search domains or under one.
     pub fn in_search_domain(&self, host: &str) -> bool {
-        self.search_domains
-            .load()
-            .iter()
-            .any(|d| host == d || (host.len() > d.len() && host.ends_with(d.as_str()) && host.as_bytes()[host.len() - d.len() - 1] == b'.'))
+        self.search_domains.load().iter().any(|d| under_domain(host, d))
+    }
+
+    /// Keeps an upstream answer: in the cache, and its public addresses for the rebinding guard.
+    /// Not when the network changed while it was asked ([`Shared::net_generation`] was `asked_on`
+    /// then): it reaches the app that asked, but an answer the old network gave for one of its
+    /// own names, or a public one for a name the new network calls its own, must not be served
+    /// on the new network.
+    pub(crate) fn keep_answer(&self, asked_on: u64, key: &cache::Key, resp: &[u8], info: &dns::ResponseInfo) {
+        if self.net_generation.load(Ordering::Acquire) != asked_on {
+            return;
+        }
+        self.note_answer(&key.name, info);
+        self.cache.lock().insert(key.clone(), resp, info);
     }
 
     /// Notes that `name` got an answer with a public address on the current network.
@@ -881,6 +900,11 @@ fn server_kinds(servers: &[std::net::SocketAddr]) -> Vec<&'static str> {
 /// True if `d` is itself a public suffix (`co.uk`, `github.io`), by the Public Suffix List.
 fn public_suffix(d: &str) -> bool {
     psl::suffix(d.as_bytes()).is_some_and(|s| s.is_known() && s.as_bytes() == d.as_bytes())
+}
+
+/// True if `host` is `domain` or a name under it.
+fn under_domain(host: &str, domain: &str) -> bool {
+    host == domain || (host.len() > domain.len() && host.ends_with(domain) && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
 }
 
 /// True if a DNS answer holds an address on the public internet.

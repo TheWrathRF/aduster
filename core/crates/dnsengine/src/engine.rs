@@ -381,6 +381,7 @@ fn cname_blocked<S: AsRef<str>>(shared: &Shared, cfg: &crate::Config, cnames: &[
 async fn forward<W: TunWrite>(ctx: Rc<Ctx<W>>, key: Key, raw: Vec<u8>) {
     let shared = ctx.shared.clone();
     let t_fwd = Instant::now();
+    let asked_on = shared.net_generation.load(std::sync::atomic::Ordering::Acquire);
     // One upstream query per name for both paths: a lookup the HTTPS filter has in flight for
     // this name is joined, and one made here is joined by it.
     let result = match crate::resolve::coalesce(&shared, &key) {
@@ -453,8 +454,7 @@ async fn forward<W: TunWrite>(ctx: Rc<Ctx<W>>, key: Key, raw: Vec<u8>) {
     // hit is checked against the current rules.
     if let Some(info) = &info {
         // As the HTTPS filter's own lookups do: it may join this one (the rebinding guard).
-        shared.note_answer(&key.name, info);
-        shared.cache.lock().insert(key.clone(), &resp, info);
+        shared.keep_answer(asked_on, &key, &resp, info);
     }
 
     // CNAME cloaking: a first-party name that aliases to a blocked tracker (not checked for a
@@ -865,6 +865,50 @@ mod tests {
             assert_eq!(r.addrs, a(want), "network {net_addr:?}, encrypted {doh_addr:?}");
             assert_eq!((net_hits.load(Ordering::SeqCst), doh_hits.load(Ordering::SeqCst)), (1, doh_asked), "{want}");
         }
+    }
+
+    /// A network's answer for one of its own names stays on that network: after a move to a
+    /// network without that search domain, the name is asked of the encrypted resolver again
+    /// instead of being served the old network's public answer from the cache.
+    #[tokio::test]
+    async fn a_network_name_answer_does_not_follow_the_phone_to_another_network() {
+        let a = |s: &str| vec![s.parse::<IpAddr>().unwrap()];
+        let (net1, _) = fake_resolver_with(0, [6, 6, 6, 6]).await;
+        let (silent, _) = crate::upstream::testing::doh_answering(None).await;
+        let shared = Shared::new(Config { resolve_uids: false, ..Config::default() });
+        shared.upstream.store(Arc::new(silent));
+        shared.set_network_info("Wi-Fi", vec!["bank.example".into()]);
+        shared.set_network(vec![net1], true, false, 1);
+        assert_eq!(crate::resolve_with(&shared, "www.bank.example", false).await.unwrap().addrs, a("6.6.6.6"));
+        let (net2, _) = fake_resolver_with(0, [5, 5, 5, 5]).await;
+        let (doh, doh_hits) = crate::upstream::testing::doh_answering(Some([1, 2, 3, 4])).await;
+        shared.upstream.store(Arc::new(doh));
+        shared.set_network_info("Mobile data", vec![]);
+        shared.set_network(vec![net2], true, false, 2);
+        assert_eq!(crate::resolve_with(&shared, "www.bank.example", false).await.unwrap().addrs, a("1.2.3.4"));
+        assert_eq!(doh_hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// The same for an answer still on its way when the phone moves: it reaches the app that
+    /// asked, but is not kept for the next network.
+    #[tokio::test]
+    async fn a_network_name_answer_in_flight_during_a_move_is_not_kept() {
+        let a = |s: &str| vec![s.parse::<IpAddr>().unwrap()];
+        let (net1, _) = fake_resolver_with(0, [6, 6, 6, 6]).await;
+        let doh = crate::UpstreamConfig::Doh { url: "https://dns.test/dns-query".into(), bootstrap: vec!["192.0.2.1".parse().unwrap()] };
+        let shared = Shared::new(Config { resolve_uids: false, upstream: doh, ..Config::default() });
+        shared.set_network_info("Wi-Fi", vec!["bank.example".into()]);
+        shared.set_network(vec![net1], true, false, 1);
+        let s = shared.clone();
+        let first = tokio::spawn(async move { crate::resolve_with(&s, "www.bank.example", false).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let (net2, _) = fake_resolver_with(0, [5, 5, 5, 5]).await;
+        let (live, _) = crate::upstream::testing::doh_answering(Some([1, 2, 3, 4])).await;
+        shared.upstream.store(Arc::new(live));
+        shared.set_network_info("Mobile data", vec![]);
+        shared.set_network(vec![net2], true, false, 2);
+        assert_eq!(first.await.unwrap().unwrap().addrs, a("6.6.6.6"), "the app that asked gets its answer");
+        assert_eq!(crate::resolve_with(&shared, "www.bank.example", false).await.unwrap().addrs, a("1.2.3.4"));
     }
 
     /// The check with the encrypted resolver waits little: on a network that blocks it, a
