@@ -69,6 +69,7 @@ import app.aduster.ui.common.RowCard
 import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ToggleRow
 import app.aduster.ui.common.ValueText
+import app.aduster.ui.counted
 import app.aduster.ui.fmt
 import app.aduster.ui.theme.GoogleSansCode
 import app.aduster.ui.theme.LocalPalette
@@ -187,7 +188,7 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
                             ) { Chevron() }
                         }
                         RowCard {
-                            ListRow("My rules", "${fmt(ruleCount)} rules", onClick = { open(Sub.RULES) }) { Chevron() }
+                            ListRow("My rules", counted(ruleCount, "rule"), onClick = { open(Sub.RULES) }) { Chevron() }
                         }
                     }
                 }

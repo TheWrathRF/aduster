@@ -13,6 +13,11 @@ private val hmFmt = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
 fun fmt(n: Long): String = synchronized(intFmt) { intFmt.format(n) }
 fun fmt(n: Int): String = synchronized(intFmt) { intFmt.format(n) }
 
+/** [n] and [word], in the plural unless [n] is 1 ("1 rule", "2 rules"). */
+fun counted(n: Long, word: String): String = "${fmt(n)} ${if (n == 1L) word else word + "s"}"
+
+fun counted(n: Int, word: String): String = counted(n.toLong(), word)
+
 fun percent(r: Double): String = if (r <= 0.0) "0%" else if (r < 0.1) "%.1f%%".format(Locale.US, r * 100) else "%.0f%%".format(Locale.US, r * 100)
 
 /** In the current time zone (a SimpleDateFormat would keep the zone it was made in). */

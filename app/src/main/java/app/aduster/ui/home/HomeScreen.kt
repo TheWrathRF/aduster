@@ -80,6 +80,7 @@ import app.aduster.ui.common.RollingNumber
 import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.common.groupItems
+import app.aduster.ui.counted
 import app.aduster.ui.fmt
 import app.aduster.ui.hm
 import app.aduster.ui.percent
@@ -289,7 +290,7 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
             selected = -1,
             label = {
                 when (it) {
-                    0 -> "Until I resume"
+                    0 -> "Until you resume"
                     60 -> "1 hour"
                     else -> "$it minutes"
                 }
@@ -416,7 +417,7 @@ private fun History(stats: Stats) {
         }
     }
     val span = if (days.size == 1) "Today" else "${days.size} days"
-    val description = "Blocked per day, ${days.size} days: ${fmt(total)} in all, today ${fmt(stats.blocked)}"
+    val description = "Blocked per day, ${counted(days.size, "day")}: ${fmt(total)} in all, today ${fmt(stats.blocked)}"
     Column {
         Canvas(
             Modifier

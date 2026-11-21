@@ -40,7 +40,7 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
     var apps by remember { mutableStateOf<List<InstalledApp>?>(null) }
     var query by rememberSaveable { mutableStateOf("") }
-    var showSystem by rememberSaveable { mutableStateOf(false) }
+    var showBackground by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { apps = vm.installedApps() }
 
@@ -69,15 +69,11 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
         onDispose { latest?.let { want -> vm.update { if (it.excludedApps == want) it else it.copy(excludedApps = want) } } }
     }
 
-    val q = query.trim().lowercase()
-    // Filtered and sorted only when its inputs change, not for every icon that loads.
-    val shown = remember(apps, q, showSystem, opened, current) {
-        apps.orEmpty()
-            // An excluded system app stays listed, also one excluded since the screen opened.
-            .filter { showSystem || !it.system || it.pkg in opened || it.pkg in current }
-            .filter { q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.contains(q) }
-            // Apps excluded when the screen opened come first, so the state is visible at a glance.
-            .sortedByDescending { it.pkg in opened }
+    // Filtered and sorted only when its inputs change, not for every icon that loads. An
+    // excluded app stays listed, also one excluded since the screen opened; the apps excluded
+    // when it opened come first, so the state is visible at a glance and a row does not jump.
+    val shown = remember(apps, query, showBackground, opened, current) {
+        shownApps(apps.orEmpty(), query, showBackground, opened + current).sortedByDescending { it.pkg in opened }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -90,7 +86,7 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
         )
         InputField(query, { query = it }, "Search apps", Modifier.fillMaxWidth().padding(horizontal = Gutter), icon = app.aduster.ui.theme.AdIcons.Search)
         Spacer(Modifier.height(12.dp))
-        Group { row { ToggleRow("Show system apps", checked = showSystem) { showSystem = it } } }
+        Group { row { ToggleRow("Show background apps", checked = showBackground) { showBackground = it } } }
         Spacer(Modifier.height(12.dp))
         if (apps == null) {
             Text("Loading apps…", style = Type.small, color = p.muted, modifier = Modifier.padding(horizontal = Gutter + 16.dp))
@@ -103,7 +99,9 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
                     if (e != null) excluded = if (v) e + a.pkg else e - a.pkg
                 }
                 val icon = remember(iconVersion, a.pkg) { vm.appIcon(a.pkg) }
-                ToggleRow(a.label, a.pkg, checked = isExcluded, leading = { AppIcon(icon) }, onChange = toggle)
+                // An app without a network of its own: excluding it would change nothing (its
+                // note names the app to exclude instead); one excluded anyway can be switched back.
+                ToggleRow(a.label, a.note ?: a.pkg, checked = isExcluded, enabled = a.network || isExcluded, leading = { AppIcon(icon) }, onChange = toggle)
             }
         }
     }

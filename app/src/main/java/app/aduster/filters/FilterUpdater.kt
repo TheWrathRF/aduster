@@ -4,6 +4,13 @@ import android.content.Context
 import app.aduster.core.NativeCore
 import app.aduster.settings.Settings
 import app.aduster.settings.DeviceProfile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.buildJsonArray
@@ -27,11 +34,13 @@ object FilterUpdater {
      * Bumped whenever the native page-filter compiler changes what it produces, so an app
      * update rebuilds the engine even when no list changed.
      */
-    private const val WEB_FORMAT = 9
-    private val INCLUDE = Regex("""^!#include\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*$""")
+    private const val WEB_FORMAT = 10
 
-    /** [dnsCompiled]/[webCompiled]: which engines were rebuilt (and need reloading). */
-    data class Result(val downloaded: Int, val unchanged: Int, val failed: List<String>, val dnsCompiled: Boolean, val webCompiled: Boolean) {
+    /**
+     * [dnsCompiled]/[webCompiled]: which engines were rebuilt (and need reloading). [checked]:
+     * the lists this update downloaded or asked about; [unchanged] also counts those it left.
+     */
+    data class Result(val downloaded: Int, val unchanged: Int, val failed: List<String>, val dnsCompiled: Boolean, val webCompiled: Boolean, val checked: Int = 0) {
         val compiled get() = dnsCompiled || webCompiled
     }
 
@@ -39,14 +48,36 @@ object FilterUpdater {
     private data class Source(val name: String, val file: File, val allow: Boolean = false)
 
     internal sealed interface Fetch {
-        data class Updated(val etag: String?, val lastModified: String?, val bytes: Long) : Fetch
-        data object NotModified : Fetch
+        data class Updated(val etag: String?, val lastModified: String?, val bytes: Long, val scan: FileScan) : Fetch
+        /** [scan]: the stored file read once, when its facts were not known yet (an older meta.json). */
+        data class NotModified(val scan: FileScan? = null) : Fetch
         /** Downloaded in full, but identical to the stored copy (kept as it is). */
-        data class Same(val etag: String?, val lastModified: String?) : Fetch
+        data class Same(val etag: String?, val lastModified: String?, val scan: FileScan) : Fetch
         data class Failed(val reason: String) : Fetch
         /** Downloaded, but with under half the rules of the stored copy: held back once. */
         data class Shrunk(val reason: String, val held: Held) : Fetch
     }
+
+    /** How much an update checks: lists not on disk yet, those not checked for an hour, or all. */
+    enum class Check { MISSING, STALE, ALL }
+
+    /**
+     * At most 6 downloads at once and 3 per host (uBO's filters and its 10 parts come from one
+     * host, as do the 13 AdGuard lists): 25 conditional checks take ~1 s this way instead of ~6 s
+     * one at a time (measured from a PC, 2026-11-21).
+     */
+    internal class Limits(total: Int = 6, private val perHost: Int = 3) {
+        private val all = Semaphore(total)
+        private val hosts = java.util.concurrent.ConcurrentHashMap<String, Semaphore>()
+
+        suspend fun <T> run(url: String, block: () -> T): T {
+            val host = runCatching { URL(url).host }.getOrDefault("")
+            return hosts.computeIfAbsent(host) { Semaphore(perHost) }.withPermit { all.withPermit { block() } }
+        }
+    }
+
+    /** One list's check: what its download gave and its parts. */
+    internal data class Checked(val list: FilterList, val fetch: Fetch, val inc: Includes?)
 
     /** A shrunk download held back: its size, its rule count and when the first was held. */
     internal data class Held(val bytes: Long = 0, val rules: Int = 0, val since: Long = 0)
@@ -86,82 +117,147 @@ object FilterUpdater {
         val store = FilterStore(context)
         val meta = store.readMeta()
         val lists = FilterCatalog.enabledDns(settings) + if (webWanted(context, settings)) FilterCatalog.enabledWeb(settings) + FilterCatalog.exclusionLists else emptyList()
-        // Aduster's own lists (and lists that follow a setting and are off) come with the app (copied out when the page engine is compiled).
-        return lists.filter { it.asset == null }.any { l ->
-            !store.raw(l.id).exists() || (!l.bundled && meta.lists[l.id]?.url.let { it != null && it != l.url })
+        return lists.any { isMissing(it, meta, store) }
+    }
+
+    /**
+     * Not on disk, or downloaded from a URL the catalog no longer uses. Aduster's own lists come
+     * with the app (copied out when the page engine is compiled); a bundled list's first-run copy
+     * counts as there.
+     */
+    private fun isMissing(l: FilterList, meta: FilterMeta, store: FilterStore): Boolean =
+        l.asset == null && (!store.raw(l.id).exists() || (!l.bundled && meta.lists[l.id]?.url.let { it != null && it != l.url }))
+
+    /** Whether list [l] is downloaded by an update that checks [check]. */
+    internal fun due(l: FilterList, meta: FilterMeta, store: FilterStore, check: Check, now: Long): Boolean {
+        if (l.asset != null) return false
+        val missing = isMissing(l, meta, store)
+        val prev = meta.lists[l.id]?.takeIf { it.url == l.url }
+        return when (check) {
+            Check.MISSING -> missing
+            Check.STALE -> missing || prev == null || now - prev.checkedAt >= RECHECK_MS
+            Check.ALL -> true
         }
     }
 
-    /** [progress] gets the list being fetched, how many lists are done and how many there are. */
-    fun update(context: Context, settings: Settings, force: Boolean, progress: (String, Int, Int) -> Unit = { _, _, _ -> }): Result {
+    /**
+     * Checks the lists [check] calls for and rebuilds what changed. The DNS lists come first: as
+     * soon as they are in, the DNS table is compiled and [onDns] told (`:core` loads it at once)
+     * while the page lists are still downloading; the page engine follows. [progress] gets the
+     * last list checked, how many are done and how many there are.
+     */
+    fun update(context: Context, settings: Settings, check: Check, onDns: (Boolean) -> Unit = {}, progress: (String, Int, Int) -> Unit = { _, _, _ -> }): Result {
         val store = FilterStore(context)
         store.locked { cleanup(store, settings) }
-        var downloaded = 0
-        var unchanged = 0
-        val failed = mutableListOf<String>()
-        val changedIds = mutableListOf<String>()
         val web = webWanted(context, settings)
-        val lists = FilterCatalog.enabledDns(settings) + if (web) FilterCatalog.enabledWeb(settings) + FilterCatalog.exclusionLists else emptyList()
+        val dnsLists = FilterCatalog.enabledDns(settings)
+        val webLists = if (web) FilterCatalog.enabledWeb(settings) + FilterCatalog.exclusionLists else emptyList()
         val now = System.currentTimeMillis()
-        val now0 = android.os.SystemClock.elapsedRealtime()
-
-        for ((i, l) in lists.withIndex()) {
-            if (l.asset != null) {
-                // Shipped with the app: nothing to download.
-                unchanged++
-                continue
-            }
-            // Validators only count for the URL they came from.
-            val prev = store.readMeta().lists[l.id]?.takeIf { it.url == l.url }
-            if (!force && prev != null && now - prev.checkedAt < RECHECK_MS && store.raw(l.id).exists()) {
-                unchanged++
-                continue
-            }
-            progress(l.name, i, lists.size)
-            val r = fetch(l.url, store.raw(l.id), prev?.etag, prev?.lastModified, prev?.let { Held(it.heldBack, it.heldRules, it.heldSince) } ?: Held(), now)
-            val inc = if (r !is Fetch.Failed && r !is Fetch.Shrunk && store.raw(l.id).exists()) fetchIncludes(store.raw(l.id), store.includes(l.id), l.url, prev?.parts.orEmpty()) else null
-            store.locked {
-                val meta = store.readMeta()
-                val changed = r is Fetch.Updated || inc?.changed == true
-                val next = nextMeta(meta.lists[l.id] ?: ListMeta(), r, inc, l.url, now)
-                when {
-                    r is Fetch.Failed || r is Fetch.Shrunk -> failed += l.name
-                    changed -> {
-                        downloaded++
-                        changedIds += l.id
-                    }
-                    else -> unchanged++
-                }
-                store.writeMeta(meta.copy(lists = meta.lists + (l.id to next)))
-            }
-        }
-        progress("Compiling", lists.size, lists.size)
-        // Signatures (size + mtime of every input) decide what needs rebuilding: an updated DNS
-        // list does not recompile the page engine unless it changes what the engine relies on,
-        // and vice versa. The DNS table goes first, since the page engine leaves hosts it
-        // already blocks to it.
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        val meta = store.readMeta()
+        val dueDns = dnsLists.filter { due(it, meta, store, check, now) }
+        val dueWeb = webLists.filter { due(it, meta, store, check, now) }
+        val total = dueDns.size + dueWeb.size
+        var done = 0
+        var lastDone = t0
+        val shown = Any()
+        val limits = Limits()
         var dnsCompiled = false
         var webCompiled = false
-        val t1 = android.os.SystemClock.elapsedRealtime()
-        var t2 = t1
-        store.locked {
-            dnsCompiled = compileLocked(context, store, settings, force = false)
-            t2 = android.os.SystemClock.elapsedRealtime()
-            webCompiled = web && compileWebLocked(context, store, settings, force = false)
-            store.writeMeta(store.readMeta().copy(lastRun = now))
+        var dnsMs = 0L
+        var dnsReady = 0L
+        var webMs = 0L
+        val checked = runBlocking(Dispatchers.IO) {
+            fun start(lists: List<FilterList>) = lists.map { l ->
+                async {
+                    checkOne(store, l, meta.lists[l.id], limits, now).also {
+                        synchronized(shown) {
+                            done++
+                            lastDone = android.os.SystemClock.elapsedRealtime()
+                            progress(l.name, done, total)
+                        }
+                    }
+                }
+            }
+            val dnsJobs = start(dueDns)
+            val webJobs = start(dueWeb)
+            val dnsChecked = dnsJobs.awaitAll()
+            // Signatures (size + mtime of every input) decide what needs rebuilding: an updated
+            // DNS list does not recompile the page engine unless it changes what the engine
+            // relies on, and vice versa.
+            store.locked {
+                record(store, dnsChecked, now)
+                val t = android.os.SystemClock.elapsedRealtime()
+                dnsCompiled = compileLocked(context, store, settings, force = false)
+                dnsMs = android.os.SystemClock.elapsedRealtime() - t
+            }
+            dnsReady = android.os.SystemClock.elapsedRealtime() - t0
+            onDns(dnsCompiled)
+            val webChecked = webJobs.awaitAll()
+            synchronized(shown) { if (web) progress("Compiling", total, total) }
+            // The page engine goes second: it leaves hosts the DNS table already blocks to it.
+            store.locked {
+                record(store, webChecked, now)
+                val t = android.os.SystemClock.elapsedRealtime()
+                webCompiled = web && compileWebLocked(context, store, settings, force = false)
+                webMs = android.os.SystemClock.elapsedRealtime() - t
+                store.writeMeta(store.readMeta().copy(lastRun = now))
+            }
+            dnsChecked + webChecked
         }
-        val t3 = android.os.SystemClock.elapsedRealtime()
+        val failed = checked.filter { it.fetch is Fetch.Failed || it.fetch is Fetch.Shrunk }.map { it.list.name }
+        val changedIds = checked.filter { it.fetch !is Fetch.Failed && it.fetch !is Fetch.Shrunk && (it.fetch is Fetch.Updated || it.inc?.changed == true) }.map { it.list.id }
         // A changed never-decrypt list reaches the proxy through a settings reload (:core reads
         // the files when it builds the proxy config).
         if (FilterCatalog.exclusionLists.any { it.id in changedIds }) {
             app.aduster.vpn.AdusterVpnService.notifySettingsChanged(context)
         }
+        val all = dnsLists.size + webLists.size
         android.util.Log.i(
             "Aduster",
-            "update: ${lists.size} lists, $downloaded changed $changedIds, ${failed.size} failed in ${t1 - now0} ms; " +
-                "DNS ${if (dnsCompiled) "compiled" else "unchanged"} ${t2 - t1} ms, web ${if (webCompiled) "compiled" else "unchanged"} ${t3 - t2} ms",
+            "update: $all lists, ${changedIds.size} changed $changedIds, ${failed.size} failed in ${lastDone - t0} ms ($total checked); " +
+                "DNS ${if (dnsCompiled) "compiled" else "unchanged"} $dnsMs ms, ready at $dnsReady ms, web ${if (webCompiled) "compiled" else "unchanged"} $webMs ms",
         )
-        return Result(downloaded, unchanged, failed, dnsCompiled, webCompiled)
+        return Result(changedIds.size, all - changedIds.size - failed.size, failed, dnsCompiled, webCompiled, checked = total)
+    }
+
+    /** Downloads list [l] and its parts ([prev]: what its last check stored). */
+    internal suspend fun checkOne(store: FilterStore, l: FilterList, prev: ListMeta?, limits: Limits, now: Long): Checked {
+        val raw = store.raw(l.id)
+        // Validators only count for the URL they came from; what is known of the stored file
+        // holds whatever URL it came from.
+        val same = prev?.takeIf { it.url == l.url }
+        val r = limits.run(l.url) { fetch(l.url, raw, same?.etag, same?.lastModified, prev?.scan, same?.let { Held(it.heldBack, it.heldRules, it.heldSince) } ?: Held(), now) }
+        val inc = if (r !is Fetch.Failed && r !is Fetch.Shrunk && raw.exists()) {
+            val names = when (r) {
+                is Fetch.Updated -> r.scan.includes
+                is Fetch.Same -> r.scan.includes
+                is Fetch.NotModified -> (r.scan ?: scanOf(raw, prev?.scan)).includes
+                else -> emptyList()
+            }
+            fetchParts(names, store.includes(l.id), l.url, same?.parts.orEmpty(), limits, now)
+        } else {
+            null
+        }
+        return Checked(l, r, inc)
+    }
+
+    /** Writes what [checked] found into meta.json: one read and one write (under the lock). */
+    internal fun record(store: FilterStore, checked: List<Checked>, now: Long) {
+        if (checked.isEmpty()) return
+        val meta = store.readMeta()
+        val lists = meta.lists.toMutableMap()
+        for (c in checked) lists[c.list.id] = nextMeta(lists[c.list.id] ?: ListMeta(), c.fetch, c.inc, c.list.url, now)
+        store.writeMeta(meta.copy(lists = lists))
+    }
+
+    /** The lists [check] calls for, downloaded as [update] does (no compile): for tests. */
+    internal fun checkAll(store: FilterStore, lists: List<FilterList>, check: Check, now: Long = System.currentTimeMillis()): List<Checked> {
+        val meta = store.readMeta()
+        val limits = Limits()
+        val checked = runBlocking(Dispatchers.IO) { lists.filter { due(it, meta, store, check, now) }.map { l -> async { checkOne(store, l, meta.lists[l.id], limits, now) } }.awaitAll() }
+        store.locked { record(store, checked, now) }
+        return checked
     }
 
     /** How many of the lists [ids] have a failed download (their rows say why). */
@@ -182,9 +278,9 @@ object FilterUpdater {
     internal fun nextMeta(old: ListMeta, r: Fetch, inc: Includes?, url: String, now: Long): ListMeta {
         val changed = r is Fetch.Updated || inc?.changed == true
         val m = when (r) {
-            is Fetch.Updated -> old.copy(etag = r.etag, lastModified = r.lastModified, bytes = r.bytes)
-            is Fetch.Same -> old.copy(etag = r.etag, lastModified = r.lastModified)
-            Fetch.NotModified -> old
+            is Fetch.Updated -> old.copy(etag = r.etag, lastModified = r.lastModified, bytes = r.bytes, scan = r.scan)
+            is Fetch.Same -> old.copy(etag = r.etag, lastModified = r.lastModified, scan = r.scan)
+            is Fetch.NotModified -> if (r.scan != null) old.copy(scan = r.scan) else old
             is Fetch.Failed -> old
             is Fetch.Shrunk -> old
         }
@@ -247,6 +343,7 @@ object FilterUpdater {
      * same time: the periodic one and "Update now") has its own temporary file and is left alone.
      */
     private fun cleanup(store: FilterStore, settings: Settings) {
+        store.removeLeftovers()
         val known = FilterCatalog.stored(settings).map { it.id }.toSet()
         val now = System.currentTimeMillis()
         store.rawDir.listFiles()?.forEach { f ->
@@ -267,31 +364,39 @@ object FilterUpdater {
      * (same host, relative, nested up to 3) into [dir]. A part that shrank is held back once like
      * a whole list.
      */
-    internal fun fetchIncludes(raw: File, dir: File, listUrl: String, prev: Map<String, PartMeta>, now: Long = System.currentTimeMillis()): Includes {
+    internal fun fetchIncludes(raw: File, dir: File, listUrl: String, prev: Map<String, PartMeta>, now: Long = System.currentTimeMillis()): Includes =
+        runBlocking(Dispatchers.IO) { fetchParts(scanFile(raw).includes, dir, listUrl, prev, Limits(), now) }
+
+    /** [fetchIncludes] for the parts [names] a list names; each level's parts download at once. */
+    internal suspend fun fetchParts(names: List<String>, dir: File, listUrl: String, prev: Map<String, PartMeta>, limits: Limits, now: Long): Includes = coroutineScope {
         val base = URL(listUrl)
         val parts = linkedMapOf<String, PartMeta>()
         var changed = false
         var error: String? = null
-        var level = includesOf(raw)
+        var level = names
         var depth = 0
         while (level.isNotEmpty() && depth < MAX_INCLUDE_DEPTH) {
+            val todo = level.distinct().filter { it !in parts }.mapNotNull { name -> URL(base, name).takeIf { it.host == base.host }?.let { name to it } }
+            if (todo.isNotEmpty()) dir.mkdirs()
+            val results = todo.map { (name, url) ->
+                async {
+                    val file = File(dir, name)
+                    // A stored part without metadata (a catalog URL change, an unreadable meta.json)
+                    // is still the good copy: a failed download keeps it.
+                    val p = prev[name]?.takeIf { file.exists() } ?: if (file.exists()) PartMeta() else null
+                    val r = limits.run(url.toString()) { fetch(url.toString(), file, p?.etag, p?.lastModified, p?.scan, p?.let { Held(it.heldBack, it.heldRules, it.heldSince) } ?: Held(), now) }
+                    Triple(name, p, r)
+                }
+            }.awaitAll()
             val next = mutableListOf<String>()
-            for (name in level) {
-                if (name in parts) continue
-                val url = URL(base, name)
-                if (url.host != base.host) continue
-                dir.mkdirs()
-                val file = File(dir, name)
-                // A stored part without metadata (a catalog URL change, an unreadable meta.json)
-                // is still the good copy: a failed download keeps it.
-                val p = prev[name]?.takeIf { file.exists() } ?: if (file.exists()) PartMeta() else null
-                when (val r = fetch(url.toString(), file, p?.etag, p?.lastModified, p?.let { Held(it.heldBack, it.heldRules, it.heldSince) } ?: Held(), now)) {
+            for ((name, p, r) in results) {
+                when (r) {
                     is Fetch.Updated -> {
                         changed = true
-                        parts[name] = PartMeta(r.etag, r.lastModified)
+                        parts[name] = PartMeta(r.etag, r.lastModified, scan = r.scan)
                     }
-                    Fetch.NotModified -> parts[name] = p ?: PartMeta()
-                    is Fetch.Same -> parts[name] = PartMeta(r.etag, r.lastModified)
+                    is Fetch.NotModified -> parts[name] = (p ?: PartMeta()).let { if (r.scan != null) it.copy(scan = r.scan) else it }
+                    is Fetch.Same -> parts[name] = PartMeta(r.etag, r.lastModified, scan = r.scan)
                     is Fetch.Shrunk -> {
                         error = "$name: ${r.reason}"
                         if (p != null) parts[name] = p.copy(heldBack = r.held.bytes, heldRules = r.held.rules, heldSince = r.held.since)
@@ -301,7 +406,8 @@ object FilterUpdater {
                         if (p != null) parts[name] = p
                     }
                 }
-                if (file.exists()) next += includesOf(file)
+                val file = File(dir, name)
+                if (file.exists()) next += scanOf(file, parts[name]?.scan).includes
             }
             level = next
             depth++
@@ -312,11 +418,25 @@ object FilterUpdater {
             if ((!part && it.name !in parts) || (part && now - it.lastModified() > RECHECK_MS)) it.delete()
         }
         if (parts.keys != prev.keys) changed = true
-        return Includes(parts, changed, error)
+        Includes(parts, changed, error)
     }
 
-    private fun includesOf(f: File): List<String> =
-        f.useLines { lines -> lines.mapNotNull { INCLUDE.matchEntire(it.trim())?.groupValues?.get(1) }.toList() }
+    /** [stored] if it still describes [f] (same size), else [f] read once. */
+    private fun scanOf(f: File, stored: FileScan?): FileScan = stored?.takeIf { it.size == f.length() } ?: scanFile(f)
+
+    /** Reads a stored file once for its [FileScan] (a file stored before these facts were kept). */
+    internal fun scanFile(f: File): FileScan {
+        val s = ListScanner()
+        f.inputStream().use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                s.feed(buf, n)
+            }
+        }
+        return s.finish()
+    }
 
     /** Builds the browsers' page-filtering engine from the enabled web lists. */
     private fun compileWebLocked(context: Context, store: FilterStore, settings: Settings, force: Boolean): Boolean {
@@ -329,9 +449,27 @@ object FilterUpdater {
             if (m.lists[l.id] == null) store.writeMeta(m.copy(lists = m.lists + (l.id to ListMeta(url = l.url))))
         }
         val lists = FilterCatalog.enabledWeb(settings).filter { store.raw(it.id).exists() }
+        return compileWebFiles(store, lists, UserRules.webPart(settings.userRules), force)
+    }
+
+    /** The page compiler, as [compileWebFiles] calls it (a stand-in in tests). */
+    internal interface WebNative {
+        fun compile(spec: String, out: String, dns: String): String
+        fun digest(dat: String, dns: String): String
+    }
+
+    private object NativeWeb : WebNative {
+        override fun compile(spec: String, out: String, dns: String): String = NativeCore.nativeCompileWeb(spec, out, dns)
+        override fun digest(dat: String, dns: String): String = NativeCore.nativeWebDnsDigest(dat, dns)
+    }
+
+    /**
+     * Builds the page engine from the stored [lists] and the user's page rules [userWeb], unless
+     * nothing it is built from changed (or [force]). Under the store's lock.
+     */
+    internal fun compileWebFiles(store: FilterStore, lists: List<FilterList>, userWeb: String, force: Boolean, native: WebNative = NativeWeb): Boolean {
         val meta = store.readMeta()
         // The user's own element-hiding and URL rules join the page filter as one more list.
-        val userWeb = UserRules.webPart(settings.userRules)
         val userFile = File(store.dir, "user-web.txt")
         if (userWeb.isEmpty()) userFile.delete() else if (!userFile.exists() || userFile.readText() != userWeb) userFile.writeText(userWeb)
         // Every browser list off and no browser rules of the user: the old engine must go too, or
@@ -352,18 +490,17 @@ object FilterUpdater {
         // Of the DNS table, the engine only depends on which hosts named by page-list exceptions
         // it blocks (native side): other DNS list updates leave the engine, and with it every
         // cached page's revalidation marker, alone. Working that out takes ~2 s of CPU on a test
-        // phone, so it is redone only when the page engine's files or the DNS table changed.
+        // phone, so it is done only when it decides something: the page lists are unchanged
+        // and the DNS table (or the engine's side table) is not the one it was worked out for.
+        // A compile hands back the digest of what it built.
         fun digestKey() = "${sig(store.webExtra)}|${sig(store.dnsTable)}"
-        fun dnsDigest(): String {
+        if (!force && store.webTable.exists() && meta.webSignature.substringBeforeLast("|dns=", "") == base) {
             val key = digestKey()
-            if (key == meta.webDigestKey && meta.webDigest.isNotEmpty()) return meta.webDigest
-            return NativeCore.nativeWebDnsDigest(store.webTable.path, if (store.dnsTable.exists()) store.dnsTable.path else "")
-        }
-        val digest = dnsDigest()
-        val signature = "$base|dns=$digest"
-        if (!force && store.webTable.exists() && meta.webSignature == signature) {
-            if (meta.webDigestKey != digestKey()) store.writeMeta(meta.copy(webDigestKey = digestKey(), webDigest = digest))
-            return false
+            val digest = if (key == meta.webDigestKey && meta.webDigest.isNotEmpty()) meta.webDigest else native.digest(store.webTable.path, if (store.dnsTable.exists()) store.dnsTable.path else "")
+            if (meta.webSignature == "$base|dns=$digest") {
+                if (meta.webDigestKey != key) store.writeMeta(meta.copy(webDigestKey = key, webDigest = digest))
+                return false
+            }
         }
         val spec = buildJsonArray {
             lists.forEach { l ->
@@ -383,7 +520,7 @@ object FilterUpdater {
             if (userWeb.isNotEmpty()) add(buildJsonObject { put("name", "user"); put("path", userFile.path) })
         }
         val dns = if (store.dnsTable.exists()) store.dnsTable.path else ""
-        val out = Json.parseToJsonElement(NativeCore.nativeCompileWeb(spec.toString(), store.webTable.path, dns)).jsonObject
+        val out = Json.parseToJsonElement(native.compile(spec.toString(), store.webTable.path, dns)).jsonObject
         val ok = out["ok"]?.jsonPrimitive?.content == "true"
         if (!ok) {
             store.writeMeta(meta.copy(webError = out["error"]?.jsonPrimitive?.content ?: "compile failed"))
@@ -396,8 +533,8 @@ object FilterUpdater {
             val m = updated[id] ?: return@forEach
             updated[id] = m.copy(rules = o["rules"]?.jsonPrimitive?.int ?: m.rules, dnsCovered = o["dns"]?.jsonPrimitive?.int ?: 0)
         }
-        // The new engine's side table decides the digest now (computed once, then cached).
-        val newDigest = NativeCore.nativeWebDnsDigest(store.webTable.path, if (store.dnsTable.exists()) store.dnsTable.path else "")
+        // The digest of what the compile built against (an engine without it: worked out here).
+        val newDigest = out["dns_digest"]?.jsonPrimitive?.content ?: native.digest(store.webTable.path, if (store.dnsTable.exists()) store.dnsTable.path else "")
         store.writeMeta(
             meta.copy(
                 lists = updated, webCompiledAt = System.currentTimeMillis(), webRules = out["rules"]?.jsonPrimitive?.int ?: 0,
@@ -487,14 +624,14 @@ object FilterUpdater {
      * updates rarely comes twice with the same size), and any shrunk download once hold-backs
      * have lasted 7 days.
      */
-    private fun fetch(url: String, target: File, etag: String?, lastModified: String?, held: Held, now: Long): Fetch {
+    private fun fetch(url: String, target: File, etag: String?, lastModified: String?, stored: FileScan?, held: Held, now: Long): Fetch {
         val conn = try {
             URL(url).openConnection() as HttpURLConnection
         } catch (e: Exception) {
             return Fetch.Failed(e.message ?: "bad url")
         }
         // Unique per download: two updates running at once never write or delete each other's file.
-        val tmp = File(target.path + ".part-" + android.os.Process.myPid() + "-" + System.nanoTime())
+        val tmp = File(target.path + ".part-" + android.os.Process.myPid() + "-" + downloads.incrementAndGet() + "-" + System.nanoTime())
         return try {
             conn.connectTimeout = 15_000
             conn.readTimeout = 30_000
@@ -505,48 +642,53 @@ object FilterUpdater {
                 lastModified?.let { conn.setRequestProperty("If-Modified-Since", it) }
             }
             when (val code = conn.responseCode) {
-                HttpURLConnection.HTTP_NOT_MODIFIED -> Fetch.NotModified
+                // A stored file whose facts are not known yet (meta.json of an older version) is
+                // read this once.
+                HttpURLConnection.HTTP_NOT_MODIFIED -> Fetch.NotModified(if (target.exists() && stored?.size != target.length()) scanFile(target) else null)
                 HttpURLConnection.HTTP_OK -> {
-                    var total = 0L
+                    // One pass: written to the temporary file while its hash, rule lines and
+                    // includes are taken.
+                    val scanner = ListScanner()
                     conn.inputStream.use { input ->
                         tmp.outputStream().buffered().use { out ->
                             val buf = ByteArray(64 * 1024)
                             while (true) {
                                 val n = input.read(buf)
                                 if (n < 0) break
-                                total += n
-                                if (total > MAX_BYTES) throw IOException("list larger than 64 MiB")
+                                if (scanner.size + n > MAX_BYTES) throw IOException("list larger than 64 MiB")
+                                scanner.feed(buf, n)
                                 out.write(buf, 0, n)
                             }
                         }
                     }
-                    if (!looksLikeFilterList(tmp)) {
+                    val scan = scanner.finish()
+                    if (!scanner.looksLikeFilterList()) {
                         tmp.delete()
                         return Fetch.Failed("not a filter list")
                     }
+                    val old = if (target.exists()) lazy { scanOf(target, stored) } else null
                     // Same measure on both copies (rule lines of this file, includes apart).
-                    val before = if (target.exists() && tmp.length() != held.bytes) ruleLines(target) else 0
+                    val before = if (old != null && scan.size != held.bytes) old.value.lines else 0
                     if (before > 1000) {
-                        val n = ruleLines(tmp)
+                        val n = scan.lines
                         val confirmed = (held.rules > 0 && Math.abs(n - held.rules) * 10 <= held.rules) ||
                             (held.since > 0 && now - held.since >= HOLD_MAX_MS)
                         if (n * 2 < before && !confirmed) {
-                            val size = tmp.length()
                             tmp.delete()
                             val since = if (held.since > 0) held.since else now
-                            return Fetch.Shrunk("the list shrank from ${"%,d".format(java.util.Locale.US, before)} to ${"%,d".format(java.util.Locale.US, n)} rules; kept the previous copy", Held(size, n, since))
+                            return Fetch.Shrunk("the list shrank from ${"%,d".format(java.util.Locale.US, before)} to ${"%,d".format(java.util.Locale.US, n)} rules; kept the previous copy", Held(scan.size, n, since))
                         }
                     }
                     // Some servers answer every request in full (no validators, or they change
                     // them): the same bytes again must not touch the stored file, whose size and
                     // mtime decide whether the engines are rebuilt.
-                    if (sameContent(tmp, target)) {
+                    if (old != null && target.length() == scan.size && old.value.sha256 == scan.sha256) {
                         tmp.delete()
-                        return Fetch.Same(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"))
+                        return Fetch.Same(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), scan)
                     }
                     // rename(2) on Android; also replaces the stored copy on a PC's JVM (the tests).
                     java.nio.file.Files.move(tmp.toPath(), target.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
-                    Fetch.Updated(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), total)
+                    Fetch.Updated(conn.getHeaderField("ETag"), conn.getHeaderField("Last-Modified"), scan.size, scan)
                 }
                 else -> Fetch.Failed("HTTP $code")
             }
@@ -558,36 +700,101 @@ object FilterUpdater {
         }
     }
 
-    private fun sameContent(a: File, b: File): Boolean {
-        if (!b.exists() || a.length() != b.length()) return false
-        a.inputStream().buffered(64 * 1024).use { x ->
-            b.inputStream().buffered(64 * 1024).use { y ->
-                val bx = ByteArray(64 * 1024)
-                val by = ByteArray(64 * 1024)
-                while (true) {
-                    val n = x.readNBytes(bx, 0, bx.size)
-                    val m = y.readNBytes(by, 0, by.size)
-                    if (n != m || !bx.copyOf(n).contentEquals(by.copyOf(m))) return false
-                    if (n == 0) return true
-                }
+    private val downloads = java.util.concurrent.atomic.AtomicLong()
+}
+
+/**
+ * Reads a list file as it streams by, once: its SHA-256, its rule lines (not blank, not a
+ * comment or a header: the shrink guard's measure), the names it pulls in with `!#include` and
+ * its first 4 KB (HTML error pages, captive-portal answers and binary junk are refused).
+ */
+internal class ListScanner {
+    private val digest = java.security.MessageDigest.getInstance("SHA-256")
+    private val head = ByteArray(4096)
+    private var headLen = 0
+    var size = 0L
+        private set
+    private var lines = 0
+    private val includes = mutableListOf<String>()
+
+    // The line being read: what its first non-blank characters say it is.
+    private var state = START
+    private val bang = java.io.ByteArrayOutputStream(128)
+
+    fun feed(buf: ByteArray, n: Int) {
+        digest.update(buf, 0, n)
+        if (headLen < head.size) {
+            val k = minOf(n, head.size - headLen)
+            System.arraycopy(buf, 0, head, headLen, k)
+            headLen += k
+        }
+        size += n
+        for (i in 0 until n) step(buf[i])
+    }
+
+    private fun step(b: Byte) {
+        if (b == NL) {
+            endLine()
+            return
+        }
+        state = when (state) {
+            START -> when {
+                b == SPACE || b == TAB || b == CR || b == VT || b == FF -> START
+                b == BANG -> { bang.reset(); bang.write(b.toInt()); BANG_LINE }
+                b == BRACKET -> OTHER
+                b == HASH -> HASH1
+                else -> { lines++; OTHER }
             }
+            // `##`, `#@#` and `#?#` start element rules; any other `#` line is a comment.
+            HASH1 -> when (b) {
+                HASH -> { lines++; OTHER }
+                AT, QUESTION -> HASH2
+                else -> OTHER
+            }
+            HASH2 -> { if (b == HASH) lines++; OTHER }
+            BANG_LINE -> { if (bang.size() < 512) bang.write(b.toInt()); BANG_LINE }
+            else -> OTHER
         }
     }
 
-    /** Lines that are rules (not blank, not a comment or a header), counted cheaply. */
-    private fun ruleLines(f: File): Int = f.useLines { lines ->
-        lines.count { raw ->
-            val l = raw.trim()
-            l.isNotEmpty() && !l.startsWith("!") && !l.startsWith("[") && !(l.startsWith("#") && !l.startsWith("##") && !l.startsWith("#@#") && !l.startsWith("#?#"))
+    private fun endLine() {
+        if (state == BANG_LINE) {
+            INCLUDE.matchEntire(bang.toByteArray().decodeToString().trim())?.let { includes += it.groupValues[1] }
         }
+        state = START
     }
 
-    /** Rejects HTML error pages, captive-portal responses and binary junk. */
-    private fun looksLikeFilterList(f: File): Boolean {
-        if (f.length() == 0L) return false
-        val head = f.inputStream().use { s -> ByteArray(4096).let { b -> b.copyOf(s.read(b).coerceAtLeast(0)) } }
-        if (head.any { it == 0.toByte() }) return false
-        val text = head.decodeToString().trimStart().lowercase()
+    fun finish(): FileScan {
+        endLine()
+        val hex = digest.digest().joinToString("") { "%02x".format(it) }
+        return FileScan(size, hex, lines, includes.toList())
+    }
+
+    fun looksLikeFilterList(): Boolean {
+        if (size == 0L) return false
+        val h = head.copyOf(headLen)
+        if (h.any { it == 0.toByte() }) return false
+        val text = h.decodeToString().trimStart().lowercase()
         return !(text.startsWith("<!doctype html") || text.startsWith("<html"))
+    }
+
+    private companion object {
+        const val START = 0
+        const val OTHER = 1
+        const val HASH1 = 2
+        const val HASH2 = 3
+        const val BANG_LINE = 4
+        const val NL: Byte = 10
+        const val CR: Byte = 13
+        const val SPACE: Byte = 32
+        const val TAB: Byte = 9
+        const val VT: Byte = 11
+        const val FF: Byte = 12
+        const val BANG: Byte = 33
+        const val HASH: Byte = 35
+        const val AT: Byte = 64
+        const val QUESTION: Byte = 63
+        const val BRACKET: Byte = 91
+        val INCLUDE = Regex("""^!#include\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*$""")
     }
 }

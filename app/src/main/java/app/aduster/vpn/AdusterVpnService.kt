@@ -785,7 +785,7 @@ class AdusterVpnService : VpnService() {
 
     /** Pauses for [minutes], or until Resume when 0. */
     private suspend fun pause(minutes: Int) {
-        Timeline.add(this, Timeline.PAUSED, if (minutes > 0) "for $minutes min" else "until Resume")
+        Timeline.add(this, Timeline.PAUSED, if (minutes > 0) "for $minutes min" else "until you resume")
         pauseDeadlineBoot = if (minutes > 0) SystemClock.elapsedRealtime() + minutes * 60_000L else 0
         setPause(if (minutes > 0) System.currentTimeMillis() + minutes * 60_000L else Long.MAX_VALUE)
     }

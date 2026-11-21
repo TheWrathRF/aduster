@@ -49,7 +49,20 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 
-data class InstalledApp(val pkg: String, val label: String, val system: Boolean, val uid: Int)
+/**
+ * A row of Excluded apps. [launchable]: it has a launcher entry. [network]: it can reach the
+ * network (it holds INTERNET, or another package of its UID does: exclusion works per UID).
+ * [note]: the line under a row whose exclusion would change nothing.
+ */
+data class InstalledApp(
+    val pkg: String,
+    val label: String,
+    val system: Boolean,
+    val uid: Int,
+    val launchable: Boolean = true,
+    val network: Boolean = true,
+    val note: String? = null,
+)
 
 /** Log entries fetched per binder call (forward paging). */
 private const val LOG_PAGE = 1000
@@ -158,7 +171,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * from are compiled by a job (never in the always-on process, and never in this screen's
      * scope, where leaving the app would freeze or kill the work).
      */
-    fun update(then: (() -> Unit)? = null, transform: (Settings) -> Settings) {
+    /**
+     * [fetch]: the change may need lists that are not on disk yet; one job then fetches them and
+     * compiles (a compile job beside it would only build the engines twice).
+     */
+    fun update(fetch: Boolean = false, transform: (Settings) -> Settings) {
         viewModelScope.launch(Dispatchers.IO) {
             // "Before" is what the transform really saw (the StateFlow can lag or still hold
             // the placeholder at start-up).
@@ -167,12 +184,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // :core is told only when something it reads changed: the theme or the log size
             // would otherwise re-initialise its engine.
             if (before.coreKey() != after.coreKey()) AdusterVpnService.notifySettingsChanged(ctx)
-            if (before.deviceProfile != after.deviceProfile || before.blockDnsBypass != after.blockDnsBypass ||
+            val compileChanged = before.deviceProfile != after.deviceProfile || before.blockDnsBypass != after.blockDnsBypass ||
                 before.listOverrides != after.listOverrides || before.customLists != after.customLists
-            ) {
-                FilterJobs.compile(ctx)
-            }
-            then?.invoke()
+            FilterJobs.afterChange(ctx, after, compileChanged, fetch)
             if (before.theme != after.theme) app.aduster.widget.StatsWidget.refresh(ctx)
             if (before.autoUpdate != after.autoUpdate || before.updateIntervalHours != after.updateIntervalHours ||
                 before.updateWifiOnly != after.updateWifiOnly || before.updateWhileCharging != after.updateWhileCharging
@@ -188,23 +202,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setListEnabled(id: String, on: Boolean) {
         // A newly enabled list is fetched if needed; unchanged lists are not re-downloaded.
-        update(then = { if (on) FilterJobs.runNow(ctx, force = false) }) { it.copy(listOverrides = it.listOverrides + (id to on)) }
+        update(fetch = on) { it.copy(listOverrides = it.listOverrides + (id to on)) }
     }
 
     /** The Device list's profile; a list used for the first time is fetched. */
     fun setDeviceProfile(p: DeviceProfile) {
-        update(then = { FilterJobs.runNow(ctx, force = false) }) { it.copy(deviceProfile = p) }
+        update(fetch = true) { it.copy(deviceProfile = p) }
     }
 
     /** Adds a list; only it is fetched (the others are not re-checked). */
     fun addCustomList(list: app.aduster.settings.CustomList) {
-        update(then = { FilterJobs.runNow(ctx, force = false) }) { st -> st.copy(customLists = st.customLists + list) }
+        update(fetch = true) { st -> st.copy(customLists = st.customLists + list) }
     }
 
     fun removeCustomList(id: String) = update { st -> st.copy(customLists = st.customLists.filterNot { it.id == id }) }
 
     fun setHttpsFiltering(on: Boolean) {
-        update(then = { if (on) FilterJobs.runNow(ctx, force = false) }) { it.copy(httpsFiltering = on) }
+        update(fetch = on) { it.copy(httpsFiltering = on) }
     }
 
     fun caInstalled(): Boolean = CaManager.isInstalled(ctx)
@@ -444,13 +458,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     suspend fun installedApps(): List<InstalledApp> = withContext(Dispatchers.IO) {
         val pm = ctx.packageManager
-        pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong()))
-            .filter { it.packageName != ctx.packageName && it.requestedPermissions?.contains(android.Manifest.permission.INTERNET) == true }
+        val launcher = android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+        val launchable = pm.queryIntentActivities(launcher, PackageManager.ResolveInfoFlags.of(0L)).map { it.activityInfo.packageName }.toSet()
+        val facts = pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong()))
+            .filter { it.packageName != ctx.packageName }
             .mapNotNull { pi ->
                 val ai = pi.applicationInfo ?: return@mapNotNull null
-                InstalledApp(pi.packageName, pm.getApplicationLabel(ai).toString(), ai.flags and ApplicationInfo.FLAG_SYSTEM != 0, ai.uid)
+                app.aduster.ui.settings.PackageFacts(
+                    pi.packageName, pm.getApplicationLabel(ai).toString(), ai.flags and ApplicationInfo.FLAG_SYSTEM != 0, ai.uid,
+                    internet = pi.requestedPermissions?.contains(android.Manifest.permission.INTERNET) == true,
+                    launchable = pi.packageName in launchable,
+                )
             }
-            .sortedBy { it.label.lowercase() }
+        app.aduster.ui.settings.appRows(facts)
     }
 
     // ---- backup ----
@@ -503,8 +523,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val after = store.trySave { current -> next.copy(enabled = current.enabled, pausedUntil = current.pausedUntil) } ?: return false
         AdusterVpnService.notifySettingsChanged(ctx)
         FilterJobs.schedule(ctx, after)
-        FilterJobs.compile(ctx)
-        if (FilterUpdater.missingLists(ctx, after)) FilterJobs.runNow(ctx, force = false)
+        FilterJobs.afterChange(ctx, after, compileChanged = true, fetch = true)
         return true
     }
 

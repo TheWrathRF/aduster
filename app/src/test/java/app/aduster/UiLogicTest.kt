@@ -17,6 +17,9 @@ import app.aduster.ui.common.segmentShape
 import app.aduster.ui.historySlots
 import app.aduster.ui.parseDomainCheck
 import app.aduster.ui.parseSiteCheck
+import app.aduster.ui.settings.PackageFacts
+import app.aduster.ui.settings.appRows
+import app.aduster.ui.settings.shownApps
 import app.aduster.ui.settings.timelineLines
 import app.aduster.ui.theme.pastBar
 import app.aduster.ui.theme.radioRing
@@ -44,6 +47,41 @@ class UiLogicTest {
         assertFalse(app.aduster.filters.FilterCatalog.all(on).any { it.adguardTrustedOf != null })
         assertTrue(app.aduster.filters.FilterCatalog.stored(on).any { it.id == base.id })
         app.aduster.filters.FilterCatalog.trustedCompanions.forEach { assertNotNull(app.aduster.filters.FilterCatalog.byId(it.adguardTrustedOf!!)) }
+    }
+
+    /**
+     * Excluded apps lists every app with a launcher entry that reaches the network, system or
+     * not (the Google app, Chrome); background parts only behind the switch; an app with no
+     * network of its own (Google's assistant app: the Google app makes its connections) only in search, with the
+     * app to exclude instead.
+     */
+    @Test
+    fun excludedAppsListsLaunchableAppsAndNamesTheCarrier() {
+        val facts = listOf(
+            PackageFacts("com.google.android.apps.bard", "Assistant", system = false, uid = 10150, internet = false, launchable = true),
+            PackageFacts("com.google.android.googlequicksearchbox", "Google", system = true, uid = 10120, internet = true, launchable = true),
+            PackageFacts("com.android.chrome", "Chrome", system = true, uid = 10130, internet = true, launchable = true),
+            PackageFacts("com.google.android.safetycore", "Android System SafetyCore", system = true, uid = 10140, internet = true, launchable = false),
+            // A launcher app whose network permission sits in another package of its shared UID.
+            PackageFacts("com.example.front", "Front", system = false, uid = 10200, internet = false, launchable = true),
+            PackageFacts("com.example.back", "Back service", system = false, uid = 10200, internet = true, launchable = false),
+            PackageFacts("com.example.calc", "Calculator", system = false, uid = 10210, internet = false, launchable = true),
+        )
+        val rows = appRows(facts)
+        fun pkgs(l: List<app.aduster.ui.InstalledApp>) = l.map { it.pkg }.toSet()
+        val main = shownApps(rows, "", background = false, excluded = emptySet())
+        assertEquals(setOf("com.google.android.googlequicksearchbox", "com.android.chrome", "com.example.front"), pkgs(main))
+        val withBackground = shownApps(rows, "", background = true, excluded = emptySet())
+        assertEquals(pkgs(main) + setOf("com.google.android.safetycore", "com.example.back"), pkgs(withBackground))
+        val assistant = shownApps(rows, "assist", background = false, excluded = emptySet()).single()
+        assertEquals("com.google.android.apps.bard", assistant.pkg)
+        assertFalse(assistant.network)
+        assertEquals("Uses Google's connection: exclude Google", assistant.note)
+        assertEquals("Has no internet access of its own", shownApps(rows, "calc", background = false, excluded = emptySet()).single().note)
+        assertNull(main.first { it.pkg == "com.android.chrome" }.note)
+        // A background part found by search; an excluded one stays listed without the switch.
+        assertEquals(listOf("com.google.android.safetycore"), shownApps(rows, "safety", background = false, excluded = emptySet()).map { it.pkg })
+        assertTrue("com.example.back" in pkgs(shownApps(rows, "", background = false, excluded = setOf("com.example.back"))))
     }
 
     @Test
@@ -305,9 +343,18 @@ class UiLogicTest {
         val lines = SettingsBackup.decode(file, Settings())!!.summary
         assertTrue(lines.toString(), "DNS server: https://dns.other.example/q (now Network default)" in lines)
         assertTrue(lines.toString(), "Block DNS bypass: off (now on)" in lines)
-        assertTrue(lines.toString(), "1 rules of your own (now 0)" in lines)
+        assertTrue(lines.toString(), "1 rule of your own (now 0)" in lines)
         // What does not change is not listed as a change.
         assertTrue(lines.toString(), lines.none { it.startsWith("Reply to blocked lookups") })
+    }
+
+    /** Counts read as words do: one rule, two rules, a thousand with its separator. */
+    @Test
+    fun countsAgreeWithTheirNumber() {
+        assertEquals("1 rule", app.aduster.ui.counted(1, "rule"))
+        assertEquals("0 rules", app.aduster.ui.counted(0, "rule"))
+        assertEquals("1,234 rules", app.aduster.ui.counted(1234, "rule"))
+        assertEquals("1 day", app.aduster.ui.counted(1, "day"))
     }
 
     /**
@@ -455,7 +502,7 @@ class UiLogicTest {
         // A pause ended by turning off is not an open pause; stops decided by code.
         val lines = timelineLines(
             listOf(
-                Timeline.Entry(1_000, Timeline.PAUSED, "until Resume"),
+                Timeline.Entry(1_000, Timeline.PAUSED, "until you resume"),
                 Timeline.Entry(2_000, Timeline.STOPPED, "turned off in the app", "user_off"),
                 Timeline.Entry(3_000, Timeline.STOPPED, "the filtering process ended (app updated)", "app_updated"),
                 Timeline.Entry(4_000, Timeline.STOPPED, "the DNS engine kept stopping", "failure"),
@@ -472,7 +519,7 @@ class UiLogicTest {
         // pause opens again after the start, so the later Resume closes it.
         val lines = timelineLines(
             listOf(
-                Timeline.Entry(1_000, Timeline.PAUSED, "until Resume"),
+                Timeline.Entry(1_000, Timeline.PAUSED, "until you resume"),
                 Timeline.Entry(2_000, Timeline.STOPPED, "the filtering process ended (app updated)", "app_updated"),
                 Timeline.Entry(3_000, Timeline.STARTED, "after an app update"),
                 Timeline.Entry(3_000, Timeline.PAUSED, "still paused"),

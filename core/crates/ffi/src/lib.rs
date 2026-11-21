@@ -369,6 +369,9 @@ struct SourceSpec {
 extern "system" fn native_compile(mut env: JNIEnv, _: JClass, sources: JString, out: JString) -> jni::sys::jstring {
     let (sources, out) = (jstr(&mut env, &sources), jstr(&mut env, &out));
     let result = guard("compile", r#"{"ok":false,"error":"panic"}"#.to_string(), || compile(&sources, &out));
+    // The lists' text and the build's tables are freed now: given back to the system, not kept
+    // by the allocator for the life of the main process.
+    dnsengine::release_free_memory();
     to_jstring(&mut env, &result)
 }
 
@@ -630,6 +633,9 @@ extern "system" fn native_proxy_stop(_env: JNIEnv, _: JClass) {
 extern "system" fn native_compile_web(mut env: JNIEnv, _: JClass, sources: JString, out: JString, dns_table: JString) -> jni::sys::jstring {
     let (sources, out, dns) = (jstr(&mut env, &sources), jstr(&mut env, &out), jstr(&mut env, &dns_table));
     let r = guard("compile web", r#"{"ok":false,"error":"panic"}"#.to_string(), || proxy::compile_web(&sources, &out, &dns));
+    // As after the DNS compile (without it the main process kept ~74 MB of freed heap after a
+    // page compile on a test phone).
+    dnsengine::release_free_memory();
     to_jstring(&mut env, &r)
 }
 
@@ -637,6 +643,7 @@ extern "system" fn native_compile_web(mut env: JNIEnv, _: JClass, sources: JStri
 extern "system" fn native_web_dns_digest(mut env: JNIEnv, _: JClass, dat: JString, dns_table: JString) -> jni::sys::jstring {
     let (dat, dns) = (jstr(&mut env, &dat), jstr(&mut env, &dns_table));
     let r = guard("web dns digest", "error".to_string(), || proxy::web_dns_digest(&dat, &dns));
+    dnsengine::release_free_memory();
     to_jstring(&mut env, &r)
 }
 

@@ -125,7 +125,7 @@ object SettingsBackup {
      * import changes it, apps by [appName].
      */
     private fun summary(old: Settings, new: Settings, pages: Boolean, appName: (String) -> String): List<String> = buildList {
-        add("${app.aduster.filters.UserRules.ruleCount(new.userRules)} rules of your own (now ${app.aduster.filters.UserRules.ruleCount(old.userRules)})")
+        add("${app.aduster.ui.counted(app.aduster.filters.UserRules.ruleCount(new.userRules), "rule")} of your own (now ${app.aduster.filters.UserRules.ruleCount(old.userRules)})")
         add("${new.customLists.size} custom lists, ${new.listOverrides.size} list switches")
         for (f in FIELDS) {
             if (f.pages && !pages) continue

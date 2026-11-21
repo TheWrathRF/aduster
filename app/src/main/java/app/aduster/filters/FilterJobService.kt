@@ -159,7 +159,28 @@ object FilterJobs {
     private const val WAIT_PREFS = "filter_jobs"
     private const val GIVE_UP_AFTER_MS = 30 * 60_000L
 
-    /** [force] re-checks every list now; otherwise only missing or stale lists are fetched. */
+    /**
+     * The one job a settings change needs ([compileChanged]: what the engines are built from
+     * changed; [fetch]: the change may need lists that are not on disk, [missing] says whether
+     * it does): a fetch of the missing lists, which compiles at its end, or a compile.
+     */
+    internal fun forChange(compileChanged: Boolean, fetch: Boolean, missing: () -> Boolean): List<Int> = when {
+        fetch && missing() -> listOf(ID_NOW)
+        compileChanged || fetch -> listOf(ID_COMPILE)
+        else -> emptyList()
+    }
+
+    /** Schedules what [forChange] says. */
+    fun afterChange(ctx: Context, settings: Settings, compileChanged: Boolean, fetch: Boolean) {
+        for (id in forChange(compileChanged, fetch) { FilterUpdater.missingLists(ctx, settings) }) {
+            if (id == ID_NOW) runNow(ctx, force = false) else compile(ctx)
+        }
+    }
+
+    /**
+     * [force] re-checks every list now; otherwise only the lists not on disk yet are fetched (a
+     * list just switched on, page filtering's lists): the others wait for the periodic update.
+     */
     fun runNow(ctx: Context, force: Boolean = true) {
         if (running(ctx, ID_NOW)) {
             rerun.merge(ID_NOW, force) { a, b -> a || b }
@@ -250,6 +271,19 @@ object FilterJobs {
         return if (here == null && there == null) null else here == true || there == true
     }
 
+    /** "Update now" is tried again when every list it checked failed. */
+    internal fun retryAfter(r: FilterUpdater.Result): Boolean = r.failed.isNotEmpty() && r.failed.size == r.checked
+
+    /** Rebuilds the engines whose inputs changed and tells :core which ones to load. */
+    private fun compileNow(ctx: Context, id: Int, settings: Settings, forceWeb: Boolean) {
+        publish(id, Progress("Compiling"))
+        val dns = FilterUpdater.compile(ctx, settings)
+        if (dns) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false)
+        val web = FilterUpdater.webWanted(ctx, settings) && FilterUpdater.compileWeb(ctx, settings, forceWeb)
+        if (web) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
+        FilterUpdater.noteAppVersion(ctx)
+    }
+
     /** Runs one job; true = retry later. */
     internal suspend fun run(ctx: Context, id: Int, extras: PersistableBundle): Boolean {
         var waiting = false
@@ -260,17 +294,17 @@ object FilterJobs {
                 val settings = SettingsStore.get(ctx).data.first()
                 val retry = when (id) {
                     ID_COMPILE -> {
-                        publish(id, Progress("Compiling"))
-                        val dns = FilterUpdater.compile(ctx, settings)
-                        val web = FilterUpdater.webWanted(ctx, settings) && FilterUpdater.compileWeb(ctx, settings, force)
-                        AdusterVpnService.notifyFiltersChanged(ctx, dns, web)
-                        FilterUpdater.noteAppVersion(ctx)
+                        compileNow(ctx, id, settings, force)
                         false
                     }
                     else -> {
                         val wifiOnly = id == ID_PERIODIC && extras.getBoolean(EXTRA_WIFI_ONLY, true)
                         if (!hasNetwork(ctx, wifiOnly)) {
                             if (id != ID_NOW) return true
+                            // A fetch of missing lists also stands for the compile its settings
+                            // change needed (a profile, a list already on disk beside it): that
+                            // is done now, the download when a network comes.
+                            if (!force) compileNow(ctx, id, settings, forceWeb = false)
                             // "Update now" without a network: the screen says so while it retries,
                             // for at most 30 minutes (backoff 30 s, 1, 2, 4, 8, 16 min); then the
                             // periodic update or the next app open catches up.
@@ -286,11 +320,21 @@ object FilterJobs {
                         }
                         ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE).edit().remove("waiting_since").apply()
                         publish(id, Progress("Starting"))
-                        val r = FilterUpdater.update(ctx, settings, force) { name, done, total -> publish(id, Progress(name, done, total)) }
-                        if (r.compiled) AdusterVpnService.notifyFiltersChanged(ctx, dns = r.dnsCompiled, web = r.webCompiled)
+                        val check = when {
+                            id == ID_PERIODIC -> FilterUpdater.Check.STALE
+                            force -> FilterUpdater.Check.ALL
+                            else -> FilterUpdater.Check.MISSING
+                        }
+                        // New DNS rules are loaded as soon as they are compiled, not after the
+                        // page engine.
+                        val r = FilterUpdater.update(ctx, settings, check, onDns = { if (it) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false) }) { name, done, total ->
+                            publish(id, Progress(name, done, total))
+                        }
+                        if (r.webCompiled) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
                         FilterUpdater.noteAppVersion(ctx)
-                        // Retry (with backoff) only if nothing at all could be fetched, e.g. flaky network.
-                        id == ID_NOW && r.failed.isNotEmpty() && r.downloaded == 0 && r.unchanged == 0
+                        // Retry (with backoff) only if no list it checked came through, e.g. flaky
+                        // network (lists it did not need to check do not count).
+                        id == ID_NOW && retryAfter(r)
                     }
                 }
                 // Asked for again while this ran (here, or from :core): once more, with what

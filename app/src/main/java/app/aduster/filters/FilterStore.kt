@@ -7,11 +7,27 @@ import java.io.File
 import java.io.RandomAccessFile
 
 /**
+ * What an update needs to know about a stored list file, taken while it was downloaded, so a
+ * check that finds it unchanged reads nothing: its [size] (the facts hold only while the file
+ * still has it), SHA-256, rule lines (the shrink guard's measure) and the names it pulls in with
+ * `!#include`.
+ */
+@Serializable
+data class FileScan(val size: Long, val sha256: String, val lines: Int, val includes: List<String> = emptyList())
+
+/**
  * Validators of one downloaded file, for conditional requests, and the size of a download held
  * back because it shrank (as [ListMeta.heldBack], so a shrunk part is not refused on every update).
  */
 @Serializable
-data class PartMeta(val etag: String? = null, val lastModified: String? = null, val heldBack: Long = 0, val heldRules: Int = 0, val heldSince: Long = 0)
+data class PartMeta(
+    val etag: String? = null,
+    val lastModified: String? = null,
+    val heldBack: Long = 0,
+    val heldRules: Int = 0,
+    val heldSince: Long = 0,
+    val scan: FileScan? = null,
+)
 
 @Serializable
 data class ListMeta(
@@ -34,6 +50,8 @@ data class ListMeta(
     /** Its rule count (within 10 % again is accepted) and when holding back began (7 days at most). */
     val heldRules: Int = 0,
     val heldSince: Long = 0,
+    /** The stored file, as read while it was downloaded (see [FileScan]). */
+    val scan: FileScan? = null,
 )
 
 @Serializable
@@ -56,8 +74,13 @@ data class FilterMeta(
 )
 
 /** On-disk layout under files/filters. Shared by the UI/worker and :core processes. */
-class FilterStore(context: Context) {
-    val dir = File(context.filesDir, "filters").apply { mkdirs() }
+class FilterStore(val dir: File) {
+    constructor(context: Context) : this(File(context.filesDir, "filters"))
+
+    init {
+        dir.mkdirs()
+    }
+
     val rawDir = File(dir, "raw").apply { mkdirs() }
     val builtinDir = File(dir, "builtin").apply { mkdirs() }
     val dnsTable = File(dir, "dns.admx")
@@ -101,10 +124,20 @@ class FilterStore(context: Context) {
             FilterMeta()
         }
 
+    /** Replaces meta.json whole; a failed write or rename throws (the job tries again later). */
     fun writeMeta(meta: FilterMeta) {
-        val tmp = File(dir, "meta.json.tmp")
+        val tmp = File(dir, META_TMP)
         tmp.writeText(SettingsJson.encodeToString(FilterMeta.serializer(), meta))
-        tmp.renameTo(metaFile)
+        java.nio.file.Files.move(tmp.toPath(), metaFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+    }
+
+    /**
+     * Temporary files a write cut short leaves (the process killed, a full disk): the page
+     * engine's pair (~16 MB), the DNS table's and meta.json's. Removed under the lock, where no
+     * compile or meta write is under way.
+     */
+    fun removeLeftovers() {
+        for (name in listOf(META_TMP, "dns.admx.tmp", "web.tmp", "web.extra.tmp", "web.count.tmp")) File(dir, name).delete()
     }
 
     /**
@@ -144,6 +177,7 @@ class FilterStore(context: Context) {
     }
 
     private companion object {
+        const val META_TMP = "meta.json.tmp"
         val processLock = java.util.concurrent.locks.ReentrantLock()
     }
 }
