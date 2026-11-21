@@ -160,6 +160,9 @@ fn skip_name(b: &[u8], mut off: usize) -> Option<usize> {
         if len & 0xC0 == 0xC0 {
             return (off + 2 <= b.len()).then_some(off + 2);
         }
+        if len > 63 {
+            return None;
+        }
         off += 1 + len;
         if len == 0 {
             return (off <= b.len()).then_some(off);
@@ -319,6 +322,9 @@ pub fn inspect(b: &[u8]) -> Option<ResponseInfo> {
     for _ in 0..qd {
         off = skip_name(b, off)? + 4;
     }
+    if off > b.len() {
+        return None;
+    }
     let mut min_answer_ttl: Option<u32> = None;
     let mut negative_ttl: Option<u32> = None;
     for i in 0..(an + ns + ar) {
@@ -431,5 +437,29 @@ mod tests {
         assert_eq!(info.cnames, vec!["shop.tracker-cdn.net".to_string()]);
         assert_eq!(info.ttl, Some(30));
         assert_eq!(info.ttl_offsets.len(), 2);
+    }
+
+    /// Label lengths 64-191 are reserved (RFC 1035 allows 0-63, RFC 6891 retired the 0x40 form):
+    /// a name holding one is malformed, not a long label.
+    #[test]
+    fn skip_name_rejects_reserved_label_lengths() {
+        let accepted: Vec<u8> = [0x40u8, 0x80, 0xBF]
+            .into_iter()
+            .filter(|&tag| {
+                let mut b = vec![tag];
+                b.extend(std::iter::repeat_n(b'a', tag as usize));
+                b.push(0);
+                skip_name(&b, 0).is_some()
+            })
+            .collect();
+        assert!(accepted.is_empty(), "accepted reserved label lengths: {accepted:#x?}");
+    }
+
+    /// An answer cut off inside its question is not an answer (it would be cached as an empty
+    /// NXDOMAIN or NOERROR).
+    #[test]
+    fn inspect_rejects_a_truncated_question() {
+        let b = [0, 1, 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        assert!(inspect(&b).is_none(), "accepted a truncated question");
     }
 }

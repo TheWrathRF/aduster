@@ -301,9 +301,10 @@ fn answers(q: &[u8], r: &[u8]) -> bool {
 }
 
 fn same_question(q: &[u8], r: &[u8]) -> bool {
-    // Compare the question section (name, type, class), case-insensitively.
+    // Compare the question section: the name case-insensitively (resolvers may echo another
+    // case), its type and class byte for byte.
     let Some(end) = question_end(q) else { return false };
-    r.len() >= end && q[12..end].eq_ignore_ascii_case(&r[12..end])
+    r.len() >= end && q[12..end - 4].eq_ignore_ascii_case(&r[12..end - 4]) && q[end - 4..end] == r[end - 4..end]
 }
 
 fn question_end(b: &[u8]) -> Option<usize> {
@@ -382,7 +383,7 @@ async fn tcp_exchange(server: SocketAddr, q: &[u8]) -> io::Result<Vec<u8>> {
         let len = s.read_u16().await? as usize;
         let mut r = vec![0u8; len];
         s.read_exact(&mut r).await?;
-        if len < 12 || dns::id_of(&r) != id || !same_question(&msg[2..], &r) {
+        if dns::id_of(&r) != id || !answers(&msg[2..], &r) {
             return Err(io::Error::new(ErrorKind::InvalidData, "bad tcp response"));
         }
         dns::set_id(&mut r, orig);
@@ -1433,5 +1434,36 @@ mod tests {
         let t1 = std::time::Instant::now();
         system_exchange(&[da, la], &q).await.unwrap();
         assert!(t1.elapsed().as_millis() < 300, "the live server is asked first now");
+    }
+
+    /// The question's name compares case-insensitively (0x20 mixing), its type and class byte
+    /// for byte: HTTPS (65) is not type 97, whose low byte is 'a' to an ASCII comparison.
+    #[test]
+    fn same_question_compares_the_type_exactly() {
+        let q65 = dns::build_query(0x1234, "a.test", 65);
+        let mut r97 = dns::build_query(0x1234, "a.test", 97);
+        r97[2] |= 0x80;
+        assert!(!same_question(&q65, &r97), "treated types 65 and 97 as equal");
+        let mut upper = dns::build_query(0x1234, "A.TEST", 65);
+        upper[2] |= 0x80;
+        assert!(same_question(&q65, &upper), "the name is case-insensitive");
+    }
+
+    /// A TCP resolver that echoes the query back (QR clear) gave no answer.
+    #[tokio::test]
+    async fn tcp_exchange_rejects_a_reply_without_the_qr_bit() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let n = s.read_u16().await.unwrap();
+            let mut m = vec![0u8; n as usize];
+            s.read_exact(&mut m).await.unwrap();
+            let mut out = n.to_be_bytes().to_vec();
+            out.extend_from_slice(&m);
+            let _ = s.write_all(&out).await;
+        });
+        let q = dns::build_query(0x1234, "a.test", dns::TYPE_A);
+        assert!(tcp_exchange(addr, &q).await.is_err(), "accepted a TCP reply without the QR bit");
     }
 }
