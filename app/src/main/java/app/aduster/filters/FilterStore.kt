@@ -71,6 +71,14 @@ data class FilterMeta(
     val webDigestKey: String = "",
     /** Which exception hosts of the page lists the DNS table blocks (native digest). */
     val webDigest: String = "",
+    /** Rule count of the user's own page engine (included in [webRules]). */
+    val webUserRules: Int = 0,
+    /** Signature of the user's own page engine (text hash, format, and DNS size:mtime when needed). */
+    val webUserSignature: String = "",
+    /** True when the user's page rules name an exception host (so a DNS table change matters). */
+    val webUserDependsDns: Boolean = false,
+    /** Size and mtime of the user's page engine and its side table when compiled. */
+    val webUserFiles: String = "",
     /** Install time of the app version whose job last checked the engines. */
     val appVersion: Long = 0,
 )
@@ -90,6 +98,11 @@ class FilterStore(val dir: File) {
     val webTable = File(dir, "web.dat")
     /** The page engine's second file, which the DNS digest reads. */
     val webExtra = File(dir, "web.extra")
+    val webCount = File(dir, "web.count")
+    /** Separate pair for the user's own page rules, loaded alongside [webTable]. */
+    val webUserTable = File(dir, "web-user.dat")
+    val webUserExtra = File(dir, "web-user.extra")
+    val webUserCount = File(dir, "web-user.count")
     /** uBlock Origin's scriptlets and redirect files, bundled in the APK. */
     val uboResources = File(builtinDir, "ubo-resources.json")
     /** Redirect files AdGuard's lists name and uBO lacks, bundled in the APK. */
@@ -139,7 +152,11 @@ class FilterStore(val dir: File) {
      * compile or meta write is under way.
      */
     fun removeLeftovers() {
-        for (name in listOf(META_TMP, "dns.admx.tmp", "web.tmp", "web.extra.tmp", "web.count.tmp")) File(dir, name).delete()
+        for (name in listOf(
+            META_TMP, "dns.admx.tmp",
+            "web.tmp", "web.extra.tmp", "web.count.tmp",
+            "web-user.tmp", "web-user.extra.tmp", "web-user.count.tmp",
+        )) File(dir, name).delete()
     }
 
     /**

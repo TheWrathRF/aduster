@@ -206,18 +206,117 @@ class FilterUpdaterTest {
     }
 
     /** A page compiler stand-in: writes the engine's pair and says which DNS digest it built against. */
-    private class FakeWeb(var dnsDigest: String) : FilterUpdater.WebNative {
+    private class FakeWeb(var dnsDigest: String, var userCandidates: Int = 0) : FilterUpdater.WebNative {
         var digests = 0
         var compiles = 0
+        val compiledOuts = mutableListOf<String>()
+        val compiledSpecs = mutableListOf<String>()
         override fun compile(spec: String, out: String, dns: String): String {
             compiles++
+            compiledOuts += out
+            compiledSpecs += spec
+            val isUser = out.endsWith("web-user.dat")
+            val rules = if (isUser) 2 else 5
+            val candidates = if (isUser) userCandidates else 1
             java.io.File(out).writeText("engine $compiles")
             java.io.File(out.removeSuffix(".dat") + ".extra").writeText("extra $compiles")
-            return """{"ok":true,"rules":5,"lists":[],"dns_digest":"$dnsDigest"}"""
+            java.io.File(out.removeSuffix(".dat") + ".count").writeText("""{"rules":$rules}""")
+            return """{"ok":true,"rules":$rules,"lists":[],"dns_digest":"$dnsDigest","exception_candidates":$candidates}"""
         }
         override fun digest(dat: String, dns: String): String {
             digests++
             return dnsDigest
+        }
+    }
+
+    /**
+     * User page rules compile into their own pair without rebuilding the lists' engine; list
+     * changes rebuild only the lists' engine; removing user rules deletes the user pair and
+     * signals a reload; DNS changes rebuild the user pair only when it has exception candidates.
+     */
+    @Test
+    fun userRulesCompileIndependentlyOfLists() {
+        val tmp = Files.createTempDirectory("aduster-user-web").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("w", "Web", "https://lists.test/w.txt", true, Group.WEB, true, "")
+            store.raw("w").writeText("##.ad\n")
+            store.dnsTable.writeText("dns 1")
+            val native = FakeWeb("d1", userCandidates = 0)
+            val listCompiles = { native.compiledOuts.count { it.endsWith("web.dat") } }
+            val userCompiles = { native.compiledOuts.count { it.endsWith("web-user.dat") } }
+            val userDat = File(tmp, "web-user.dat")
+            val userExtra = File(tmp, "web-user.extra")
+            val userCount = File(tmp, "web-user.count")
+
+            // Initial compile with lists only: only web.dat is built.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
+            assertEquals(1, listCompiles())
+            assertEquals(0, userCompiles())
+            assertEquals(false, userDat.exists())
+            assertEquals(5, store.readMeta().webRules)
+
+            // User adds a page rule: only the user pair compiles, lists are untouched.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "news.test#@#.ad", false, native))
+            assertEquals("lists must not recompile for a user rule", 1, listCompiles())
+            assertEquals(1, userCompiles())
+            assertEquals(true, userDat.exists() && userExtra.exists())
+            assertEquals(true, native.compiledSpecs.last().contains("\"user\":true"))
+            assertEquals(7, store.readMeta().webRules)
+
+            // Nothing changed: neither compiles.
+            assertEquals(false, FilterUpdater.compileWebFiles(store, listOf(l), "news.test#@#.ad", false, native))
+            assertEquals(1, listCompiles())
+            assertEquals(1, userCompiles())
+
+            // DNS table changes while user rules have no host exceptions: user pair is not rebuilt.
+            store.dnsTable.writeText("dns 22")
+            assertEquals(false, FilterUpdater.compileWebFiles(store, listOf(l), "news.test#@#.ad", false, native))
+            assertEquals(1, listCompiles())
+            assertEquals(1, userCompiles())
+
+            // User adds a host exception (depends on DNS): compiles user pair only; next DNS change
+            // rebuilds the user pair too.
+            native.userCandidates = 1
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "@@||ads.example^\$domain=news.test", false, native))
+            assertEquals(1, listCompiles())
+            assertEquals(2, userCompiles())
+            store.dnsTable.writeText("dns 333")
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "@@||ads.example^\$domain=news.test", false, native))
+            assertEquals(1, listCompiles())
+            assertEquals(3, userCompiles())
+
+            // List changes: only the lists' engine compiles, user pair is untouched.
+            store.raw("w").writeText("##.ad\n##.banner\n")
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "@@||ads.example^\$domain=news.test", false, native))
+            assertEquals(2, listCompiles())
+            assertEquals(3, userCompiles())
+            assertEquals(7, store.readMeta().webRules)
+
+            // User rules removed: user pair deleted, lists untouched, returns true to reload :core.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
+            assertEquals(2, listCompiles())
+            assertEquals(3, userCompiles())
+            assertEquals(false, userDat.exists() || userExtra.exists() || userCount.exists())
+            assertEquals(5, store.readMeta().webRules)
+            assertEquals(false, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
+
+            // Lists empty, user rules present: empty lists engine + user pair; removing user rules
+            // deletes everything.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, emptyList(), "site.test##.mine", false, native))
+            assertEquals(3, listCompiles())
+            assertEquals(4, userCompiles())
+            assertEquals(true, store.webTable.exists() && userDat.exists())
+            assertEquals(true, FilterUpdater.compileWebFiles(store, emptyList(), "", false, native))
+            assertEquals(false, store.webTable.exists() || store.webExtra.exists() || userDat.exists() || userExtra.exists())
+            assertEquals(0, store.readMeta().webRules)
+
+            // Leftover user temp files are cleaned up.
+            val tmps = listOf("web-user.tmp", "web-user.extra.tmp", "web-user.count.tmp").map { File(tmp, it).apply { writeText("x") } }
+            store.removeLeftovers()
+            assertEquals(true, tmps.none { it.exists() })
+        } finally {
+            tmp.deleteRecursively()
         }
     }
 
