@@ -245,6 +245,66 @@ class UiLogicTest {
         assertEquals("Off" to "0 blocked today", w.lines(running = false, paused = false, blocked = 0))
     }
 
+    /**
+     * Widget redraws read `running` once and serialize state read + draw under one lock so an
+     * in-flight screen-on redraw cannot overwrite a later "Off" draw.
+     */
+    @Test
+    fun widgetRedrawReadsRunningOnceAndSerializesDraws() {
+        val w = app.aduster.widget.StatsWidget
+        // Reading running once avoids torn text/color when protection stops mid-update.
+        var reads = 0
+        var drawnRunning = false
+        var drawnBig = ""
+        w.renderLocked(
+            readRunning = { (++reads) == 1 },
+            readPausedUntil = { 0L },
+            readBlocked = { 10L },
+        ) { running, _, big, _ ->
+            drawnRunning = running
+            drawnBig = big
+        }
+        assertEquals("running must be read once", 1, reads)
+        assertEquals(true, drawnRunning)
+        assertEquals("10", drawnBig)
+
+        // Ordering: thread 1 starts drawing while running == true and stalls inside draw; thread 2
+        // flips running to false and redraws. Thread 2's "Off" draw must land last.
+        val isRunning = java.util.concurrent.atomic.AtomicBoolean(true)
+        val inDraw = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val applied = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val t1 = Thread {
+            w.renderLocked(
+                readRunning = { isRunning.get() },
+                readPausedUntil = { 0L },
+                readBlocked = { 10L },
+            ) { _, _, big, _ ->
+                inDraw.countDown()
+                release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                applied += big
+            }
+        }
+        t1.start()
+        assertTrue(inDraw.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        isRunning.set(false)
+        val t2 = Thread {
+            w.renderLocked(
+                readRunning = { isRunning.get() },
+                readPausedUntil = { 0L },
+                readBlocked = { 10L },
+            ) { _, _, big, _ ->
+                applied += big
+            }
+        }
+        t2.start()
+        Thread.sleep(50)
+        release.countDown()
+        t1.join(5_000)
+        t2.join(5_000)
+        assertEquals(listOf("10", "Off"), applied)
+    }
+
     @Test
     fun statsCarryDnsAndPageCounts() {
         val s = Stats.parse("""{"running":true,"queries":10,"blocked":6,"dns_queries":4,"dns_blocked":1,"top_blocked":[["x.com",5]],"top_blocked_page_counts":[["x.com",3]],"https_state":"ca_untrusted"}""", running = false)

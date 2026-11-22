@@ -52,27 +52,49 @@ class StatsWidget : AppWidgetProvider() {
         @Volatile
         private var placed: Boolean? = null
 
+        /** Serializes reading protection state and calling `updateAppWidget`, so an older redraw never overwrites a newer state. */
+        private val drawLock = Any()
+
+        internal fun renderLocked(
+            readRunning: () -> Boolean,
+            readPausedUntil: () -> Long,
+            readBlocked: () -> Long,
+            nowMs: () -> Long = System::currentTimeMillis,
+            draw: (running: Boolean, paused: Boolean, big: String, small: String) -> Unit,
+        ) = synchronized(drawLock) {
+            // Read `running` once under the lock so text, color and pause state stay consistent
+            // and a later stop/pause always draws last.
+            val running = readRunning()
+            val paused = running && readPausedUntil() > nowMs()
+            val (big, small) = lines(running, paused, readBlocked())
+            draw(running, paused, big, small)
+        }
+
         fun update(ctx: Context) {
             if (placed == false) return
             val mgr = AppWidgetManager.getInstance(ctx) ?: return
             val ids = mgr.getAppWidgetIds(ComponentName(ctx, StatsWidget::class.java))
             placed = ids.isNotEmpty()
             if (ids.isEmpty()) return
-            val paused = AdusterVpnService.isPaused()
-            val (big, small) = lines(AdusterVpnService.running, paused, blockedToday(ctx))
-            val p = if (light(ctx)) LightPalette else BlackPalette
-            val views = RemoteViews(ctx.packageName, R.layout.widget_stats).apply {
-                setInt(R.id.widget_root, "setBackgroundResource", if (p.dark) R.drawable.widget_bg else R.drawable.widget_bg_light)
-                setTextViewText(R.id.widget_count, big)
-                setTextColor(R.id.widget_count, (if (paused) p.warn else if (AdusterVpnService.running) p.text else p.muted).toArgb())
-                setTextViewText(R.id.widget_caption, small)
-                setTextColor(R.id.widget_caption, p.muted.toArgb())
-                setOnClickPendingIntent(
-                    R.id.widget_root,
-                    PendingIntent.getActivity(ctx, 12, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE),
-                )
+            renderLocked(
+                readRunning = { AdusterVpnService.running },
+                readPausedUntil = { AdusterVpnService.pausedUntil },
+                readBlocked = { blockedToday(ctx) },
+            ) { running, paused, big, small ->
+                val p = if (light(ctx)) LightPalette else BlackPalette
+                val views = RemoteViews(ctx.packageName, R.layout.widget_stats).apply {
+                    setInt(R.id.widget_root, "setBackgroundResource", if (p.dark) R.drawable.widget_bg else R.drawable.widget_bg_light)
+                    setTextViewText(R.id.widget_count, big)
+                    setTextColor(R.id.widget_count, (if (paused) p.warn else if (running) p.text else p.muted).toArgb())
+                    setTextViewText(R.id.widget_caption, small)
+                    setTextColor(R.id.widget_caption, p.muted.toArgb())
+                    setOnClickPendingIntent(
+                        R.id.widget_root,
+                        PendingIntent.getActivity(ctx, 12, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE),
+                    )
+                }
+                mgr.updateAppWidget(ids, views)
             }
-            mgr.updateAppWidget(ids, views)
         }
 
         /**
@@ -89,7 +111,7 @@ class StatsWidget : AppWidgetProvider() {
 
         /** The widget's two lines: the count while protected, otherwise the state above the count. */
         fun lines(running: Boolean, paused: Boolean, blocked: Long): Pair<String, String> = when {
-            paused -> "Paused" to "${fmt(blocked)} blocked today"
+            running && paused -> "Paused" to "${fmt(blocked)} blocked today"
             running -> fmt(blocked) to "Blocked today"
             else -> "Off" to "${fmt(blocked)} blocked today"
         }
