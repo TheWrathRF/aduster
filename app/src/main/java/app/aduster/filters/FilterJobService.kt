@@ -293,11 +293,11 @@ object FilterJobs {
     }
 
     /** Rebuilds the engines whose inputs changed and tells :core which ones to load. */
-    private fun compileNow(ctx: Context, id: Int, settings: Settings, forceWeb: Boolean) {
+    private fun compileNow(ctx: Context, id: Int, readSettings: suspend () -> Settings, forceWeb: Boolean) {
         publish(id, Progress("Compiling"))
-        val dns = FilterUpdater.compile(ctx, settings)
+        val dns = FilterUpdater.compile(ctx, readSettings)
         if (dns) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false)
-        val web = FilterUpdater.webWanted(ctx, settings) && FilterUpdater.compileWeb(ctx, settings, forceWeb)
+        val web = FilterUpdater.compileWeb(ctx, readSettings, forceWeb)
         if (web) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
         FilterUpdater.noteAppVersion(ctx)
     }
@@ -307,12 +307,12 @@ object FilterJobs {
         var waiting = false
         executing += id
         try {
+            val readSettings: suspend () -> Settings = { SettingsStore.get(ctx).data.first() }
             var force = extras.getBoolean(EXTRA_FORCE, false)
             while (true) {
-                val settings = SettingsStore.get(ctx).data.first()
                 val retry = when (id) {
                     ID_COMPILE -> {
-                        compileNow(ctx, id, settings, force)
+                        compileNow(ctx, id, readSettings, force)
                         false
                     }
                     else -> {
@@ -323,7 +323,7 @@ object FilterJobs {
                             // change needed (a profile, a list already on disk beside it): that
                             // is done now (once, not at every retry), the download when a
                             // network comes.
-                            if (!force && waitingSince(ctx) == 0L) compileNow(ctx, id, settings, forceWeb = false)
+                            if (!force && waitingSince(ctx) == 0L) compileNow(ctx, id, readSettings, forceWeb = false)
                             // "Update now" without a network: the screen says so while it retries,
                             // for at most 30 minutes (backoff 30 s, 1, 2, 4, 8, 16 min); then the
                             // periodic update or the next app open catches up.
@@ -340,7 +340,7 @@ object FilterJobs {
                         }
                         // New DNS rules are loaded as soon as they are compiled, not after the
                         // page engine.
-                        val r = FilterUpdater.update(ctx, settings, check, onDns = { if (it) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false) }) { name, done, total ->
+                        val r = FilterUpdater.update(ctx, readSettings, check, onDns = { if (it) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false) }) { name, done, total ->
                             publish(id, Progress(name, done, total))
                         }
                         if (r.webCompiled) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)

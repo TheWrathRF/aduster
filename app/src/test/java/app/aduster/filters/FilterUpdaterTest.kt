@@ -211,11 +211,15 @@ class FilterUpdaterTest {
         var compiles = 0
         val compiledOuts = mutableListOf<String>()
         val compiledSpecs = mutableListOf<String>()
+        var failLists: String? = null
+        var failUser: String? = null
         override fun compile(spec: String, out: String, dns: String): String {
             compiles++
             compiledOuts += out
             compiledSpecs += spec
             val isUser = out.endsWith("web-user.dat")
+            val err = if (isUser) failUser else failLists
+            if (err != null) return """{"ok":false,"error":"$err"}"""
             val rules = if (isUser) 2 else 5
             val candidates = if (isUser) userCandidates else 1
             java.io.File(out).writeText("engine $compiles")
@@ -518,6 +522,260 @@ class FilterUpdaterTest {
             assertNotNull(r.parts["part.txt"])
         } finally {
             s.close()
+        }
+    }
+
+    /**
+     * Settings changed while an update's downloads are in flight (a user page rule saved and
+     * compiled by its own compile job, or a DNS setting toggled) are kept when the update takes
+     * the lock to compile, never overwritten by the older snapshot taken before downloading.
+     */
+    @Test
+    fun settingsChangedWhileUpdateFetchIsInFlightAreKept() {
+        val fetchesStarted = java.util.concurrent.CountDownLatch(2)
+        val allowResponse = java.util.concurrent.CountDownLatch(1)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+        server.createContext("/w.txt") { ex ->
+            fetchesStarted.countDown()
+            allowResponse.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            val b = "##.ad\n##.banner\n".toByteArray()
+            ex.sendResponseHeaders(200, b.size.toLong())
+            ex.responseBody.use { it.write(b) }
+            ex.close()
+        }
+        server.createContext("/d.txt") { ex ->
+            fetchesStarted.countDown()
+            allowResponse.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            val b = "||ads.test^\n".toByteArray()
+            ex.sendResponseHeaders(200, b.size.toLong())
+            ex.responseBody.use { it.write(b) }
+            ex.close()
+        }
+        server.start()
+        val tmp = Files.createTempDirectory("aduster-update-race").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val base = "http://127.0.0.1:${server.address.port}"
+            val d = FilterList("custom-00000001", "DNS", "$base/d.txt", false, Group.CUSTOM, true, "")
+            val w = FilterList("custom-00000002", "Web", "$base/w.txt", true, Group.CUSTOM, true, "")
+            store.raw(w.id).writeText("##.ad\n")
+            store.dnsTable.writeText("dns 1")
+            val native = FakeWeb("d1")
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(w), "", false, native))
+
+            val customLists = listOf(
+                app.aduster.settings.CustomList(d.id, d.name, d.url, web = false),
+                app.aduster.settings.CustomList(w.id, w.name, w.url, web = true),
+            )
+            val current = java.util.concurrent.atomic.AtomicReference(
+                app.aduster.settings.Settings(httpsFiltering = true, userRules = "", customLists = customLists),
+            )
+            val dnsSettingsSeen = java.util.Collections.synchronizedList(mutableListOf<app.aduster.settings.Settings>())
+            val workerError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+            val worker = Thread {
+                try {
+                    FilterUpdater.updateStore(
+                        store = store,
+                        readSettings = { current.get() },
+                        check = FilterUpdater.Check.ALL,
+                        webWanted = { it.httpsFiltering },
+                        compileDns = { s -> dnsSettingsSeen += s; false },
+                        compileWeb = { s -> FilterUpdater.compileWebFiles(store, listOf(w), s.userRules, false, native) },
+                        dnsListsOf = { listOf(d) },
+                        webListsOf = { listOf(w) },
+                    )
+                } catch (t: Throwable) {
+                    workerError.set(t)
+                }
+            }
+            worker.start()
+            assertEquals(true, fetchesStarted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+
+            // While the update's fetches are in flight, the user saves a page rule (compiled by
+            // its own job) and toggles a DNS setting.
+            current.set(current.get().copy(userRules = "site.test##.mine", blockDnsBypass = false))
+            store.locked {
+                assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(w), current.get().userRules, false, native))
+            }
+            val userDatBefore = store.webUserTable.readText()
+            val userCompilesBefore = native.compiledOuts.count { it.endsWith("web-user.dat") }
+
+            allowResponse.countDown()
+            worker.join(10_000)
+            assertNull("update worker must not fail", workerError.get())
+
+            assertEquals("DNS compile must see updated settings", listOf(false), dnsSettingsSeen.map { it.blockDnsBypass })
+            assertEquals("newer user pair must stay on disk", true, store.webUserTable.exists() && store.webUserExtra.exists())
+            assertEquals("newer user pair must not be overwritten", userDatBefore, store.webUserTable.readText())
+            assertEquals("user pair already matched current settings", userCompilesBefore, native.compiledOuts.count { it.endsWith("web-user.dat") })
+            assertEquals("site.test##.mine", File(store.dir, "user-web.txt").readText())
+        } finally {
+            allowResponse.countDown()
+            server.stop(0)
+            tmp.deleteRecursively()
+        }
+    }
+
+    /**
+     * A failed page-rule compile records `webError`, and reverting the failed change clears it
+     * even when both pairs are already up to date or no engine files exist on disk yet.
+     */
+    @Test
+    fun revertingAFailedChangeClearsStaleWebError() {
+        val tmp = Files.createTempDirectory("aduster-weberr").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("w", "Web", "https://lists.test/w.txt", true, Group.WEB, true, "")
+            store.raw("w").writeText("##.ad\n")
+            store.dnsTable.writeText("dns 1")
+            val native = FakeWeb("d1")
+
+            // 1. Both pairs built cleanly, then a user rule edit fails once, then is reverted.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "a.test##.ad", false, native))
+            assertNull(store.readMeta().webError)
+            native.failUser = "disk full"
+            assertEquals(false, FilterUpdater.compileWebFiles(store, listOf(l), "b.test##.bad", false, native))
+            assertEquals("disk full", store.readMeta().webError)
+            native.failUser = null
+            // Reverting back to "a.test##.ad": both pairs are already up to date, webError must clear.
+            assertEquals(false, FilterUpdater.compileWebFiles(store, listOf(l), "a.test##.ad", false, native))
+            assertNull("stale webError must clear when both pairs are up to date", store.readMeta().webError)
+
+            // 2. Nothing exists on disk yet: first compile fails, then the user clears the rule.
+            val emptyStore = FilterStore(File(tmp, "empty"))
+            native.failLists = "disk full"
+            assertEquals(false, FilterUpdater.compileWebFiles(emptyStore, emptyList(), "b.test##.bad", false, native))
+            assertEquals("disk full", emptyStore.readMeta().webError)
+            native.failLists = null
+            assertEquals(false, FilterUpdater.compileWebFiles(emptyStore, emptyList(), "", false, native))
+            assertNull("stale webError must clear when no files exist yet", emptyStore.readMeta().webError)
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    /**
+     * When the lists' compile fails while a valid current-format lists' engine is already on disk,
+     * the lists' error is recorded and the user pair can still be edited or deleted; a user pair
+     * is never built against a missing, mismatched or older-format lists' engine.
+     */
+    @Test
+    fun failingListsCompileDoesNotBlockUserPairWhenValidListsEngineExists() {
+        val tmp = Files.createTempDirectory("aduster-lists-fail").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("w", "Web", "https://lists.test/w.txt", true, Group.WEB, true, "")
+            store.raw("w").writeText("##.ad\n")
+            store.dnsTable.writeText("dns 1")
+            val native = FakeWeb("d1")
+            val userCompiles = { native.compiledOuts.count { it.endsWith("web-user.dat") } }
+
+            // Build valid lists + user pair first.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "broken.test##.ad", false, native))
+            assertEquals(1, userCompiles())
+
+            // List file changes, lists' compile fails: editing the user rule must still update the user pair.
+            store.raw("w").writeText("##.ad\n##.more\n")
+            native.failLists = "no space for lists"
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "fixed.test##.ad", false, native))
+            assertEquals(2, userCompiles())
+            assertEquals("no space for lists", store.readMeta().webError)
+            assertEquals(true, store.webUserTable.exists())
+
+            // Deleting the user rule while lists still fail must remove the user pair and keep lists' error.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
+            assertEquals(false, store.webUserTable.exists() || store.webUserExtra.exists())
+            assertEquals("no space for lists", store.readMeta().webError)
+
+            // Missing lists' engine: user pair must NOT be built.
+            val missing = FilterStore(File(tmp, "missing"))
+            missing.raw("w").writeText("##.ad\n")
+            val beforeMissing = userCompiles()
+            assertEquals(false, FilterUpdater.compileWebFiles(missing, listOf(l), "mine.test##.ad", false, native))
+            assertEquals(beforeMissing, userCompiles())
+            assertEquals(false, missing.webUserTable.exists())
+            assertEquals("no space for lists", missing.readMeta().webError)
+
+            // Older-format lists' engine on disk: user pair must NOT be paired with it.
+            val oldFmt = FilterStore(File(tmp, "oldfmt"))
+            oldFmt.raw("w").writeText("##.ad\n")
+            oldFmt.dnsTable.writeText("dns 1")
+            native.failLists = null
+            assertEquals(true, FilterUpdater.compileWebFiles(oldFmt, listOf(l), "", false, native))
+            val m = oldFmt.readMeta()
+            oldFmt.writeMeta(m.copy(webSignature = m.webSignature.replace(Regex("\\|format=\\d+\\|"), "|format=1|")))
+            native.failLists = "no space for lists"
+            val beforeOld = userCompiles()
+            assertEquals(false, FilterUpdater.compileWebFiles(oldFmt, listOf(l), "mine.test##.ad", false, native))
+            assertEquals(beforeOld, userCompiles())
+            assertEquals(false, oldFmt.webUserTable.exists())
+            assertEquals("no space for lists", oldFmt.readMeta().webError)
+
+            // Mismatched lists' engine on disk (missing web.extra): user pair must NOT be paired with it.
+            val broken = FilterStore(File(tmp, "broken"))
+            broken.raw("w").writeText("##.ad\n")
+            broken.dnsTable.writeText("dns 1")
+            native.failLists = null
+            assertEquals(true, FilterUpdater.compileWebFiles(broken, listOf(l), "", false, native))
+            broken.webExtra.delete()
+            broken.raw("w").writeText("##.ad\n##.more\n")
+            native.failLists = "no space for lists"
+            val beforeBroken = userCompiles()
+            assertEquals(false, FilterUpdater.compileWebFiles(broken, listOf(l), "mine.test##.ad", false, native))
+            assertEquals(beforeBroken, userCompiles())
+            assertEquals(false, broken.webUserTable.exists())
+            assertEquals("no space for lists", broken.readMeta().webError)
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    /**
+     * A half-written user pair (e.g. kill between renaming `web-user.dat` and `web-user.extra`)
+     * makes `needsCheck` return true so app open schedules a compile that rebuilds only the user pair.
+     */
+    @Test
+    fun halfWrittenUserPairTriggersNeedsCheckAndRebuildsUserOnly() {
+        val tmp = Files.createTempDirectory("aduster-half-user").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("w", "Web", "https://lists.test/w.txt", true, Group.WEB, true, "")
+            store.raw("w").writeText("##.ad\n")
+            store.dnsTable.writeText("dns 1")
+            val native = FakeWeb("d1")
+            val listCompiles = { native.compiledOuts.count { it.endsWith("web.dat") } }
+            val userCompiles = { native.compiledOuts.count { it.endsWith("web-user.dat") } }
+
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "site.test##.ad", false, native))
+            store.writeMeta(store.readMeta().copy(appVersion = 42L))
+            assertEquals("clean state needs no check", false, FilterUpdater.needsCheck(store, 42L))
+
+            // Simulate a kill between renaming web-user.dat and web-user.extra.
+            store.webUserTable.writeText("replaced user dat from interrupted compile")
+            assertEquals("mismatched user pair must need check", true, FilterUpdater.needsCheck(store, 42L))
+
+            // Scheduled compile rebuilds only the user pair, leaving lists untouched.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "site.test##.ad", false, native))
+            assertEquals("lists must not recompile", 1, listCompiles())
+            assertEquals("user pair must rebuild", 2, userCompiles())
+            assertEquals("rebuilt pair is clean again", false, FilterUpdater.needsCheck(store, 42L))
+
+            // Missing web-user.extra also triggers needsCheck.
+            store.webUserExtra.delete()
+            assertEquals(true, FilterUpdater.needsCheck(store, 42L))
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "site.test##.ad", false, native))
+            assertEquals(false, FilterUpdater.needsCheck(store, 42L))
+
+            // Removing user rules cleanly leaves needsCheck false.
+            assertEquals(true, FilterUpdater.compileWebFiles(store, listOf(l), "", false, native))
+            assertEquals(false, FilterUpdater.needsCheck(store, 42L))
+
+            // Half-written first user pair (no webUserFiles recorded yet, stray web-user.dat left behind).
+            store.webUserTable.writeText("stray first compile")
+            assertEquals(true, FilterUpdater.needsCheck(store, 42L))
+        } finally {
+            tmp.deleteRecursively()
         }
     }
 }

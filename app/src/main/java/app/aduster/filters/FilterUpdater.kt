@@ -157,21 +157,54 @@ object FilterUpdater {
      * while the page lists are still downloading; the page engine follows. [progress] gets the
      * last list checked, how many are done and how many there are.
      */
-    fun update(context: Context, settings: Settings, check: Check, onDns: (Boolean) -> Unit = {}, progress: (String, Int, Int) -> Unit = { _, _, _ -> }): Result =
+    fun update(
+        context: Context,
+        readSettings: suspend () -> Settings,
+        check: Check,
+        onDns: (Boolean) -> Unit = {},
+        progress: (String, Int, Int) -> Unit = { _, _, _ -> },
+    ): Result =
         // One update at a time (the periodic one and "Update now" may overlap): each reads what
         // meta.json knows of the files before it downloads and records it after, and two at once
         // would record each other's files with the wrong facts or remove each other's parts. The
         // second waits; it then finds the lists just checked.
-        updating.withLock { updateNow(context, settings, check, onDns, progress) }
+        updating.withLock {
+            val store = FilterStore(context)
+            updateStore(
+                store = store,
+                readSettings = readSettings,
+                check = check,
+                webWanted = { webWanted(context, it) },
+                compileDns = { compileLocked(context, store, it, force = false) },
+                compileWeb = { compileWebLocked(context, store, it, force = false) },
+                onDns = onDns,
+                onExclusionsChanged = { app.aduster.vpn.AdusterVpnService.notifySettingsChanged(context) },
+                progress = progress,
+            )
+        }
 
     private val updating = java.util.concurrent.locks.ReentrantLock()
 
-    private fun updateNow(context: Context, settings: Settings, check: Check, onDns: (Boolean) -> Unit, progress: (String, Int, Int) -> Unit): Result {
-        val store = FilterStore(context)
-        store.locked { cleanup(store, settings) }
-        val web = webWanted(context, settings)
-        val dnsLists = FilterCatalog.enabledDns(settings)
-        val webLists = if (web) FilterCatalog.enabledWeb(settings) + FilterCatalog.exclusionLists else emptyList()
+    internal fun updateStore(
+        store: FilterStore,
+        readSettings: suspend () -> Settings,
+        check: Check,
+        webWanted: (Settings) -> Boolean,
+        compileDns: (Settings) -> Boolean,
+        compileWeb: (Settings) -> Boolean,
+        dnsListsOf: (Settings) -> List<FilterList> = { FilterCatalog.enabledDns(it) },
+        webListsOf: (Settings) -> List<FilterList> = { FilterCatalog.enabledWeb(it) + FilterCatalog.exclusionLists },
+        onDns: (Boolean) -> Unit = {},
+        onExclusionsChanged: () -> Unit = {},
+        progress: (String, Int, Int) -> Unit = { _, _, _ -> },
+    ): Result {
+        // Read current settings under the lock so a custom list added while waiting is not removed.
+        val initial = store.locked {
+            runBlocking { readSettings() }.also { cleanup(store, it) }
+        }
+        val web = webWanted(initial)
+        val dnsLists = dnsListsOf(initial)
+        val webLists = if (web) webListsOf(initial) else emptyList()
         val now = System.currentTimeMillis()
         val t0 = android.os.SystemClock.elapsedRealtime()
         val meta = store.readMeta()
@@ -204,11 +237,13 @@ object FilterUpdater {
             val dnsChecked = dnsJobs.awaitAll()
             // Signatures (size + mtime of every input) decide what needs rebuilding: an updated
             // DNS list does not recompile the page engine unless it changes what the engine
-            // relies on, and vice versa.
+            // relies on, and vice versa. Re-read settings under the lock so changes saved while
+            // downloading (lists switched, DNS settings) are never reverted.
             store.locked {
                 record(store, dnsChecked, now)
+                val current = runBlocking { readSettings() }
                 val t = android.os.SystemClock.elapsedRealtime()
-                dnsCompiled = compileLocked(context, store, settings, force = false)
+                dnsCompiled = compileDns(current)
                 dnsMs = android.os.SystemClock.elapsedRealtime() - t
             }
             dnsReady = android.os.SystemClock.elapsedRealtime() - t0
@@ -216,10 +251,13 @@ object FilterUpdater {
             val webChecked = webJobs.awaitAll()
             synchronized(shown) { if (web) progress("Compiling", total, total) }
             // The page engine goes second: it leaves hosts the DNS table already blocks to it.
+            // Re-read settings under the lock so a page rule saved and compiled while downloads
+            // ran is kept instead of reverted by an older snapshot.
             store.locked {
                 record(store, webChecked, now)
+                val current = runBlocking { readSettings() }
                 val t = android.os.SystemClock.elapsedRealtime()
-                webCompiled = web && compileWebLocked(context, store, settings, force = false)
+                webCompiled = webWanted(current) && compileWeb(current)
                 webMs = android.os.SystemClock.elapsedRealtime() - t
                 store.writeMeta(store.readMeta().copy(lastRun = now))
             }
@@ -230,7 +268,7 @@ object FilterUpdater {
         // A changed never-decrypt list reaches the proxy through a settings reload (:core reads
         // the files when it builds the proxy config).
         if (FilterCatalog.exclusionLists.any { it.id in changedIds }) {
-            app.aduster.vpn.AdusterVpnService.notifySettingsChanged(context)
+            onExclusionsChanged()
         }
         val all = dnsLists.size + webLists.size
         android.util.Log.i(
@@ -334,28 +372,54 @@ object FilterUpdater {
     }
 
     /**
-     * Whether an app start must schedule a compile job: only after an app update (a new
-     * compiler, new bundled lists) or when no table exists; everything else that changes the
-     * engines schedules its own job, so an ordinary app open starts none.
+     * Whether an app start must schedule a compile job: after an app update (a new compiler, new
+     * bundled lists), when no table exists, or when the user's page-engine pair on disk does not
+     * match what [FilterMeta.webUserFiles] recorded; everything else that changes the engines
+     * schedules its own job, so an ordinary app open starts none.
      */
-    fun needsCheck(context: Context): Boolean {
-        val store = FilterStore(context)
-        return !store.dnsTable.exists() || store.readMeta().appVersion != appVersion(context)
+    fun needsCheck(context: Context): Boolean = needsCheck(FilterStore(context), appVersion(context))
+
+    internal fun needsCheck(store: FilterStore, appVersion: Long): Boolean {
+        if (!store.dnsTable.exists()) return true
+        val meta = store.readMeta()
+        return meta.appVersion != appVersion || userPairMismatch(store, meta)
+    }
+
+    private fun fileSig(f: File) = "${f.length()}:${f.lastModified()}"
+
+    private fun userFilesSig(store: FilterStore) = "${fileSig(store.webUserTable)}|${fileSig(store.webUserExtra)}"
+
+    /**
+     * True when `web-user.dat` / `web-user.extra` on disk do not match [FilterMeta.webUserFiles]
+     * (e.g. a kill between the two renames), so the next compile rebuilds the user pair.
+     */
+    internal fun userPairMismatch(store: FilterStore, meta: FilterMeta): Boolean {
+        val hasDat = store.webUserTable.exists()
+        val hasExtra = store.webUserExtra.exists()
+        if (meta.webUserFiles.isEmpty()) return hasDat || hasExtra
+        return !hasDat || !hasExtra || userFilesSig(store) != meta.webUserFiles
     }
 
     private fun appVersion(context: Context): Long =
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime }.getOrDefault(0L)
 
     /** Recompiles only if the set of sources or their contents changed (or [force]). */
-    fun compile(context: Context, settings: Settings, force: Boolean = false): Boolean {
+    fun compile(context: Context, readSettings: suspend () -> Settings, force: Boolean = false): Boolean {
         val store = FilterStore(context)
         // A compile job also clears what a cut-short write left (an update does it in cleanup).
-        return store.locked { store.removeLeftovers(); compileLocked(context, store, settings, force) }
+        return store.locked {
+            store.removeLeftovers()
+            compileLocked(context, store, runBlocking { readSettings() }, force)
+        }
     }
 
-    fun compileWeb(context: Context, settings: Settings, force: Boolean = false): Boolean {
+    fun compileWeb(context: Context, readSettings: suspend () -> Settings, force: Boolean = false): Boolean {
         val store = FilterStore(context)
-        return store.locked { store.removeLeftovers(); compileWebLocked(context, store, settings, force) }
+        return store.locked {
+            store.removeLeftovers()
+            val settings = runBlocking { readSettings() }
+            webWanted(context, settings) && compileWebLocked(context, store, settings, force)
+        }
     }
 
     /**
@@ -504,22 +568,29 @@ object FilterUpdater {
         // a page engine.
         if (lists.isEmpty() && userWeb.isEmpty()) {
             val files = listOf(store.webTable, store.webExtra, store.webCount, store.webUserTable, store.webUserExtra, store.webUserCount)
-            if (files.none { it.exists() }) return false
+            val existed = files.any { it.exists() }
             files.forEach { it.delete() }
-            store.writeMeta(
-                meta.copy(
-                    webSignature = "", webRules = 0, webDigestKey = "", webDigest = "",
-                    webUserSignature = "", webUserRules = 0, webUserDependsDns = false, webUserFiles = "",
-                    webError = null,
-                ),
-            )
-            return true
+            // Clear stale metadata (including a prior compile error after reverting a failed
+            // change) even when no engine files exist on disk yet.
+            if (existed || meta.webSignature.isNotEmpty() || meta.webRules != 0 ||
+                meta.webDigestKey.isNotEmpty() || meta.webDigest.isNotEmpty() ||
+                meta.webUserSignature.isNotEmpty() || meta.webUserRules != 0 ||
+                meta.webUserDependsDns || meta.webUserFiles.isNotEmpty() || meta.webError != null
+            ) {
+                store.writeMeta(
+                    meta.copy(
+                        webSignature = "", webRules = 0, webDigestKey = "", webDigest = "",
+                        webUserSignature = "", webUserRules = 0, webUserDependsDns = false, webUserFiles = "",
+                        webError = null,
+                    ),
+                )
+            }
+            return existed
         }
-        fun sig(f: File) = "${f.length()}:${f.lastModified()}"
         val dns = if (store.dnsTable.exists()) store.dnsTable.path else ""
         val base = lists.joinToString("|") { l ->
-            val inc = store.includes(l.id).listFiles()?.sortedBy { it.name }?.joinToString(",") { "${it.name}:${sig(it)}" }.orEmpty()
-            "${l.id}:${sig(store.raw(l.id))}[$inc]"
+            val inc = store.includes(l.id).listFiles()?.sortedBy { it.name }?.joinToString(",") { "${it.name}:${fileSig(it)}" }.orEmpty()
+            "${l.id}:${fileSig(store.raw(l.id))}[$inc]"
         } + "|format=$WEB_FORMAT"
         // Of the DNS table, the lists' engine only depends on which hosts named by page-list
         // exceptions it blocks (native side): other DNS list updates leave the engine, and with it
@@ -529,8 +600,9 @@ object FilterUpdater {
         // A compile hands back the digest of what it built.
         // The engine file too: one replaced without its side table (a compile cut short between
         // its renames) is asked about again, and the engine says the pair does not match.
-        fun digestKey() = "${sig(store.webTable)}|${sig(store.webExtra)}|${sig(store.dnsTable)}"
+        fun digestKey() = "${fileSig(store.webTable)}|${fileSig(store.webExtra)}|${fileSig(store.dnsTable)}"
         var listsCompiled = false
+        var listsError: String? = null
         var listRules = (meta.webRules - meta.webUserRules).coerceAtLeast(0)
         val listsUpToDate = if (!force && store.webTable.exists() && meta.webSignature.substringBeforeLast("|dns=", "") == base) {
             val key = digestKey()
@@ -568,30 +640,42 @@ object FilterUpdater {
             }
             val out = Json.parseToJsonElement(native.compile(spec.toString(), store.webTable.path, dns)).jsonObject
             if (out["ok"]?.jsonPrimitive?.content != "true") {
-                store.writeMeta(meta.copy(webError = out["error"]?.jsonPrimitive?.content ?: "compile failed"))
-                return false
+                listsError = out["error"]?.jsonPrimitive?.content ?: "compile failed"
+                // Never pair a user pair with a missing, mismatched or older-format lists' engine;
+                // only continue updating the user pair when a valid current-format lists' engine
+                // is already on disk.
+                val hasValidListsEngine = !force &&
+                    store.webTable.exists() &&
+                    store.webExtra.exists() &&
+                    meta.webSignature.substringBeforeLast("|dns=", "").endsWith("|format=$WEB_FORMAT") &&
+                    meta.webDigestKey.substringBeforeLast('|', "") == "${fileSig(store.webTable)}|${fileSig(store.webExtra)}"
+                if (!hasValidListsEngine) {
+                    store.writeMeta(meta.copy(webError = listsError))
+                    return false
+                }
+            } else {
+                val updated = meta.lists.toMutableMap()
+                (out["lists"] as? JsonArray)?.forEach { e ->
+                    val o = e.jsonObject
+                    val id = o["name"]?.jsonPrimitive?.content ?: return@forEach
+                    val m = updated[id] ?: return@forEach
+                    updated[id] = m.copy(rules = o["rules"]?.jsonPrimitive?.int ?: m.rules, dnsCovered = o["dns"]?.jsonPrimitive?.int ?: 0)
+                }
+                // The digest of what the compile built against (an engine without it: worked out here).
+                val newDigest = out["dns_digest"]?.jsonPrimitive?.content ?: native.digest(store.webTable.path, dns)
+                listRules = out["rules"]?.jsonPrimitive?.int ?: 0
+                meta = meta.copy(
+                    lists = updated,
+                    webCompiledAt = System.currentTimeMillis(),
+                    webRules = listRules + meta.webUserRules,
+                    webSignature = "$base|dns=$newDigest",
+                    webError = null,
+                    webDigestKey = digestKey(),
+                    webDigest = newDigest,
+                )
+                metaDirty = true
+                listsCompiled = true
             }
-            val updated = meta.lists.toMutableMap()
-            (out["lists"] as? JsonArray)?.forEach { e ->
-                val o = e.jsonObject
-                val id = o["name"]?.jsonPrimitive?.content ?: return@forEach
-                val m = updated[id] ?: return@forEach
-                updated[id] = m.copy(rules = o["rules"]?.jsonPrimitive?.int ?: m.rules, dnsCovered = o["dns"]?.jsonPrimitive?.int ?: 0)
-            }
-            // The digest of what the compile built against (an engine without it: worked out here).
-            val newDigest = out["dns_digest"]?.jsonPrimitive?.content ?: native.digest(store.webTable.path, dns)
-            listRules = out["rules"]?.jsonPrimitive?.int ?: 0
-            meta = meta.copy(
-                lists = updated,
-                webCompiledAt = System.currentTimeMillis(),
-                webRules = listRules + meta.webUserRules,
-                webSignature = "$base|dns=$newDigest",
-                webError = null,
-                webDigestKey = digestKey(),
-                webDigest = newDigest,
-            )
-            metaDirty = true
-            listsCompiled = true
         }
 
         var userChanged = false
@@ -599,27 +683,26 @@ object FilterUpdater {
             val userFiles = listOf(store.webUserTable, store.webUserExtra, store.webUserCount)
             val existed = userFiles.any { it.exists() }
             userFiles.forEach { it.delete() }
-            if (existed || meta.webUserSignature.isNotEmpty() || meta.webUserRules != 0 || meta.webUserDependsDns || meta.webUserFiles.isNotEmpty() || meta.webError != null) {
+            if (existed || meta.webUserSignature.isNotEmpty() || meta.webUserRules != 0 || meta.webUserDependsDns || meta.webUserFiles.isNotEmpty() || meta.webError != listsError) {
                 meta = meta.copy(
                     webRules = listRules,
                     webUserRules = 0,
                     webUserSignature = "",
                     webUserDependsDns = false,
                     webUserFiles = "",
-                    webError = null,
+                    webError = listsError,
                 )
                 metaDirty = true
                 userChanged = existed
             }
         } else {
-            fun userFilesSig() = "${sig(store.webUserTable)}|${sig(store.webUserExtra)}"
             val userBase = "user=${sha256(userWeb)}|format=$WEB_FORMAT"
-            fun userSig(dependsDns: Boolean) = if (dependsDns) "$userBase|dns=${sig(store.dnsTable)}" else userBase
+            fun userSig(dependsDns: Boolean) = if (dependsDns) "$userBase|dns=${fileSig(store.dnsTable)}" else userBase
             val userUpToDate = !force &&
                 store.webUserTable.exists() &&
                 store.webUserExtra.exists() &&
                 meta.webUserSignature == userSig(meta.webUserDependsDns) &&
-                meta.webUserFiles == userFilesSig()
+                meta.webUserFiles == userFilesSig(store)
             if (!userUpToDate) {
                 val userSpec = buildJsonArray {
                     add(buildJsonObject {
@@ -641,11 +724,16 @@ object FilterUpdater {
                     webUserRules = userRules,
                     webUserSignature = userSig(dependsDns),
                     webUserDependsDns = dependsDns,
-                    webUserFiles = userFilesSig(),
-                    webError = null,
+                    webUserFiles = userFilesSig(store),
+                    webError = listsError,
                 )
                 metaDirty = true
                 userChanged = true
+            } else if (meta.webError != listsError) {
+                // Both pairs are up to date (e.g. a failed change was reverted), or the lists'
+                // compile failed while the existing user pair stayed up to date.
+                meta = meta.copy(webError = listsError)
+                metaDirty = true
             }
         }
         if (metaDirty) store.writeMeta(meta)
