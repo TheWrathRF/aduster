@@ -169,6 +169,15 @@ class AdusterVpnService : VpnService() {
     @Volatile
     private var starting = false
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + serial + failed)
+    /**
+     * Disk work a broadcast asks for (the stats written at screen-off, the widget redrawn at
+     * screen-on): off the main thread, where a slow disk would hold up every other broadcast and
+     * the system's calls into this service, and apart from [serial], so it never waits for a start.
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val chores: CoroutineScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO.limitedParallelism(1) + kotlinx.coroutines.CoroutineExceptionHandler { _, e -> Log.e(TAG, "background task failed", e) },
+    )
     private val store by lazy { SettingsStore.get(this) }
 
     private var settings = Settings()
@@ -239,7 +248,7 @@ class AdusterVpnService : VpnService() {
                     }
                 }
                 // Browsing leaves freed buffers resident; give them back while the phone idles.
-                Intent.ACTION_SCREEN_OFF -> NativeCore.nativeTrimMemory()
+                Intent.ACTION_SCREEN_OFF -> chores.launch { NativeCore.nativeTrimMemory() }
                 Intent.ACTION_TIMEZONE_CHANGED -> scope.launch { if (engineReady) initEngine() }
                 // The widget refreshes only when someone can actually see it. The trust-store
                 // broadcast is the main signal; a rare, cheap alias check here is the safety net.
@@ -251,7 +260,7 @@ class AdusterVpnService : VpnService() {
                     // "Today" (stats, widget) is the local day: a new UTC offset (summer time
                     // starts or ends without a time-zone broadcast) reaches the engine first.
                     if (engineReady && TimeZone.getDefault().getOffset(System.currentTimeMillis()) != tzOffset) scope.launch { initEngine() }
-                    StatsWidget.update(context)
+                    chores.launch { StatsWidget.update(context) }
                     // The card can vanish while the protection runs on: Xiaomi's Android build
                     // removes an app's notifications when it cleans its other (UI) process in the
                     // background, and folds any card older than 6 h out of sight. One look when someone can see
@@ -390,7 +399,7 @@ class AdusterVpnService : VpnService() {
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        NativeCore.nativeTrimMemory()
+        chores.launch { NativeCore.nativeTrimMemory() }
     }
 
     override fun onBind(intent: Intent?): IBinder? =
@@ -481,6 +490,7 @@ class AdusterVpnService : VpnService() {
         running = false
         NativeCore.nativePersist()
         scope.cancel()
+        chores.cancel()
         refreshSurfaces()
         super.onDestroy()
     }
