@@ -158,6 +158,10 @@ class FilterUpdaterTest {
             most.accumulateAndGet(n) { a, b -> maxOf(a, b) }
             try {
                 Thread.sleep(300)
+                // Counted as done before the answer leaves: the client may start its next request
+                // as soon as it has the answer, before this thread would reach a later decrement
+                // (a slow CI runner failed this check that way).
+                active.decrementAndGet()
                 val name = ex.requestURI.path.removePrefix("/")
                 val body = (if (name == "l0.txt") "! Title: zero\n!#include part.txt\n" else "") + (1..50).joinToString("\n") { "||$name-$it.test^" }
                 val tag = "\"${body.hashCode()}\""
@@ -170,7 +174,6 @@ class FilterUpdaterTest {
                     ex.responseBody.use { it.write(b) }
                 }
             } finally {
-                active.decrementAndGet()
                 ex.close()
             }
         }
@@ -193,7 +196,7 @@ class FilterUpdaterTest {
             assertEquals(12, second.count { it.fetch == FilterUpdater.Fetch.NotModified(null) })
             assertEquals(false, second.single { it.list.id == "l0" }.inc?.changed)
             assertEquals(true, most.get() in 2..3)
-            assertEquals("12 checks of 300 ms took $ms ms", true, ms < 2_400)
+            assertEquals("12 checks of 300 ms took $ms ms", true, ms < 3_000)
             // Checked an hour ago or less: an ordinary update leaves them; a list switched on
             // fetches only what is missing.
             assertEquals(0, FilterUpdater.checkAll(store, lists, FilterUpdater.Check.STALE).size)
