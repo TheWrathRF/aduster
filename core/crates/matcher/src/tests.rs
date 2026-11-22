@@ -502,3 +502,82 @@ fn wildcard_and_regex_edge_cases() {
     let f = Filters { lists: t, user: Table::empty() };
     assert!(f.check("ok.example.test").blocked());
 }
+
+/// Long literals in a small regex/wildcard class must not blow up the Aho-Corasick prefilter DFA,
+/// and capping prefilter literals must still decide matching and near-miss host names accurately.
+#[test]
+fn long_literals_keep_prefilter_memory_bounded() {
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+    let make_lit = |seed: usize, len: usize| -> String {
+        let mut s = String::with_capacity(len);
+        let mut x = (seed as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x517c_c1b7_2722_0a95;
+        for i in 0..len {
+            if i > 0 && i % 19 == 0 && i + 1 < len {
+                s.push('.');
+            } else {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s.push(alphabet[(x >> 32) as usize % alphabet.len()] as char);
+            }
+        }
+        s
+    };
+
+    let mut rules = String::new();
+    // 20 very long wildcards + 4 very long raw regexes in Class::Block (<= 32 literals in the class).
+    let mut long_wild_lits = Vec::new();
+    for i in 0..20 {
+        let lit = make_lit(i + 1, 1800);
+        rules.push_str(&format!("||w{i:02}*.{lit}.example.test^\n"));
+        long_wild_lits.push(lit);
+    }
+    let mut long_re_lits = Vec::new();
+    for i in 0..4 {
+        let lit = make_lit(100 + i, 800);
+        let esc = lit.replace('.', r"\.");
+        rules.push_str(&format!("/^r{i:02}\\.{esc}\\.(a|b)$/\n"));
+        long_re_lits.push(lit);
+    }
+    // Realistic-length (> 64 bytes, <= 253 bytes) wildcard and regex to verify full-pattern checks
+    // when the prefilter literal is capped at 64 bytes.
+    let shared_prefix = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 66 bytes
+    let wild_tail = "tail-wild.example.test";
+    let re_tail = "tail-re";
+    rules.push_str(&format!("||ad*.{shared_prefix}.{wild_tail}^\n"));
+    rules.push_str(&format!("/^re\\.{shared_prefix}\\.{re_tail}\\.(net|org)$/\n"));
+
+    let f = filters(&[("custom", &rules)], "");
+    let mem = f.lists.regex_memory_usage();
+    assert!(mem < 1024 * 1024, "prefilter heap too large for long literals: {} KiB", mem / 1024);
+
+    // Full pattern verification after a 64-byte prefilter hit (matching prefix, differing tail).
+    assert!(f.check(&format!("ad1.{shared_prefix}.{wild_tail}")).blocked());
+    assert!(!f.check(&format!("ad1.{shared_prefix}.other-wild.example.test")).blocked());
+    assert!(f.check(&format!("re.{shared_prefix}.{re_tail}.net")).blocked());
+    assert!(f.check(&format!("re.{shared_prefix}.{re_tail}.org")).blocked());
+    assert!(!f.check(&format!("re.{shared_prefix}.{re_tail}.com")).blocked());
+    assert!(!f.check(&format!("re.{shared_prefix}.other-re.net")).blocked());
+
+    // Long wildcard and raw regex rules still decide exact matches and near-misses correctly.
+    let hit_wild = format!("w00x.{}.example.test", long_wild_lits[0]);
+    let miss_wild = format!("w00x.{}.example.org", long_wild_lits[0]);
+    assert!(f.check(&hit_wild).blocked());
+    assert!(!f.check(&miss_wild).blocked());
+    let hit_re = format!("r00.{}.a", long_re_lits[0]);
+    let miss_re = format!("r00.{}.c", long_re_lits[0]);
+    assert!(f.check(&hit_re).blocked());
+    assert!(!f.check(&miss_re).blocked());
+
+    // Many 64-byte literals in one small class (total bytes > DFA cap) must also avoid a large DFA.
+    let mut medium_rules = String::new();
+    let mut medium_lits = Vec::new();
+    for i in 0..24 {
+        let lit = make_lit(500 + i, 64);
+        medium_rules.push_str(&format!("||m{i:02}*.{lit}.test^\n"));
+        medium_lits.push(lit);
+    }
+    let fm = filters(&[("medium", &medium_rules)], "");
+    let mmem = fm.lists.regex_memory_usage();
+    assert!(mmem < 128 * 1024, "medium-literal small class DFA too large: {} KiB", mmem / 1024);
+    assert!(fm.check(&format!("m05x.{}.test", medium_lits[5])).blocked());
+    assert!(!fm.check(&format!("m05x.{}.other", medium_lits[5])).blocked());
+}

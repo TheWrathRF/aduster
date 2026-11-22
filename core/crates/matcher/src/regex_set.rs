@@ -22,6 +22,13 @@ use std::collections::HashMap;
 /// Maximum pattern byte length accepted by the direct wildcard fast path; anything longer goes
 /// through the regex builder so its NFA size limit still applies.
 const MAX_WILDCARD_LEN: usize = 4096;
+/// Maximum prefilter literal length: a slice of a required literal is still required, and host
+/// names are at most 253 bytes, so 64 bytes is plenty while keeping prefilter automata small.
+const MAX_PREFILTER_LITERAL: usize = 64;
+/// Upper bounds for choosing a full Aho-Corasick DFA over `ContiguousNFA`: keeps the DFA to a
+/// few tens of KiB even when every literal hits [`MAX_PREFILTER_LITERAL`].
+const MAX_DFA_LITERALS: usize = 32;
+const MAX_DFA_BYTES: usize = 512;
 
 /// All regex/wildcard rules of one [`Class`].
 pub(crate) struct ClassRegex {
@@ -425,7 +432,7 @@ fn is_usable_literal(lit: &[u8]) -> bool {
 }
 
 fn best_literal(pieces: &[Box<[u8]>]) -> Option<&[u8]> {
-    pieces.iter().map(|p| p.as_ref()).filter(|p| is_usable_literal(p)).max_by_key(|p| p.len())
+    pieces.iter().map(|p| p.as_ref()).filter(|p| is_usable_literal(p)).max_by_key(|p| p.len()).map(|p| &p[..p.len().min(MAX_PREFILTER_LITERAL)])
 }
 
 /// Conservatively extracts one lowercase ASCII substring that must appear in every match of `pat`.
@@ -559,6 +566,7 @@ fn extract_required_literal(pat: &str) -> Option<Vec<u8>> {
         return None;
     }
     flush(&mut cur, &mut best);
+    best.truncate(MAX_PREFILTER_LITERAL);
     (!best.is_empty()).then_some(best)
 }
 
@@ -577,10 +585,12 @@ fn push_bucket(lit_to_idx: &mut HashMap<Vec<u8>, usize>, literals: &mut Vec<Vec<
 }
 
 fn build_aho_corasick(literals: &[Vec<u8>]) -> Option<AhoCorasick> {
-    // Small classes (e.g. Allow / ImportantBlock with a handful of rules) fit in a few KiB as a
-    // DFA and skip failure-link walks; large classes use ContiguousNFA (~170 KiB for ~600 literals
-    // vs ~3 MiB for a full DFA).
-    if literals.len() <= 32
+    // Small classes (e.g. Allow / ImportantBlock with a handful of short rules) fit in a few KiB
+    // as a DFA and skip failure-link walks; larger classes or longer totals use ContiguousNFA
+    // (~170 KiB for ~600 literals vs ~3 MiB for a full DFA).
+    let total_bytes: usize = literals.iter().map(Vec::len).sum();
+    if literals.len() <= MAX_DFA_LITERALS
+        && total_bytes <= MAX_DFA_BYTES
         && let Ok(ac) = AhoCorasick::builder().ascii_case_insensitive(true).kind(Some(AhoCorasickKind::DFA)).build(literals)
     {
         return Some(ac);
