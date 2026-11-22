@@ -15,9 +15,9 @@
 //!  .  sources  src_n   x { len u16, bytes }
 //! ```
 
+use crate::regex_set::ClassRegex;
 use crate::{Class, Hit, HitKind};
 use memmap2::Mmap;
-use regex_automata::Input;
 use regex_automata::meta::Regex;
 use std::fs::File;
 use std::path::Path;
@@ -83,12 +83,9 @@ pub struct Table {
     /// Subdomain-only hashes are present: only then is each parent of a name looked up a
     /// second time.
     subdomains: bool,
-    /// One regex per rule class, highest class first (a class whose patterns cannot be built
-    /// together has one regex per pattern, in a row). Each maps its pattern ids back to the
-    /// global regex index. A name only needs the best class that matches, so the search stops
-    /// at the first class with a match and never needs overlapping (all-matches) search, which
-    /// is what made unseen names slow (lazy DFA cache thrash across hundreds of patterns).
-    regex: Vec<(Class, Regex, Vec<u32>)>,
+    /// One prefiltered matcher per rule class, highest class first. A name only needs the best
+    /// class that matches, so the search stops at the first class with a match.
+    regex: Vec<ClassRegex>,
     regex_meta: Vec<(Class, u16)>,
     regex_patterns: Vec<String>,
     /// Patterns left out because they could not be built at all.
@@ -180,20 +177,8 @@ impl Table {
         let mut skipped = 0;
         for class in classes {
             let ids: Vec<u32> = (0..regex_meta.len() as u32).filter(|&i| regex_meta[i as usize].0 == class).collect();
-            let pats: Vec<&str> = ids.iter().map(|&i| regex_patterns[i as usize].as_str()).collect();
-            match build_regex(&pats) {
-                Ok(re) => regex.push((class, re, ids)),
-                // One pattern too large (or all of them together) must not take every other
-                // rule of the table down with it: build them one by one and leave out the
-                // ones that fail.
-                Err(_) => {
-                    for (&id, pat) in ids.iter().zip(&pats) {
-                        match build_regex(&[pat]) {
-                            Ok(re) => regex.push((class, re, vec![id])),
-                            Err(_) => skipped += 1,
-                        }
-                    }
-                }
+            if let Some(group) = ClassRegex::build(class, &ids, &regex_patterns, &mut skipped) {
+                regex.push(group);
             }
         }
 
@@ -219,6 +204,16 @@ impl Table {
 
     pub fn regex_pattern(&self, i: u32) -> Option<&str> {
         self.regex_patterns.get(i as usize).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn regex_memory_usage(&self) -> usize {
+        self.regex.iter().map(ClassRegex::memory_usage).sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn regex_debug_summary(&self) -> Vec<String> {
+        self.regex.iter().map(ClassRegex::debug_summary).collect()
     }
 
     #[inline]
@@ -269,13 +264,12 @@ impl Table {
                 }
             }
         }
-        for (class, re, ids) in &self.regex {
-            if *class <= best.class {
+        for group in &self.regex {
+            if group.class <= best.class {
                 break;
             }
-            if let Some(m) = re.search(&Input::new(bytes).earliest(true)) {
-                let id = ids[m.pattern().as_usize()];
-                *best = Hit { class: *class, src: self.regex_meta[id as usize].1, table: table_id, kind: HitKind::Regex(id) };
+            if let Some(id) = group.find(bytes) {
+                *best = Hit { class: group.class, src: self.regex_meta[id as usize].1, table: table_id, kind: HitKind::Regex(id) };
                 break;
             }
         }

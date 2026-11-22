@@ -229,14 +229,13 @@ fn real_lists() {
         let text = std::fs::read_to_string(path).unwrap();
         let real: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         for pass in 1..=2 {
+            use std::hash::{Hash, Hasher};
             let t = std::time::Instant::now();
             let mut verdicts = std::collections::hash_map::DefaultHasher::new();
             for n in &real {
-                use std::hash::{Hash, Hasher};
                 let h = f.check(n);
                 (h.blocked(), h.class as u8).hash(&mut verdicts);
             }
-            use std::hash::Hasher;
             println!(
                 "real-name lookup pass {pass}: {} names, {}ns each, verdicts={:016x}",
                 real.len(),
@@ -257,6 +256,10 @@ fn real_lists() {
         h.finish()
     };
     println!("{stats:?}\nsize={} KiB compile={compile_ms}ms load={load_ms}ms lookup={ns}ns table={fingerprint:016x}", bytes.len() / 1024);
+    println!("regex_mem={} KiB", f.lists.regex_memory_usage() / 1024);
+    for line in f.lists.regex_debug_summary() {
+        println!("  {line}");
+    }
 }
 
 /// The URL exception for Google's AI Overview request is no DNS rule (it goes to
@@ -281,4 +284,221 @@ fn a_header_with_huge_counts_is_a_format_error() {
         b[16..20].copy_from_slice(&src_n.to_le_bytes());
         assert!(matches!(Table::from_bytes(b), Err(TableError::Format(_))), "{regex_n} {src_n}");
     }
+}
+
+/// Many wildcard rules searched against diverse real-looking host names must stay fast and steady
+/// on both passes (no lazy-DFA cache thrashing or fallback cliff) while deciding every name by the
+/// right pattern and class, including case-insensitivity, `||` / `|` anchors, and unprefilterable
+/// regexes.
+#[test]
+fn many_wildcards_stay_fast_and_accurate() {
+    let mut rules = String::new();
+    // Spread `.*` prefixes across the alphabet (like real filter lists) so multi-label host
+    // names activate distinct combinations of `.*` branches and stress multi-pattern DFAs.
+    let rule_prefixes = [
+        "", "a", "ad", "ads", "an", "ap", "b", "be", "c", "cd", "cl", "co", "d", "da", "e", "ev", "f", "g", "i", "im", "l", "lo", "m", "me", "p", "pi", "r",
+        "s", "sd", "st", "t", "ta", "te", "tr", "v", "w",
+    ];
+    for i in 0..400 {
+        let p = rule_prefixes[i % rule_prefixes.len()];
+        rules.push_str(&format!("||{p}*.host{i:03}.example.com^\n"));
+    }
+    rules.push_str("||ad*.host999.example.com^\n");
+    for i in 0..100 {
+        let p = rule_prefixes[(i * 3) % rule_prefixes.len()];
+        rules.push_str(&format!("||{p}*.cdn{i:03}.site.net^\n"));
+    }
+    rules.push_str("||a*.cdn999.site.net^\n");
+    for i in 0..50 {
+        rules.push_str(&format!("||trk-{i:03}.\n"));
+    }
+    for i in 0..50 {
+        rules.push_str(&format!("|load.gtm{i:03}.\n"));
+    }
+    // Overlapping literals in the same class: `foo.overlap` occurs inside `y1.foo.overlap.net`,
+    // where the first rule must fail and the second must still be checked and match.
+    rules.push_str("||x*foo.overlap^\n");
+    rules.push_str("||y*foo.overlap.net^\n");
+    // Duplicate required literal shared by two rules.
+    rules.push_str("||alpha*.shared-lit.test^\n");
+    rules.push_str("||beta*.shared-lit.test^\n");
+    // Precedence across classes on the same wildcard shapes.
+    rules.push_str("||ad*.host942.example.com^\n");
+    rules.push_str("@@||ad*.host942.example.com^\n");
+    rules.push_str("||ad*.host942.example.com^$important\n");
+    rules.push_str("@@||a*.cdn999.site.net^\n");
+    // Regexes with no usable literal (must still match via fallback).
+    rules.push_str("/^[a-z]{3}\\.[0-9]{4}\\.io$/\n");
+    rules.push_str("/^(a|c)\\.[0-9a-f]{16}\\.com$/\n");
+    rules.push_str("/foo-alt|bar-alt/\n");
+    // Raw regex with a usable required literal.
+    rules.push_str("/^198\\.51\\.100\\.(1[0-9]|2[0-5])$/\n");
+
+    let user = "@@||ad*.host999.example.com^\n||u*.only-user.test^\n";
+    let f = filters(&[("list", &rules)], user);
+
+    // Accuracy: right pattern, right class, describe() id, anchors, case-insensitivity.
+    let h = f.check("ad7.host999.example.com");
+    assert_eq!(h.class, Class::UserAllow);
+    assert!(!h.blocked());
+    let h = f.check("ad7.host002.example.com");
+    assert_eq!(h.class, Class::Block);
+    assert_eq!(f.describe("ad7.host002.example.com", &h), Some((r"/(?:^|\.)ad.*\.host002\.example\.com$/".into(), "list".into())));
+
+    let h = f.check("sub.ad7.host002.example.com");
+    assert_eq!(h.class, Class::Block);
+    assert!(!f.check("bad7.host002.example.com").blocked(), "|| requires start or dot boundary");
+    assert!(!f.check("ad7.host002.example.com.other").blocked(), "^ requires end of name");
+
+    // Case-insensitivity across wildcard, anchored and raw regex rules.
+    assert_eq!(f.check("AD7.HOST002.EXAMPLE.COM").class, Class::Block);
+    assert_eq!(f.check("SUB.TRK-009.ORG").class, Class::Block);
+    assert_eq!(f.check("LOAD.GTM005.SITE.COM").class, Class::Block);
+    assert_eq!(f.check("ABC.1234.IO").class, Class::Block);
+
+    // `||` vs `|` anchor semantics.
+    assert!(f.check("trk-009.org").blocked());
+    assert!(f.check("a.trk-009.org").blocked());
+    assert!(!f.check("xtrk-009.org").blocked());
+    assert!(f.check("load.gtm005.site.com").blocked());
+    assert!(!f.check("sub.load.gtm005.site.com").blocked(), "| anchors at start only");
+
+    // Overlapping and duplicate literals in the same class.
+    assert!(f.check("y1.foo.overlap.net").blocked());
+    assert!(!f.check("y1.foo.overlap").blocked());
+    let h = f.check("beta9.shared-lit.test");
+    assert_eq!(h.class, Class::Block);
+    assert_eq!(f.describe("beta9.shared-lit.test", &h), Some((r"/(?:^|\.)beta.*\.shared-lit\.test$/".into(), "list".into())));
+
+    // Highest class wins: ImportantBlock > Allow > Block, UserAllow > everything.
+    let h = f.check("ad1.host942.example.com");
+    assert_eq!(h.class, Class::ImportantBlock);
+    assert!(h.blocked());
+    let h = f.check("a9.cdn999.site.net");
+    assert_eq!(h.class, Class::Allow);
+    assert!(!h.blocked());
+    assert_eq!(f.check("u5.only-user.test").class, Class::UserBlock);
+
+    // Unprefilterable and raw regex rules.
+    let h = f.check("abc.1234.io");
+    assert_eq!(h.class, Class::Block);
+    assert_eq!(f.describe("abc.1234.io", &h), Some((r"/^[a-z]{3}\.[0-9]{4}\.io$/".into(), "list".into())));
+    assert!(!f.check("abcd.1234.io").blocked());
+    assert!(f.check("a.0123456789abcdef.com").blocked());
+    assert!(!f.check("b.0123456789abcdef.com").blocked());
+    assert!(f.check("x.foo-alt.net").blocked());
+    assert!(f.check("x.bar-alt.net").blocked());
+    assert!(f.check("198.51.100.15").blocked());
+    assert!(!f.check("198.51.100.99").blocked());
+
+    // Diverse real-looking host names across two passes: neither pass may thrash or degrade.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next_u64 = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state
+    };
+    let tlds = ["com", "net", "org", "io", "de", "co.uk", "jp", "ru", "fr", "dev"];
+    let mut names: Vec<String> = Vec::with_capacity(4000);
+    for _ in 0..4000 {
+        let mut s = String::with_capacity(32);
+        for label in 0..3 {
+            if label > 0 {
+                s.push('.');
+            }
+            let len = 4 + (next_u64() as usize % 6);
+            for _ in 0..len {
+                s.push((b'a' + (next_u64() % 26) as u8) as char);
+            }
+        }
+        s.push('.');
+        s.push_str(tlds[next_u64() as usize % tlds.len()]);
+        names.push(s);
+    }
+    names.sort();
+
+    let mut pass_ns = [0u128; 2];
+    for (pass, slot) in pass_ns.iter_mut().enumerate() {
+        let t = std::time::Instant::now();
+        let mut blocked = 0usize;
+        for name in &names {
+            if f.check(name).blocked() {
+                blocked += 1;
+            }
+        }
+        *slot = t.elapsed().as_nanos() / names.len() as u128;
+        assert_eq!(blocked, 0, "pass {}: none of the synthetic non-matching names should match", pass + 1);
+    }
+    // Today's combined lazy DFA thrashes and gives up on pass 2 (>100_000ns/name in release);
+    // a prefiltered matcher stays well under 10_000ns/name on both passes and keeps heap small.
+    assert!(pass_ns[0] < 10_000 && pass_ns[1] < 10_000, "wildcards lookup too slow: pass1={}ns/name pass2={}ns/name", pass_ns[0], pass_ns[1]);
+    assert!(f.lists.regex_memory_usage() < 512 * 1024, "regex heap too large: {} KiB", f.lists.regex_memory_usage() / 1024);
+}
+
+/// Edge cases for wildcard matching, literal extraction soundness, newline handling, and Send+Sync.
+#[test]
+fn wildcard_and_regex_edge_cases() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Table>();
+    assert_send_sync::<Filters>();
+
+    let rules = [
+        // Leading and trailing wildcards, multiple wildcards.
+        "||*suffix-only.test^",
+        "||prefix-only.test*^",
+        "||p1*mid*end.multi.test^",
+        // Unanchored plain wildcard with suffix anchor and without.
+        ".inner-lit.net",
+        ".end-lit.net^",
+        // Inline flag (?x) and optional quantifier right after a literal must never cause false negatives.
+        "/(?x) s p a c e d \\. t e s t /",
+        "/^fooo?\\.opt\\.test$/",
+        "/^optx{0,2}\\.quant\\.test$/",
+        "/^reqx{1,2}\\.quant\\.test$/",
+        "/(?:a|b)\\.group-lit\\.test$/",
+        // Non-wildcard regex with character class containing `)` inside parens.
+        "/^(?:[)])\\.paren\\.test$/",
+    ]
+    .join("\n");
+    let f = filters(&[("e", &rules)], "");
+
+    assert!(f.check("anything.suffix-only.test").blocked());
+    assert!(f.check("xsuffix-only.test").blocked());
+    assert!(!f.check("suffix-only.test.more").blocked());
+
+    assert!(f.check("prefix-only.test").blocked());
+    assert!(f.check("a.prefix-only.test.anything").blocked());
+    assert!(!f.check("xprefix-only.test").blocked());
+
+    assert!(f.check("p1-aa-mid-bb-end.multi.test").blocked());
+    assert!(f.check("x.p1midend.multi.test").blocked());
+    assert!(!f.check("p1-end-mid.multi.test").blocked());
+    assert!(!f.check("xp1midend.multi.test").blocked());
+
+    assert!(f.check("a.inner-lit.net.extra").blocked());
+    assert!(!f.check("inner-lit.net").blocked());
+    assert!(f.check("a.end-lit.net").blocked());
+    assert!(!f.check("a.end-lit.net.extra").blocked());
+
+    assert!(f.check("spaced.test").blocked());
+    assert!(f.check("foo.opt.test").blocked(), "optional 'o' must not be required by prefilter");
+    assert!(f.check("fooo.opt.test").blocked());
+    assert!(f.check("opt.quant.test").blocked(), "x{{0,2}} must not require 'x'");
+    assert!(f.check("optxx.quant.test").blocked());
+    assert!(!f.check("req.quant.test").blocked());
+    assert!(f.check("reqx.quant.test").blocked());
+    assert!(f.check("a.group-lit.test").blocked());
+    assert!(f.check(").paren.test").blocked());
+
+    // `.` in `.*` must not match `\n`, matching regex-automata's default dot_matches_new_line(false).
+    assert!(!f.check("p1\nmid-end.multi.test").blocked());
+    assert!(!f.check("a\np1midend.multi.test").blocked(), "^ does not match after newline");
+    assert!(f.check("a\n.p1midend.multi.test").blocked());
+    assert!(!f.check("").blocked());
+    assert!(!f.check(".").blocked());
+
+    // An oversized raw regex with an extractable literal is skipped cleanly without sinking peers.
+    let t = table_with_regexes(&[r"example\.test(?:a{1000}){1000}", r"^ok\.example\.test$"]);
+    assert_eq!(t.skipped(), 1);
+    let f = Filters { lists: t, user: Table::empty() };
+    assert!(f.check("ok.example.test").blocked());
 }

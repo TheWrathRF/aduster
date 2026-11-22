@@ -8,6 +8,7 @@
 //! multi-pattern regex.
 
 mod compile;
+mod regex_set;
 pub mod rule;
 mod table;
 

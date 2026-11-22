@@ -501,6 +501,7 @@ dependencies = [
 name = "matcher"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "memmap2",
  "regex-automata",
  "xxhash-rust",

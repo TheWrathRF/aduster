@@ -14,6 +14,7 @@ matcher = { path = "crates/matcher" }
 dnsengine = { path = "crates/dnsengine" }
 proxy = { path = "crates/proxy" }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+aho-corasick = "1.1"
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "perf", "meta", "nfa", "dfa", "hybrid"] }
 memmap2 = "0.9"
 arc-swap = "1.7"

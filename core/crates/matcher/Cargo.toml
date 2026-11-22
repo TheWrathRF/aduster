@@ -7,5 +7,6 @@ publish.workspace = true
 
 [dependencies]
 xxhash-rust.workspace = true
+aho-corasick.workspace = true
 regex-automata.workspace = true
 memmap2.workspace = true
