@@ -27,6 +27,8 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -100,45 +102,44 @@ fun RollingNumber(text: String, style: TextStyle, color: Color, modifier: Modifi
 enum class Protection { ON, PAUSED, OFF }
 
 /**
- * The protection read-out, drawn from the logo: its ring. On: a closed ring in the accent with
- * the logo's bar in the middle. Paused: a gap opens in the ring (amber). Off: a thin, faint ring.
+ * The protection read-out: the launcher icon's slotted "a" (ring body cut by a slot, stem on the
+ * right, the bar in the slot). On: the mark in [ink] with its bar in the accent. Paused: amber,
+ * the slot empty. Off: a thin, faint outline of it.
  */
 @Composable
-fun ProtectionRing(state: Protection, accent: Color, warn: Color, faint: Color, modifier: Modifier = Modifier, size: Dp = 76.dp) {
-    val ringColor by animateColorAsState(
+fun ProtectionMark(state: Protection, ink: Color, accent: Color, warn: Color, faint: Color, modifier: Modifier = Modifier, size: Dp = 76.dp) {
+    val body by animateColorAsState(
         when (state) {
-            Protection.ON -> accent
+            Protection.ON -> ink
             Protection.PAUSED -> warn
             Protection.OFF -> faint
         },
-        tween(Motion.LONG, easing = Motion.Emphasized), label = "ring color",
+        tween(Motion.LONG, easing = Motion.Emphasized), label = "mark color",
     )
-    val stroke by animateFloatAsState(if (state == Protection.OFF) 0.035f else 0.12f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow), label = "ring stroke")
-    val gap by animateFloatAsState(if (state == Protection.PAUSED) 64f else 0f, tween(Motion.LONG, easing = Motion.Emphasized), label = "ring gap")
-    val bar by animateFloatAsState(if (state == Protection.ON) 1f else 0f, tween(Motion.LONG, easing = Motion.Emphasized), label = "ring bar")
+    // In the icon's 108-unit grid: the body's stroke 9, thin when off.
+    val stroke by animateFloatAsState(if (state == Protection.OFF) 3f else 9f, spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow), label = "mark stroke")
+    val bar by animateFloatAsState(if (state == Protection.ON) 1f else 0f, tween(Motion.LONG, easing = Motion.Emphasized), label = "mark bar")
     Canvas(modifier.size(size)) {
         val w = this.size.minDimension
-        val sw = w * stroke
-        val inset = w * 0.06f + sw / 2
-        val arcSize = Size(w - inset * 2, w - inset * 2)
-        // The gap opens at the top right, where the logo's stem meets the ring.
-        drawArc(
-            color = ringColor,
-            startAngle = -60f + gap / 2,
-            sweepAngle = 360f - gap,
-            useCenter = false,
-            topLeft = Offset(inset, inset),
-            size = arcSize,
-            style = Stroke(width = sw, cap = if (gap > 0.5f) androidx.compose.ui.graphics.StrokeCap.Round else androidx.compose.ui.graphics.StrokeCap.Butt),
+        // The glyph spans x 21.5-74.5, y 28-84.5 of the icon (ic_launcher_fg.xml); centred, 80 % tall.
+        val k = w * 0.80f / 56.5f
+        fun x(u: Float) = center.x + (u - 48f) * k
+        fun y(u: Float) = center.y + (u - 56.25f) * k
+        clipRect(left = 0f, top = y(54f), right = this.size.width, bottom = y(62f), clipOp = ClipOp.Difference) {
+            drawCircle(body, radius = 22f * k, center = Offset(x(48f), y(58f)), style = Stroke(width = stroke * k))
+        }
+        drawRoundRect(
+            color = body,
+            topLeft = Offset(x(70f - stroke / 2), y(28f + (9f - stroke) / 2)),
+            size = Size(stroke * k, (56.5f - (9f - stroke)) * k),
+            cornerRadius = CornerRadius(stroke / 2 * k, stroke / 2 * k),
         )
         if (bar > 0.01f) {
-            val bw = w * 0.30f * bar
-            val bh = w * 0.075f
             drawRoundRect(
                 color = accent.copy(alpha = bar),
-                topLeft = Offset(center.x - bw / 2, center.y - bh / 2),
-                size = Size(bw, bh),
-                cornerRadius = CornerRadius(bh / 2, bh / 2),
+                topLeft = Offset(x(33f), y(55.5f)),
+                size = Size(16f * k * bar, 5f * k),
+                cornerRadius = CornerRadius(2.5f * k, 2.5f * k),
             )
         }
     }

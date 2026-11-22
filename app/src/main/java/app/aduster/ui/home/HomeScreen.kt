@@ -75,7 +75,7 @@ import app.aduster.ui.common.Metric
 import app.aduster.ui.common.Motion
 import app.aduster.ui.common.PillButton
 import app.aduster.ui.common.Protection
-import app.aduster.ui.common.ProtectionRing
+import app.aduster.ui.common.ProtectionMark
 import app.aduster.ui.common.RollingNumber
 import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ValueText
@@ -136,7 +136,7 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
             // The status card: the state at a glance, its actions, and what needs fixing.
             Card(color = p.tone, horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.fillMaxWidth()) {
-                    ProtectionRing(state, p.accent, p.warn, p.faint, Modifier.align(Alignment.TopCenter).padding(top = 12.dp), size = 132.dp)
+                    ProtectionMark(state, p.text, p.accent, p.warn, p.faint, Modifier.align(Alignment.TopCenter).padding(top = 12.dp), size = 112.dp)
                     // Turn off is rare and asks first, so it sits in the corner and leaves the
                     // centre column and the full-width action to the state.
                     if (running && !unknown) {
@@ -503,10 +503,10 @@ private fun History(stats: Stats) {
             label = "chart label",
         ) { d ->
             if (d == null) {
-                Text("$span · ${fmt(total)} blocked", style = Type.mono, color = p.muted)
+                Text("$span: ${fmt(total)} blocked", style = Type.small, color = p.muted)
             } else {
                 val date = if (d.day == stats.day) "Today" else dayFormat.format(Date(d.day * 86_400_000L))
-                Text("$date · ${fmt(d.blocked)} blocked", style = Type.mono, color = p.text)
+                Text("$date: ${fmt(d.blocked)} blocked", style = Type.small, color = p.text)
             }
         }
     }

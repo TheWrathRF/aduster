@@ -302,6 +302,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Tells :core to read the settings again (e.g. the certificate was just installed). */
     fun notifyCore() = AdusterVpnService.notifySettingsChanged(ctx)
 
+    /** The packages behind an app's [uid] (one, or those sharing its UID), for Excluded apps. */
+    fun packagesOf(uid: Int): Set<String> = runCatching { ctx.packageManager.getPackagesForUid(uid)?.toSet() }.getOrNull().orEmpty()
+
     /** The user's own never-decrypt entries (the core only knows the merged list). */
     fun userExcludes(host: String, s: Settings): Boolean =
         s.httpsExclusions.lines().mapNotNull { HttpsConfig.exclusionHost(it) }.any { host == it || host.endsWith(".$it") }

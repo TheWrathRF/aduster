@@ -24,10 +24,10 @@ import app.aduster.settings.ThemeMode
 
 /**
  * A deliberately small palette, the same as www.aduster.site's: one ink scale plus one fixed
- * silver-blue accent. The accent marks what is active or blocked and the actions on offer
- * (buttons, links, tabs, progress); amber marks "paused" and what needs a look (errors,
- * destructive actions). [faint] is for lines and decorations only: text uses [muted] or
- * stronger (faint text is about 2.5:1, below the contrast text needs).
+ * silver-blue accent. The accent marks what is active and the actions on offer (buttons,
+ * links, tabs, progress); [blocked] marks what was blocked, in the Log; amber marks "paused"
+ * and what needs a look (errors, destructive actions). [faint] is for lines and decorations
+ * only: text uses [muted] or stronger (faint text is about 2.5:1, below the contrast text needs).
  */
 @Immutable
 data class Palette(
@@ -47,6 +47,8 @@ data class Palette(
     val faint: Color,
     val accent: Color,
     val onAccent: Color,
+    /** What was blocked: the Log's bar, tint and word. */
+    val blocked: Color,
     val warn: Color,
 )
 
@@ -62,7 +64,7 @@ val GoogleSans = FontFamily(
     Font(R.font.google_sans_medium, FontWeight.Medium),
 )
 
-/** Google Sans Code (OFL, bundled) for numbers, the query log and rules: columns line up. */
+/** Google Sans Code (OFL, bundled) only for times, rules and fingerprints, where characters must line up. */
 val GoogleSansCode = FontFamily(
     Font(R.font.google_sans_code_light, FontWeight.Light),
     Font(R.font.google_sans_code_regular, FontWeight.Normal),
@@ -70,13 +72,14 @@ val GoogleSansCode = FontFamily(
 )
 
 object Type {
+    /** Even-width digits in the proportional face: numbers line up and keep their own punctuation. */
     private val tnum = "tnum"
-    val display = TextStyle(fontSize = 40.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, letterSpacing = (-1.0).sp, lineHeight = 46.sp)
+    val display = TextStyle(fontSize = 36.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, letterSpacing = (-0.8).sp, lineHeight = 42.sp, fontFeatureSettings = tnum)
     /** The tabs' titles (Filters, Settings, Log). */
-    val screenTitle = TextStyle(fontSize = 32.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, letterSpacing = (-0.5).sp, lineHeight = 40.sp)
-    val title = TextStyle(fontSize = 26.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, letterSpacing = (-0.4).sp, lineHeight = 32.sp)
-    val dialogTitle = TextStyle(fontSize = 22.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, letterSpacing = (-0.2).sp, lineHeight = 28.sp)
-    val metric = TextStyle(fontSize = 26.sp, fontFamily = GoogleSansCode, fontWeight = FontWeight.Light, letterSpacing = (-0.8).sp, lineHeight = 32.sp)
+    val screenTitle = TextStyle(fontSize = 30.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, letterSpacing = (-0.5).sp, lineHeight = 38.sp)
+    val title = TextStyle(fontSize = 24.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, letterSpacing = (-0.3).sp, lineHeight = 30.sp)
+    val dialogTitle = TextStyle(fontSize = 21.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, letterSpacing = (-0.2).sp, lineHeight = 28.sp)
+    val metric = TextStyle(fontSize = 26.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, letterSpacing = (-0.4).sp, lineHeight = 32.sp, fontFeatureSettings = tnum)
     val body = TextStyle(fontSize = 15.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, lineHeight = 21.sp)
     val bodyStrong = TextStyle(fontSize = 15.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, lineHeight = 21.sp)
     val small = TextStyle(fontSize = 13.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, lineHeight = 18.sp, fontFeatureSettings = tnum)
@@ -85,7 +88,11 @@ object Type {
     val nav = TextStyle(fontSize = 12.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Normal, lineHeight = 16.sp)
     val mono = TextStyle(fontSize = 13.sp, fontFamily = GoogleSansCode, lineHeight = 19.sp)
     val monoBody = TextStyle(fontSize = 14.sp, fontFamily = GoogleSansCode, lineHeight = 20.sp)
-    val number = TextStyle(fontSize = 14.sp, fontFamily = GoogleSansCode, lineHeight = 20.sp)
+    val number = TextStyle(fontSize = 14.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, lineHeight = 20.sp, fontFeatureSettings = tnum)
+    /** A domain in the Log. */
+    val domain = TextStyle(fontSize = 15.sp, fontFamily = GoogleSans, fontWeight = FontWeight.Medium, lineHeight = 20.sp, fontFeatureSettings = tnum)
+    /** A time of day, as in the Log's rows. */
+    val time = TextStyle(fontSize = 12.sp, fontFamily = GoogleSansCode, lineHeight = 18.sp)
     val numberLabel = TextStyle(fontSize = 11.sp, fontFamily = GoogleSansCode, fontWeight = FontWeight.Medium, letterSpacing = 0.6.sp)
 }
 
@@ -114,8 +121,8 @@ fun AdusterTheme(mode: ThemeMode, content: @Composable () -> Unit) {
     }
 }
 
-/** Dialogs (Material's extra-large shape) take the cards' 24 dp corners. */
-private val shapes = Shapes(extraLarge = RoundedCornerShape(24.dp))
+/** Dialogs (Material's extra-large shape) take the cards' corners. */
+private val shapes = Shapes(extraLarge = RoundedCornerShape(14.dp))
 
 /** Material's own parts (dialogs, menus, ripples, text fields) in the palette's colours, nothing from the wallpaper. */
 internal fun colorScheme(p: Palette): ColorScheme = (if (p.dark) darkColorScheme() else lightColorScheme()).copy(
@@ -140,6 +147,9 @@ internal val Palette.shareLine: Color get() = muted
 internal val Palette.switchEdge: Color get() = muted
 internal val Palette.radioRing: Color get() = muted
 
+/** A blocked row's background in the Log: a faint wash of [Palette.blocked] (its texts keep their contrast, a test checks). */
+internal fun Palette.blockedTint(): Color = blocked.copy(alpha = if (dark) 0.10f else 0.06f)
+
 /** Every text colour keeps at least 4.5:1 on [Palette.bg], [Palette.surface], [Palette.surfaceHigh] and [Palette.tone] (a test checks). */
 internal val BlackPalette = Palette(
     dark = true,
@@ -155,6 +165,7 @@ internal val BlackPalette = Palette(
     faint = Color(0xFF4E4E55),
     accent = Color(0xFFC2C6D6),
     onAccent = Color(0xFF15171D),
+    blocked = Color(0xFFEE7A70),
     warn = Color(0xFFFFB547),
 )
 
@@ -172,5 +183,6 @@ internal val LightPalette = Palette(
     // The site's --sig-deep: its --sig is too light on a light page.
     accent = Color(0xFF3D4766),
     onAccent = Color.White,
+    blocked = Color(0xFFB33329),
     warn = Color(0xFF9A5900),
 )

@@ -21,6 +21,7 @@ import app.aduster.ui.settings.PackageFacts
 import app.aduster.ui.settings.appRows
 import app.aduster.ui.settings.shownApps
 import app.aduster.ui.settings.timelineLines
+import app.aduster.ui.theme.blockedTint
 import app.aduster.ui.theme.pastBar
 import app.aduster.ui.theme.radioRing
 import app.aduster.ui.theme.shareLine
@@ -147,42 +148,137 @@ class UiLogicTest {
         assertEquals(listOf("DNS lookups", "DNS lookups blocked"), app.aduster.ui.home.homeNumbers(public, pages = false).map { it.label })
     }
 
-    /** Log: one row per name and app for its A and AAAA lookups, under a heading per minute. */
+    /**
+     * The Log as a ledger: one row per name, app and outcome for its A, AAAA and HTTPS lookups and
+     * its repeats within a minute ("×N"), a browser's connection folded into the lookup or page
+     * row it belongs to, a day divider wherever the day changes, newest activity first.
+     */
     @Test
     fun logLedger() {
-        val t = 1_700_000_040_000L - 1_700_000_040_000L % 60_000
-        fun e(seq: Long, at: Long, name: String, q: Int, uid: Int, a: QueryAction) = LogItem(seq, t + at, name, q, uid, a, null, null, 0)
+        val day = 86_400_000L
+        val zone = java.util.TimeZone.getDefault()
+        // Noon local time, so a few minutes either way stay on one day.
+        val t0 = 1_700_000_000_000L.let { it - Math.floorMod(it + zone.getOffset(it), day) + day / 2 }
+        fun e(seq: Long, at: Long, name: String, q: Int, uid: Int, a: QueryAction, page: String? = null) =
+            LogItem(seq, t0 + at, name, q, uid, a, null, null, 0, page = page)
+        fun show(lines: List<app.aduster.ui.log.LogLine>) = lines.map { l ->
+            when (l) {
+                is app.aduster.ui.log.LogLine.Day -> "day"
+                is app.aduster.ui.log.LogLine.Query -> "${l.e.name} ${l.types} x${l.count}"
+                is app.aduster.ui.log.LogLine.Marker -> "marker"
+                else -> l.toString()
+            }
+        }
         val newestFirst = listOf(
-            e(6, 65_200, "b.test", 65, 10, QueryAction.BLOCKED),
-            e(5, 65_000, "b.test", 28, 10, QueryAction.BLOCKED),
-            e(4, 64_500, "b.test", 1, 10, QueryAction.BLOCKED),
-            e(3, 30_000, "c.test", 1, 10, QueryAction.UPSTREAM),
-            e(2, 29_000, "c.test", 28, 11, QueryAction.UPSTREAM),
-            e(1, 1_000, "d.test", 0, 10, QueryAction.FILTERED),
+            // The page's own connection, then a request in it blocked: one row, the page block.
+            e(12, 40_300, "static.test", 0, 10, QueryAction.FILTERED, page = "news.test"),
+            e(11, 40_000, "static.test", 0, 10, QueryAction.UPSTREAM),
+            // A lookup and its connection a moment later: one row.
+            e(10, 30_400, "news.test", 0, 10, QueryAction.UPSTREAM),
+            e(9, 30_100, "news.test", 28, 10, QueryAction.UPSTREAM),
+            e(8, 30_000, "news.test", 1, 10, QueryAction.UPSTREAM),
+            // A name answered, then its connection refused: both kept, the refusal is news.
+            e(7, 20_500, "half.test", 0, 10, QueryAction.BLOCKED),
+            e(6, 20_000, "half.test", 1, 10, QueryAction.UPSTREAM),
+            // The same blocked name three times within a minute: one row, ×3.
+            e(5, 15_000, "ads.test", 1, 11, QueryAction.BLOCKED),
+            e(4, 10_000, "ads.test", 28, 11, QueryAction.BLOCKED),
+            e(3, 9_900, "ads.test", 1, 11, QueryAction.BLOCKED),
+            e(2, 1_000, "ads.test", 1, 11, QueryAction.BLOCKED),
+            e(1, 0, "ads.test", 1, 12, QueryAction.BLOCKED),
         )
         val lines = app.aduster.ui.log.ledgerOf(newestFirst)
         assertEquals(
-            listOf("minute 1", "b.test A, AAAA, HTTPS", "minute 0", "c.test A", "c.test AAAA", "d.test Page"),
-            lines.map { l ->
-                when (l) {
-                    is app.aduster.ui.log.LogLine.Minute -> "minute ${(l.time - t) / 60_000}"
-                    is app.aduster.ui.log.LogLine.Query -> "${l.e.name} ${l.types}"
-                    else -> l.toString()
-                }
-            },
+            listOf(
+                "day",
+                "static.test Page, Connection x1",
+                "news.test A, AAAA, Connection x1",
+                "half.test Connection x1",
+                "half.test A x1",
+                "ads.test A, AAAA x3",
+                // Another app's lookup of the same name is its own row.
+                "ads.test A x1",
+            ),
+            show(lines),
         )
-        // A merged row keeps its key (its oldest entry) when the next type of the name arrives.
-        val merged = lines[1] as app.aduster.ui.log.LogLine.Query
-        assertEquals(4L, merged.key)
         assertEquals(lines.size, lines.map { it.key }.toSet().size)
-        // Lookups seconds apart, or one blocked and one answered, stay apart.
-        val apart = app.aduster.ui.log.ledgerOf(listOf(e(8, 9_000, "x.test", 28, 10, QueryAction.UPSTREAM), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM)))
-        assertEquals(3, apart.size)
-        val mixed = app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.BLOCKED), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM)))
-        assertEquals(3, mixed.size)
-        // An AAAA answered with no address (IPv4-only answers) is not hidden under its A row.
-        val v4 = app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.NO_IPV6), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM)))
-        assertEquals(3, v4.size)
+        // Keys stay as newer entries arrive: a repeat moves its row to the top under the same key.
+        val more = app.aduster.ui.log.ledgerOf(listOf(e(13, 50_000, "ads.test", 1, 11, QueryAction.BLOCKED)) + newestFirst)
+        assertEquals("ads.test A, AAAA x4", show(more)[1])
+        assertEquals(lines.map { it.key }.toSet(), more.map { it.key }.toSet())
+        // A minute after a row's first lookup the name starts a new row; a pause marker ends every row.
+        val later = app.aduster.ui.log.ledgerOf(listOf(e(21, 70_000, "x.test", 1, 10, QueryAction.UPSTREAM), e(20, 0, "x.test", 1, 10, QueryAction.UPSTREAM)))
+        assertEquals(listOf("day", "x.test A x1", "x.test A x1"), show(later))
+        val split = app.aduster.ui.log.ledgerOf(
+            listOf(e(32, 2_000, "x.test", 1, 10, QueryAction.UPSTREAM), e(31, 1_500, "", 0, -1, QueryAction.RESUMED), e(30, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM)),
+        )
+        assertEquals(listOf("day", "x.test A x1", "marker", "day", "x.test A x1"), show(split))
+        assertEquals(split.size, split.map { it.key }.toSet().size)
+        // An AAAA left out by IPv4-only answers is not hidden under its A row; a failed lookup is not an allowed one.
+        assertEquals(3, app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.NO_IPV6), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM))).size)
+        assertEquals(3, app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.FAILED), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM))).size)
+        // Each day gets its divider.
+        val days = app.aduster.ui.log.ledgerOf(listOf(e(41, 0, "a.test", 1, 10, QueryAction.UPSTREAM), e(40, -day, "b.test", 1, 10, QueryAction.UPSTREAM)))
+        assertEquals(listOf("day", "a.test A x1", "day", "b.test A x1"), show(days))
+        assertEquals(
+            listOf("Today", "Yesterday", "27 Sep"),
+            listOf(0L, 1L, 7L).map { app.aduster.ui.log.dayLabel(20_000L - it, today = 20_000L) },
+        )
+        // "N new" counts rows, not entries: one lookup of three record types is one new row.
+        assertEquals(1, app.aduster.ui.log.freshRows(lines, seenSeq = 11))
+        assertEquals(0, app.aduster.ui.log.freshRows(lines, seenSeq = 12))
+        assertEquals(3, app.aduster.ui.log.freshRows(lines, seenSeq = 6))
+    }
+
+    /** A Log row says what happened in a word, and its second line names the app with the page or the list. */
+    @Test
+    fun logRowWords() {
+        fun q(a: QueryAction, qtype: Int = 1, list: String? = null, page: String? = null) =
+            app.aduster.ui.log.LogLine.Query(listOf(LogItem(1, 0, "ads.test", qtype, 10, a, null, list, 0, page = page)))
+        assertEquals("Blocked", app.aduster.ui.log.statusWord(q(QueryAction.BLOCKED)))
+        assertEquals("Blocked", app.aduster.ui.log.statusWord(q(QueryAction.BLOCKED_CNAME)))
+        assertEquals("Page", app.aduster.ui.log.statusWord(q(QueryAction.FILTERED, qtype = 0, page = "news.test")))
+        assertEquals("Failed", app.aduster.ui.log.statusWord(q(QueryAction.FAILED)))
+        assertEquals("Cached", app.aduster.ui.log.statusWord(q(QueryAction.CACHE)))
+        assertEquals("Cached", app.aduster.ui.log.statusWord(q(QueryAction.STALE)))
+        assertEquals("", app.aduster.ui.log.statusWord(q(QueryAction.UPSTREAM)))
+        assertEquals("Chrome on news.test", app.aduster.ui.log.secondLine(q(QueryAction.FILTERED, qtype = 0, page = "news.test"), "Chrome"))
+        assertEquals("Chrome", app.aduster.ui.log.secondLine(q(QueryAction.FILTERED, qtype = 0, page = "ads.test"), "Chrome"))
+        assertEquals("Chrome, HaGeZi Pro", app.aduster.ui.log.secondLine(q(QueryAction.BLOCKED, list = "HaGeZi Pro"), "Chrome"))
+        assertEquals("Chrome", app.aduster.ui.log.secondLine(q(QueryAction.UPSTREAM, list = "x"), "Chrome"))
+        // The engines record a list's id: the row names the list.
+        val s = Settings()
+        assertEquals("Chrome, HaGeZi Multi PRO", app.aduster.ui.log.secondLine(q(QueryAction.BLOCKED, list = "hagezi-pro"), "Chrome") { app.aduster.ui.log.listLabel(it, s) })
+        assertEquals("My rules", app.aduster.ui.log.listLabel("user", s))
+        assertEquals("unknown-list", app.aduster.ui.log.listLabel("unknown-list", s))
+    }
+
+    /** The Log's filters combine: one of All / Blocked / Allowed, and on top of it Browsers, Pages, one app and the search. */
+    @Test
+    fun logFiltersCombine() {
+        fun e(name: String, q: Int, uid: Int, a: QueryAction) = LogItem(1, 0, name, q, uid, a, null, null, 0)
+        val browsers = setOf(20)
+        val apps = mapOf(10 to "Mail", 20 to "Browser")
+        fun keep(x: LogItem, kind: Int = 0, inBrowsers: Boolean = false, pages: Boolean = false, only: Int? = null, query: String = "") =
+            app.aduster.ui.log.logMatches(x, kind, inBrowsers, pages, only, query, browsers) { apps[it] ?: "" }
+        val dnsBlocked = e("ads.test", 1, 10, QueryAction.BLOCKED)
+        val pageBlocked = e("ads.test", 0, 20, QueryAction.FILTERED)
+        val connection = e("news.test", 0, 20, QueryAction.UPSTREAM)
+        val browserLookup = e("news.test", 1, 20, QueryAction.UPSTREAM)
+        val failed = e("down.test", 1, 10, QueryAction.FAILED)
+        val marker = e("", 0, -1, QueryAction.PAUSED)
+        val all = listOf(dnsBlocked, pageBlocked, connection, browserLookup, failed)
+        assertTrue(all.all { keep(it) })
+        assertEquals(listOf(true, true, false, false, false), all.map { keep(it, kind = 1) })
+        assertEquals(listOf(false, false, true, true, false), all.map { keep(it, kind = 2) })
+        // Blocked in browsers; allowed in pages (the browsers' connections).
+        assertEquals(listOf(false, true, false, false, false), all.map { keep(it, kind = 1, inBrowsers = true) })
+        assertEquals(listOf(false, false, true, false, false), all.map { keep(it, kind = 2, pages = true) })
+        assertEquals(listOf(true, false, false, false, true), all.map { keep(it, only = 10) })
+        assertTrue(keep(browserLookup, query = "brow") && keep(browserLookup, query = "NEWS ") && !keep(dnsBlocked, query = "news"))
+        // Markers divide the list whatever the view, but not a search or one app's rows.
+        assertTrue(keep(marker, kind = 1, inBrowsers = true))
+        assertFalse(keep(marker, query = "x") || keep(marker, only = 10))
     }
 
     /** Diagnostics: process ends grouped by what happened, in plain words, newest group first. */
@@ -665,7 +761,7 @@ class UiLogicTest {
     fun textContrastAtLeast4point5() {
         for (p in listOf(app.aduster.ui.theme.BlackPalette, app.aduster.ui.theme.LightPalette)) {
             val theme = if (p.dark) "black" else "light"
-            val inks = listOf("text" to p.text, "text2" to p.text2, "muted" to p.muted, "warn" to p.warn, "accent" to p.accent)
+            val inks = listOf("text" to p.text, "text2" to p.text2, "muted" to p.muted, "warn" to p.warn, "accent" to p.accent, "blocked" to p.blocked)
             val surfaces = listOf("bg" to p.bg, "surface" to p.surface, "surfaceHigh" to p.surfaceHigh, "tone" to p.tone)
             for ((name, ink) in inks) {
                 for ((under, bg) in surfaces) {
@@ -677,6 +773,12 @@ class UiLogicTest {
             for ((name, fill) in listOf("accent" to p.accent, "warn" to p.warn)) {
                 val ratio = contrast(p.onAccent, fill)
                 assertTrue("$theme onAccent on $name: ${"%.2f".format(ratio)}", ratio >= 4.5)
+            }
+            // A blocked row of the Log is tinted: its texts keep their contrast on the tint.
+            val tint = over(p.blockedTint(), p.bg)
+            for ((name, ink) in listOf("text" to p.text, "text2" to p.text2, "muted" to p.muted, "blocked" to p.blocked)) {
+                val ratio = contrast(ink, tint)
+                assertTrue("$theme $name on a blocked row: ${"%.2f".format(ratio)}", ratio >= 4.5)
             }
             // Material's parts take the palette, not the wallpaper; its dialogs sit on the card colour.
             val scheme = app.aduster.ui.theme.colorScheme(p)
@@ -748,14 +850,14 @@ class UiLogicTest {
         assertTrue(app.aduster.ui.filters.tabGroups(app.aduster.ui.filters.FilterTab.DNS, all, null, true).none { it.first == app.aduster.filters.Group.DEVICE })
     }
 
-    /** A group's segments: 18 dp outside, 8 dp where two meet; a single row is round all over. */
+    /** A group's segments: 10 dp outside, 5 dp where two meet; a single row is round all over. */
     @Test
     fun groupSegmentCorners() {
         fun shape(top: Int, bottom: Int) = androidx.compose.foundation.shape.RoundedCornerShape(top.dp, top.dp, bottom.dp, bottom.dp)
-        assertEquals(shape(18, 18), segmentShape(0, 1))
-        assertEquals(shape(18, 8), segmentShape(0, 3))
-        assertEquals(shape(8, 8), segmentShape(1, 3))
-        assertEquals(shape(8, 18), segmentShape(2, 3))
+        assertEquals(shape(10, 10), segmentShape(0, 1))
+        assertEquals(shape(10, 5), segmentShape(0, 3))
+        assertEquals(shape(5, 5), segmentShape(1, 3))
+        assertEquals(shape(5, 10), segmentShape(2, 3))
     }
 
     /**
@@ -765,12 +867,6 @@ class UiLogicTest {
      */
     @Test
     fun graphicsContrastAtLeast3() {
-        fun over(fg: androidx.compose.ui.graphics.Color, bg: androidx.compose.ui.graphics.Color) =
-            androidx.compose.ui.graphics.Color(
-                fg.red * fg.alpha + bg.red * (1 - fg.alpha),
-                fg.green * fg.alpha + bg.green * (1 - fg.alpha),
-                fg.blue * fg.alpha + bg.blue * (1 - fg.alpha),
-            )
         for (p in listOf(app.aduster.ui.theme.BlackPalette, app.aduster.ui.theme.LightPalette)) {
             val theme = if (p.dark) "black" else "light"
             val checks = listOf(
@@ -782,6 +878,7 @@ class UiLogicTest {
                 "switch edge on a row" to contrast(p.switchEdge, p.surface),
                 "switch edge on the page" to contrast(p.switchEdge, p.bg),
                 "unselected radio ring in a dialog" to contrast(p.radioRing, p.surface),
+                "a blocked row's bar on its tint" to contrast(p.blocked, over(p.blockedTint(), p.bg)),
             )
             for ((what, ratio) in checks) assertTrue("$theme $what: ${"%.2f".format(ratio)}", ratio >= 3.0)
         }
@@ -851,17 +948,12 @@ class UiLogicTest {
         assertNull(app.aduster.settings.salvageSettings("not json"))
     }
 
-    /** The Log's rows are grouped in runs between minute headings and markers. */
-    @Test
-    fun logRuns() {
-        val t = 1_700_000_040_000L - 1_700_000_040_000L % 60_000
-        fun e(seq: Long, at: Long, name: String) = LogItem(seq, t + at, name, 1, 10, QueryAction.UPSTREAM, null, null, 0)
-        val rows = app.aduster.ui.log.ledgerOf(listOf(e(4, 65_000, "a.test"), e(3, 30_000, "b.test"), e(2, 20_000, "c.test"), e(1, 10_000, "d.test")))
-        val runs = app.aduster.ui.log.runsOf(rows)
-        // minute 1, a.test | minute 0, b, c, d
-        assertEquals(listOf(0, 0, 0, 0, 1, 2), runs.index.toList())
-        assertEquals(listOf(0, 1, 0, 3, 3, 3), runs.count.toList())
-    }
+    private fun over(fg: androidx.compose.ui.graphics.Color, bg: androidx.compose.ui.graphics.Color) =
+        androidx.compose.ui.graphics.Color(
+            fg.red * fg.alpha + bg.red * (1 - fg.alpha),
+            fg.green * fg.alpha + bg.green * (1 - fg.alpha),
+            fg.blue * fg.alpha + bg.blue * (1 - fg.alpha),
+        )
 
     private fun contrast(a: androidx.compose.ui.graphics.Color, b: androidx.compose.ui.graphics.Color): Double {
         fun lum(c: androidx.compose.ui.graphics.Color): Double {

@@ -71,7 +71,7 @@ import app.aduster.ui.common.ToggleRow
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.counted
 import app.aduster.ui.fmt
-import app.aduster.ui.theme.GoogleSansCode
+import androidx.compose.ui.text.font.FontWeight
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
 import java.util.UUID
@@ -275,7 +275,7 @@ private fun Header(meta: app.aduster.filters.FilterMeta, inUse: List<String>, pr
                 } else {
                     Text(
                         buildAnnotatedString {
-                            withStyle(SpanStyle(fontFamily = GoogleSansCode, color = p.accent)) { append(fmt(meta.compiledRules)) }
+                            withStyle(SpanStyle(fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum", color = p.accent)) { append(fmt(meta.compiledRules)) }
                             append(" DNS rules · ")
                             append(updateLine(meta, inUse))
                         },

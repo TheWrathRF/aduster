@@ -120,8 +120,8 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         item(key = "protection") { Column {
             BackBar("Diagnostics", onBack)
 
-            SectionHeading("Protection")
-            Group {
+            SectionHeading("Protection", flat = true)
+            Group(flat = true) {
                 row { ListRow("State") { ValueText(DiagnosticsStates.protection(stats, s.isPaused())) } }
                 row { ListRow("Running for") { ValueText(uptime(n("uptime_s"))) } }
                 row { ListRow("DNS bypass attempts blocked") { ValueText(fmt(n("rst_sent"))) } }
@@ -146,8 +146,8 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         } }
 
         item(key = "resolver") { Column {
-            SectionHeading("DNS server")
-            Group {
+            SectionHeading("DNS server", flat = true)
+            Group(flat = true) {
                 row { ListRow("In use") { ValueText(d?.get("upstream")?.jsonPrimitive?.content ?: "system") } }
                 row { ListRow("Network DNS servers") { ValueText(list("system_servers").ifEmpty { "none" }) } }
                 // Medians, and the slowest 1 % of the DNS server's answers.
@@ -159,15 +159,15 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         } }
 
         item(key = "today") { Column {
-            SectionHeading("Today")
-            Group {
+            SectionHeading("Today", flat = true)
+            Group(flat = true) {
                 for ((label, count) in DiagnosticsStates.today(stats, HttpsConfig.available)) row { ListRow(label) { ValueText(fmt(count)) } }
             }
         } }
 
         item(key = "pages") { Column {
-            SectionHeading("Page filtering")
-            Group {
+            SectionHeading("Page filtering", flat = true)
+            Group(flat = true) {
                 row {
                     ListRow("State") {
                         // Until the first diagnostics arrive nothing is known: no warning flashes.
@@ -185,9 +185,9 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         // bypass can be ended here ("Filter again").
         val notNow = (px?.get("not_filtered_now") as? JsonArray).orEmpty()
         if (pagesRunning) item(key = "notnow") { Column {
-            SectionHeading("Not filtered right now")
+            SectionHeading("Not filtered right now", flat = true)
             if (notNow.isEmpty()) None("None")
-            Group {
+            Group(flat = true) {
                 notNow.forEach { e ->
                     val o = e as? JsonObject ?: return@forEach
                     val host = o["host"]?.jsonPrimitive?.content.orEmpty()
@@ -217,8 +217,8 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         // week, by itself; listed so it is never silent.
         val retreats = (px?.get("retreats") as? JsonArray).orEmpty()
         if (retreats.isNotEmpty()) item(key = "retreats") { Column {
-            SectionHeading("Turned off on these sites")
-            Group {
+            SectionHeading("Turned off on these sites", flat = true)
+            Group(flat = true) {
                 retreats.forEach { e ->
                     val o = e as? JsonObject ?: return@forEach
                     val left = o["remaining_s"]?.jsonPrimitive?.longOrNull ?: 0L
@@ -237,10 +237,10 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
 
         item(key = "timeline") { Column {
             // When protection was on, off or paused, and why (a pause shows as one stretch).
-            SectionHeading("Protection timeline")
+            SectionHeading("Protection timeline", flat = true)
             val lines = timelineLines(timeline).take(12)
             if (lines.isEmpty()) None("Nothing recorded yet")
-            Group {
+            Group(flat = true) {
                 lines.forEach { (title, detail, warn) ->
                     row { ListRow(title, detail, titleColor = if (warn) p.warn else p.text) }
                 }
@@ -249,9 +249,9 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
 
         item(key = "exits") { Column {
             // How Aduster's processes ended lately, as Android recorded it: crashes, ANRs and kills.
-            SectionHeading("How it last stopped")
+            SectionHeading("How it last stopped", flat = true)
             if (exits.isEmpty()) None("Nothing recorded")
-            Group {
+            Group(flat = true) {
                 exitLines(exits).forEach { (title, detail, notable) ->
                     row { ListRow(title, detail, titleColor = if (notable) p.warn else p.text) }
                 }
@@ -259,8 +259,8 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         } }
 
         item(key = "report") { Column {
-            SectionHeading("Report")
-            Group {
+            SectionHeading("Report", flat = true)
+            Group(flat = true) {
                 row {
                     ListRow(
                         "Export report",
@@ -295,7 +295,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
 /** An empty section, said in a line where its rows would be. */
 @Composable
 private fun None(text: String) {
-    Text(text, style = Type.small, color = LocalPalette.current.muted, modifier = Modifier.padding(horizontal = Gutter + 16.dp, vertical = 4.dp))
+    Text(text, style = Type.small, color = LocalPalette.current.muted, modifier = Modifier.padding(horizontal = Gutter, vertical = 4.dp))
 }
 
 /**

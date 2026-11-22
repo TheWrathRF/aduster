@@ -3,68 +3,67 @@ package app.aduster.ui.log
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Process
 import android.widget.Toast
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.IntrinsicSize
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.material3.minimumInteractiveComponentSize
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.semantics.heading
-import app.aduster.ui.common.AppIcon
-import app.aduster.ui.hm
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -74,28 +73,32 @@ import app.aduster.ui.MainViewModel
 import app.aduster.ui.QueryAction
 import app.aduster.ui.appName
 import app.aduster.ui.clock
-import app.aduster.ui.common.ChipTabs
+import app.aduster.ui.common.AppIcon
 import app.aduster.ui.common.ChoiceDialog
 import app.aduster.ui.common.ClearLogDialog
-import app.aduster.ui.common.GroupSegment
-import app.aduster.ui.common.PillButton
+import app.aduster.ui.common.Corners
+import app.aduster.ui.common.FilterChip
 import app.aduster.ui.common.Gutter
 import app.aduster.ui.common.Haptics
 import app.aduster.ui.common.InputField
 import app.aduster.ui.common.Motion
+import app.aduster.ui.common.PillButton
 import app.aduster.ui.common.ScreenTitle
+import app.aduster.ui.common.Segmented
 import app.aduster.ui.common.TextAction
 import app.aduster.ui.counted
 import app.aduster.ui.fmt
 import app.aduster.ui.micros
 import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
-import app.aduster.ui.theme.GoogleSansCode
 import app.aduster.ui.theme.Type
+import app.aduster.ui.theme.blockedTint
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-private val FILTERS = listOf("All", "Blocked", "Allowed", "Browsers")
+private val KINDS = listOf("All", "Blocked", "Allowed")
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -109,7 +112,9 @@ fun LogScreen(vm: MainViewModel) {
     val browsers by vm.browserUids.collectAsStateWithLifecycle()
     // Kept across tab switches and recreation.
     var query by rememberSaveable { mutableStateOf("") }
-    var filter by rememberSaveable { mutableIntStateOf(0) }
+    var kind by rememberSaveable { mutableIntStateOf(0) }
+    var inBrowsers by rememberSaveable { mutableStateOf(false) }
+    var pages by rememberSaveable { mutableStateOf(false) }
     var app by rememberSaveable { mutableStateOf<Int?>(null) }
     var appDialog by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
@@ -129,37 +134,26 @@ fun LogScreen(vm: MainViewModel) {
         }
     }
 
-    val shown by remember(entries, query, filter, labels, app, browsers) {
-        derivedStateOf {
-            val q = query.trim().lowercase()
-            entries.filter { e ->
-                // Pause and resume markers divide the list whatever the tab, unless searching.
-                if (e.action.marker) return@filter q.isEmpty() && app == null
-                val kind = when (filter) {
-                    1 -> e.action.blocked
-                    // Answered names only: failed lookups were never "allowed".
-                    2 -> e.action.answered
-                    3 -> e.uid in browsers || e.action == QueryAction.FILTERED
-                    else -> true
-                }
-                kind && (app == null || e.uid == app) &&
-                    (q.isEmpty() || e.name.contains(q) || appName(labels, e.uid).lowercase().contains(q))
-            }
+    // The ledger is rebuilt at every poll over up to 10,000 entries: off the main thread. Null
+    // until the first one is ready (no "Nothing logged yet" flash).
+    var rows by remember { mutableStateOf<List<LogLine>?>(null) }
+    LaunchedEffect(entries, query, kind, inBrowsers, pages, app, labels, browsers) {
+        rows = withContext(Dispatchers.Default) {
+            ledgerOf(entries.filter { logMatches(it, kind, inBrowsers, pages, app, query, browsers) { uid -> appName(labels, uid) } })
         }
     }
-    // A ledger: minute headings, a name's record types in one row, no-network failures as one stretch.
-    val rows by remember(shown) { derivedStateOf { ledgerOf(shown) } }
-    val place by remember(rows) { derivedStateOf { runsOf(rows) } }
+    val lines = rows.orEmpty()
+    val listName: (String) -> String = remember(s) { { id -> listLabel(id, s) } }
 
-    // New entries: at the top of the list they slide in; further down the list stays put and a
-    // pill counts them instead.
+    // New rows: at the top of the list they slide in; further down the list stays put and the
+    // line above it counts them instead.
     val listState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val scope = rememberCoroutineScope()
     if (clearDialog) ClearLogDialog(vm.viewModelScope, { vm.clearLog() }) { clearDialog = false }
     val undoBar = remember { androidx.compose.material3.SnackbarHostState() }
     var pinnedTop by remember { mutableStateOf(true) }
     var seenSeq by remember { mutableLongStateOf(0L) }
-    val topSeq = shown.firstOrNull()?.seq ?: 0L
+    val topSeq = topSeqOf(lines)
     LaunchedEffect(listState) {
         snapshotFlow { Triple(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset, listState.isScrollInProgress) }
             .collect { (i, o, scrolling) -> if (scrolling) pinnedTop = i == 0 && o < 24 }
@@ -172,8 +166,8 @@ fun LogScreen(vm: MainViewModel) {
     }
     // A changed filter starts at the top; coming back to the tab keeps the place.
     var lastFilters by rememberSaveable { mutableStateOf("") }
-    LaunchedEffect(query, filter, app) {
-        val key = "$query|$filter|$app"
+    LaunchedEffect(query, kind, inBrowsers, pages, app) {
+        val key = "$query|$kind|$inBrowsers|$pages|$app"
         if (lastFilters.isNotEmpty() && lastFilters != key) {
             pinnedTop = true
             seenSeq = topSeq
@@ -181,7 +175,8 @@ fun LogScreen(vm: MainViewModel) {
         }
         lastFilters = key
     }
-    val fresh = if (pinnedTop) 0 else shown.takeWhile { it.seq > seenSeq }.size
+    val fresh = if (pinnedTop) 0 else freshRows(lines, seenSeq)
+    val shownCount = lines.count { it is LogLine.Query || it is LogLine.Offline }
 
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
@@ -190,81 +185,79 @@ fun LogScreen(vm: MainViewModel) {
         }
         InputField(query, { query = it }, "Filter by domain or app", Modifier.fillMaxWidth().padding(horizontal = Gutter), icon = AdIcons.Search)
         Spacer(Modifier.height(4.dp))
-        ChipTabs(FILTERS, filter, { filter = it }) {
+        // One of All / Blocked / Allowed with the app beside it; under them Browsers and Pages,
+        // which combine with both, and the rows left or the new ones above while reading further
+        // down (a line of its own: nothing covers the first row).
+        Row(
+            Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = Gutter),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Segmented(KINDS, kind, { kind = it })
             AppFilter(app?.let { appName(labels, it) }, onPick = { appDialog = true }, onClear = { app = null })
         }
-        Spacer(Modifier.height(4.dp))
+        Row(Modifier.fillMaxWidth().padding(start = Gutter, end = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            FilterChip("Browsers", inBrowsers) { inBrowsers = it }
+            FilterChip("Pages", pages) { pages = it }
+            Spacer(Modifier.weight(1f))
+            if (fresh > 0) {
+                Row(
+                    Modifier
+                        .minimumInteractiveComponentSize()
+                        .clip(RoundedCornerShape(Corners.outer))
+                        .clickable(role = Role.Button) {
+                            scope.launch {
+                                listState.animateScrollToItem(0)
+                                pinnedTop = true
+                                seenSeq = topSeq
+                            }
+                        }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(AdIcons.Up, null, tint = p.accent, modifier = Modifier.size(14.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("${fmt(fresh)} new", style = Type.bodyStrong.copy(fontSize = Type.small.fontSize), color = p.accent, maxLines = 1)
+                }
+            } else if (s.logEnabled && rows != null && entries.isNotEmpty()) {
+                Text(counted(shownCount, "row", "rows"), style = Type.small, color = p.muted, maxLines = 1, modifier = Modifier.padding(end = 12.dp))
+            }
+        }
 
         if (!s.logEnabled) {
             Empty("The log is off", "Turn it on in Settings.")
-        } else if (shown.isEmpty()) {
+        } else if (rows == null) {
+            Box(Modifier.fillMaxSize())
+        } else if (lines.none { it !is LogLine.Day }) {
             Empty(if (entries.isEmpty()) "Nothing logged yet" else "Nothing matches")
         } else {
-            Box(Modifier.fillMaxSize()) {
-                LazyColumn(Modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
-                    rows.forEachIndexed { i, r ->
-                        when (r) {
-                            // The minute stays at the top while its rows scroll under it.
-                            is LogLine.Minute -> stickyHeader(key = r.key, contentType = "minute") { MinuteHeading(r.time) }
-                            is LogLine.Marker -> item(key = r.key, contentType = "marker") { MarkerRow(r.e, Modifier.animateItem(fadeInSpec = tween(Motion.MEDIUM), placementSpec = tween(Motion.LONG, easing = Motion.Emphasized), fadeOutSpec = tween(Motion.SHORT))) }
-                            else -> item(key = r.key, contentType = "row") {
-                                val mod = Modifier.animateItem(fadeInSpec = tween(Motion.MEDIUM), placementSpec = tween(Motion.LONG, easing = Motion.Emphasized), fadeOutSpec = tween(Motion.SHORT))
-                                // The rows of one minute are one group of segments.
-                                GroupSegment(place.index[i], place.count[i], mod) {
-                                    when (r) {
-                                        is LogLine.Query -> {
-                                            val icon = remember(iconVersion, r.e.uid) { vm.appIconForUid(r.e.uid) }
-                                            LogRow(
-                                                r, appName(labels, r.e.uid), icon,
-                                                onLongClick = {
-                                                    Haptics.longPress(view)
-                                                    copy(ctx, r.e.name)
-                                                },
-                                            ) { selected = r }
-                                        }
-                                        is LogLine.Offline -> OfflineRow(r)
-                                        is LogLine.Marker, is LogLine.Minute -> {}
-                                    }
-                                }
-                            }
+            val today = localDay(System.currentTimeMillis())
+            LazyColumn(Modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(bottom = 16.dp)) {
+                for (r in lines) {
+                    when (r) {
+                        // The day stays at the top while its rows scroll under it.
+                        is LogLine.Day -> stickyHeader(key = r.key, contentType = "day") { DayHeading(dayLabel(r.day, today)) }
+                        is LogLine.Marker -> item(key = r.key, contentType = "marker") { MarkerRow(r.e, Modifier.animateItem(fadeInSpec = tween(Motion.MEDIUM), placementSpec = tween(Motion.LONG, easing = Motion.Emphasized), fadeOutSpec = tween(Motion.SHORT))) }
+                        is LogLine.Offline -> item(key = r.key, contentType = "offline") { OfflineRow(r, Modifier.animateItem(fadeInSpec = tween(Motion.MEDIUM), placementSpec = tween(Motion.LONG, easing = Motion.Emphasized), fadeOutSpec = tween(Motion.SHORT))) }
+                        is LogLine.Query -> item(key = r.key, contentType = "row") {
+                            val mod = Modifier.animateItem(fadeInSpec = tween(Motion.MEDIUM), placementSpec = tween(Motion.LONG, easing = Motion.Emphasized), fadeOutSpec = tween(Motion.SHORT))
+                            val icon = remember(iconVersion, r.e.uid) { vm.appIconForUid(r.e.uid) }
+                            LogRow(
+                                r, appName(labels, r.e.uid), icon, mod, listName,
+                                onLongClick = {
+                                    Haptics.longPress(view)
+                                    copy(ctx, r.e.name)
+                                },
+                            ) { selected = r }
                         }
-                    }
-                }
-                // The plain (not ColumnScope) AnimatedVisibility: this sits in a Box.
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = fresh > 0,
-                    enter = fadeIn(tween(Motion.MEDIUM)) + slideInVertically(tween(Motion.MEDIUM, easing = Motion.Emphasized)) { -it },
-                    exit = fadeOut(tween(Motion.SHORT)) + slideOutVertically(tween(Motion.SHORT)) { -it },
-                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 2.dp),
-                ) {
-                    // The pill is 32 dp tall; the touch area around it is 48 dp.
-                    Row(
-                        Modifier
-                            .clip(RoundedCornerShape(50))
-                            .clickable(role = Role.Button) {
-                                scope.launch {
-                                    listState.animateScrollToItem(0)
-                                    pinnedTop = true
-                                    seenSeq = topSeq
-                                }
-                            }
-                            .padding(vertical = 8.dp)
-                            .clip(RoundedCornerShape(50))
-                            .background(p.accent)
-                            .padding(horizontal = 14.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(AdIcons.Up, null, tint = p.onAccent, modifier = Modifier.size(14.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("${fmt(fresh)} new", style = Type.small, color = p.onAccent)
                     }
                 }
             }
         }
     }
-    // Under Allow / Block from the Log: what changed, with Undo.
+    // Under an action from the Log: what changed, with Undo.
     androidx.compose.material3.SnackbarHost(undoBar, Modifier.align(Alignment.BottomCenter).padding(horizontal = Gutter, vertical = 12.dp)) { d ->
-        androidx.compose.material3.Snackbar(d, containerColor = p.surfaceHigh, contentColor = p.text, actionColor = p.accent, shape = RoundedCornerShape(18.dp))
+        androidx.compose.material3.Snackbar(d, containerColor = p.surfaceHigh, contentColor = p.text, actionColor = p.accent, shape = RoundedCornerShape(Corners.outer))
     }
     }
 
@@ -286,14 +279,14 @@ fun LogScreen(vm: MainViewModel) {
 
     selected?.let { r ->
         Details(
-            r.e, r.types, appName(labels, r.e.uid), vm,
+            r, appName(labels, r.e.uid), vm,
             onOnlyApp = { app = r.e.uid; selected = null },
-            onRuleAdded = { text ->
-                // Allow and Block act at once; the bar says what changed and takes it back.
+            onChanged = { text, undo ->
+                // The actions act at once; the bar says what changed and takes it back.
                 scope.launch {
                     undoBar.currentSnackbarData?.dismiss()
                     val r2 = undoBar.showSnackbar(text, actionLabel = "Undo", duration = androidx.compose.material3.SnackbarDuration.Long)
-                    if (r2 == androidx.compose.material3.SnackbarResult.ActionPerformed) vm.undoAddedRule()
+                    if (r2 == androidx.compose.material3.SnackbarResult.ActionPerformed) undo()
                 }
             },
         ) { selected = null }
@@ -303,124 +296,274 @@ fun LogScreen(vm: MainViewModel) {
 @Composable
 private fun AppFilter(name: String?, onPick: () -> Unit, onClear: () -> Unit) {
     val p = LocalPalette.current
-    // A chip like the filters beside it; filled while one app is picked.
+    val shape = RoundedCornerShape(Corners.outer)
+    // A chip like the others: "App ▾" opens the list of apps; filled with the app's name while one is picked.
     Row(
         Modifier
             .minimumInteractiveComponentSize()
-            .clip(RoundedCornerShape(50))
-            .then(if (name != null) Modifier.background(p.surfaceHigh) else Modifier.border(1.dp, p.line, RoundedCornerShape(50)))
-            .clickable(role = Role.Button, onClick = onPick)
+            .clip(shape)
+            .then(if (name != null) Modifier.background(p.surfaceHigh) else Modifier.border(1.dp, p.line, shape))
+            .clickable(role = Role.Button, onClickLabel = "Show one app", onClick = onPick)
             .heightIn(min = 36.dp)
-            .padding(start = 16.dp, end = if (name != null) 8.dp else 16.dp),
+            .padding(start = 14.dp, end = if (name != null) 6.dp else 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(name ?: "All apps", style = Type.bodyStrong.copy(fontSize = Type.heading.fontSize), color = if (name != null) p.text else p.muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp))
+        Text(name ?: "App", style = Type.bodyStrong.copy(fontSize = Type.heading.fontSize), color = if (name != null) p.text else p.muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 160.dp))
         if (name != null) {
             // A 48 dp target around the small cross, as the field's clear button.
             Icon(
                 AdIcons.Close, "Show all apps", tint = p.muted,
                 modifier = Modifier.minimumInteractiveComponentSize().clip(RoundedCornerShape(50)).clickable(role = Role.Button, onClick = onClear).padding(2.dp).size(18.dp),
             )
+        } else {
+            Icon(AdIcons.Chevron, null, tint = p.muted, modifier = Modifier.padding(start = 4.dp).size(16.dp).rotate(90f))
         }
     }
 }
 
-/** A line of the log list: a query, a stretch of lookups that failed without a network, or a pause/resume marker. */
 /**
- * A line of the Log: a minute's heading, a lookup (or a name's A, AAAA and HTTPS lookups as one
- * row), a stretch of lookups that failed without a network, or a pause/resume marker. Keys stay
- * the same as newer entries arrive above, so rows do not jump.
+ * A line of the Log: a day's divider, a row of lookups (a name's A, AAAA and HTTPS records, its
+ * repeats within a minute and the browser connection that went with it), a stretch of lookups
+ * that failed without a network, or a pause/resume marker. Keys stay the same as newer entries
+ * arrive, so rows do not jump.
  */
 internal sealed class LogLine(val key: Any) {
-    class Minute(val time: Long, key: Any) : LogLine(key)
-    /** [entries]: newest first; keyed by the oldest, which a later lookup of the name never changes. */
+    /** [day]: local epoch day. */
+    class Day(val day: Long, key: Any) : LogLine(key)
+
+    /** [entries]: newest first; keyed by the oldest, which a later entry never changes. */
     class Query(val entries: List<LogItem>) : LogLine(entries.last().seq) {
-        val e: LogItem get() = entries.first()
-        val types: String get() = entries.sortedBy { it.qtype }.map { it.typeName }.distinct().joinToString(", ")
+        /** The row's lookup or page request: its connections only fold into it. */
+        val e: LogItem = entries.firstOrNull { !it.connection } ?: entries.first()
+        val newest: LogItem get() = entries.first()
+        val oldest: LogItem get() = entries.last()
+        /** Record types, the connection last: "A, AAAA, Connection". */
+        val types: String by lazy {
+            entries.sortedWith(compareBy({ it.connection }, { it.qtype })).map { it.typeName }.distinct().joinToString(", ")
+        }
+        /** How many times it happened: a lookup of three record types counts once. */
+        val count: Int by lazy {
+            entries.filter { !it.connection }.ifEmpty { entries }.groupingBy { it.qtype }.eachCount().values.max()
+        }
     }
-    class Offline(val newest: LogItem, val oldest: LogItem, val count: Int) : LogLine(newest.seq)
+
+    /** Keyed by its oldest failure, which later ones never change. */
+    class Offline(val newest: LogItem, val oldest: LogItem, val count: Int) : LogLine(oldest.seq)
     class Marker(val e: LogItem) : LogLine(e.seq)
 }
 
-/** Blocked, answered, or neither (failed): only lookups of one kind share a row. */
-/** Rows of one kind merge; an AAAA left out by IPv4-only answers keeps a row of its own. */
-private fun kind(a: QueryAction) = if (a.blocked) 0 else if (a == QueryAction.NO_IPV6) 3 else if (a.answered) 1 else 2
-
-/** One app's lookups of one name within 2 seconds and of one kind: its A, AAAA and HTTPS records. */
-private fun sameLookup(a: LogItem, b: LogItem) =
-    a.qtype != 0 && b.qtype != 0 && !b.offline && !b.action.marker && a.name == b.name && a.uid == b.uid &&
-        kind(a.action) == kind(b.action) && kotlin.math.abs(a.time - b.time) <= 2_000
+/** A browser's connection to a host, as the page filter records it (not a lookup, not a request blocked in a page). */
+internal val LogItem.connection: Boolean get() = qtype == 0 && action != QueryAction.FILTERED
 
 /**
- * The Log as a ledger, from [shown] (newest first): a heading for each minute (again after a
- * marker), one row per lookup with a name's record types together, and consecutive no-network
- * failures as one row.
+ * Whether [e] is shown: [kind] 0 all, 1 blocked, 2 allowed (answered: a failed lookup was never
+ * allowed); [inBrowsers] only browsers' lookups and what the page filter saw; [pages] only what
+ * the page filter saw (connections and requests in pages); [app] one app; [query] part of the
+ * domain or the app's name. Pause and resume markers divide the list whatever the view, but not
+ * a search or one app's rows.
+ */
+internal fun logMatches(e: LogItem, kind: Int, inBrowsers: Boolean, pages: Boolean, app: Int?, query: String, browsers: Set<Int>, appName: (Int) -> String): Boolean {
+    val q = query.trim().lowercase()
+    if (e.action.marker) return q.isEmpty() && app == null
+    if (kind == 1 && !e.action.blocked) return false
+    if (kind == 2 && !e.action.answered) return false
+    if (pages && e.qtype != 0) return false
+    if (inBrowsers && e.qtype != 0 && e.uid !in browsers) return false
+    if (app != null && e.uid != app) return false
+    return q.isEmpty() || e.name.contains(q) || appName(e.uid).lowercase().contains(q)
+}
+
+/** Blocked, answered, or neither (failed): only entries of one kind share a row; an AAAA left out by IPv4-only answers keeps a row of its own. */
+private fun kind(a: QueryAction) = if (a.blocked) 0 else if (a == QueryAction.NO_IPV6) 3 else if (a.answered) 1 else 2
+
+/** One row's entries: the same name, app and outcome; for a page request, the same page too. */
+private fun rowKey(e: LogItem): String = when {
+    e.action == QueryAction.FILTERED -> "p|${e.name}|${e.uid}|${e.page}"
+    e.connection -> "c|${e.name}|${e.uid}|${kind(e.action)}"
+    else -> "d|${e.name}|${e.uid}|${kind(e.action)}"
+}
+
+/**
+ * Whether connection [c] belongs with the row of [row]: an allowed connection with the name's
+ * answered lookup or a page request on it, a refused one with the name's blocked lookup. A
+ * connection with another outcome than its lookup (answered, then refused) is news: a row of its own.
+ */
+private fun fits(row: LogItem, c: LogItem): Boolean = when {
+    c.action.blocked -> row.action != QueryAction.FILTERED && !row.connection && row.action.blocked
+    c.action.answered -> row.action == QueryAction.FILTERED || (!row.connection && kind(row.action) == 1)
+    else -> false
+}
+
+/** A row's repeats are counted from its first entry for a minute; its connections within a few seconds of it. */
+private const val REPEAT_MS = 60_000L
+private const val CONNECTION_MS = 5_000L
+
+private class Group(first: LogItem, var key: String) {
+    val items = arrayListOf(first)
+    val start = first.time
+    var main: LogItem? = first.takeIf { !it.connection }
+    val last: LogItem get() = items.last()
+
+    fun add(e: LogItem) {
+        items += e
+        if (!e.connection) main = e
+    }
+}
+
+/**
+ * The Log as a ledger, from [shown] (newest first): rows as [LogLine.Query] says, newest activity
+ * first, a day's divider wherever the day changes (again after a marker). Built from the oldest
+ * entry on, so a row's members and its key never change as newer entries arrive.
  */
 internal fun ledgerOf(shown: List<LogItem>): List<LogLine> {
-    val out = ArrayList<LogLine>(shown.size + 16)
-    // The rows of the minute being read (epoch minutes: zone offsets are whole minutes, so they are local minutes too).
-    var section = ArrayList<LogLine>()
-    var minute = Long.MIN_VALUE
-    fun close() {
-        if (section.isEmpty()) return
-        // Keyed by the oldest row under it, which newer entries of its minute never change.
-        out += LogLine.Minute(minute * 60_000L, "m${section.last().key}")
-        out += section
-        section = ArrayList()
-    }
-    var i = 0
-    while (i < shown.size) {
+    val units = ArrayList<Any>(shown.size)
+    val open = HashMap<String, Group>()
+    // The latest row of a name and app, for the connections that go with it.
+    val latest = HashMap<String, Group>()
+    var offline: ArrayList<LogItem>? = null
+    for (i in shown.indices.reversed()) {
         val e = shown[i]
         if (e.action.marker) {
-            close()
-            out += LogLine.Marker(e)
-            minute = Long.MIN_VALUE
-            i++
+            open.clear()
+            latest.clear()
+            offline = null
+            units += e
             continue
         }
-        val m = Math.floorDiv(e.time, 60_000L)
-        if (m != minute) {
-            close()
-            minute = m
-        }
-        var j = i
         if (e.offline) {
-            while (j + 1 < shown.size && shown[j + 1].offline) j++
-        } else {
-            while (j + 1 < shown.size && sameLookup(e, shown[j + 1])) j++
+            val stretch = offline ?: ArrayList<LogItem>().also { offline = it; units.add(it) }
+            stretch += e
+            continue
         }
-        section += if (e.offline) LogLine.Offline(e, shown[j], j - i + 1) else LogLine.Query(shown.subList(i, j + 1).toList())
-        i = j + 1
+        offline = null
+        val who = "${e.name}|${e.uid}"
+        val prev = latest[who]?.takeIf { e.time - it.last.time <= CONNECTION_MS }
+        if (e.connection) {
+            val main = prev?.main
+            if (prev != null && main != null && fits(main, e)) {
+                prev.add(e)
+                continue
+            }
+        }
+        val key = rowKey(e)
+        var g = open[key]?.takeIf { e.time - it.start <= REPEAT_MS }
+        if (g == null && !e.connection && prev != null && prev.main == null && fits(e, prev.items.first())) {
+            // The connection came first (a page's own, then a request in it blocked): it joins this row.
+            open.remove(prev.key)
+            prev.key = key
+            g = prev
+        }
+        if (g == null) {
+            g = Group(e, key)
+            units += g
+        } else {
+            g.add(e)
+        }
+        open[key] = g
+        latest[who] = g
     }
-    close()
+    val lines = units.map { u ->
+        @Suppress("UNCHECKED_CAST")
+        when (u) {
+            is Group -> LogLine.Query(u.items.asReversed().toList())
+            is LogItem -> LogLine.Marker(u)
+            else -> (u as ArrayList<LogItem>).let { LogLine.Offline(it.last(), it.first(), it.size) }
+        }
+    }.sortedByDescending { newestSeq(it) }
+
+    val out = ArrayList<LogLine>(lines.size + 8)
+    val keys = HashSet<Any>()
+    var day = Long.MIN_VALUE
+    var marker: Long? = null
+    for (l in lines) {
+        if (l is LogLine.Marker) {
+            out += l
+            day = Long.MIN_VALUE
+            marker = l.e.seq
+            continue
+        }
+        val d = localDay(newestTime(l))
+        if (d != day) {
+            // A clock set back can bring a day round again: its divider then takes the row's key.
+            val base = if (marker == null) "d$d" else "d$d-$marker"
+            out += LogLine.Day(d, if (keys.add(base)) base else "$base-${l.key}".also { keys += it })
+            day = d
+        }
+        out += l
+    }
     return out
 }
 
-/** Each row's place in its run between two headings or markers: [index] within the run, and the run's [count]. */
-internal class Runs(val index: IntArray, val count: IntArray)
+private fun newestSeq(l: LogLine): Long = when (l) {
+    is LogLine.Query -> l.newest.seq
+    is LogLine.Offline -> l.newest.seq
+    is LogLine.Marker -> l.e.seq
+    is LogLine.Day -> Long.MIN_VALUE
+}
 
-internal fun runsOf(rows: List<LogLine>): Runs {
-    val index = IntArray(rows.size)
-    val count = IntArray(rows.size)
-    var start = 0
-    for (i in 0..rows.size) {
-        if (i == rows.size || rows[i] is LogLine.Marker || rows[i] is LogLine.Minute) {
-            for (j in start until i) {
-                index[j] = j - start
-                count[j] = i - start
-            }
-            start = i + 1
-        }
+private fun newestTime(l: LogLine): Long = when (l) {
+    is LogLine.Query -> l.newest.time
+    is LogLine.Offline -> l.newest.time
+    is LogLine.Marker -> l.e.time
+    is LogLine.Day -> 0
+}
+
+/** The newest entry's sequence in [rows]. */
+internal fun topSeqOf(rows: List<LogLine>): Long = rows.firstOrNull { it !is LogLine.Day }?.let { newestSeq(it) } ?: 0L
+
+/** Rows with an entry newer than [seenSeq]: a lookup of three record types is one new row. */
+internal fun freshRows(rows: List<LogLine>, seenSeq: Long): Int =
+    rows.count { (it is LogLine.Query || it is LogLine.Offline) && newestSeq(it) > seenSeq }
+
+internal fun localDay(ms: Long): Long = Math.floorDiv(ms + java.util.TimeZone.getDefault().getOffset(ms), 86_400_000L)
+
+/** A day divider's words: "Today", "Yesterday", or the date ("27 Sep", with the year when it is another). */
+internal fun dayLabel(day: Long, today: Long): String = when (day) {
+    today -> "Today"
+    today - 1 -> "Yesterday"
+    else -> {
+        val d = java.time.LocalDate.ofEpochDay(day)
+        d.format(if (d.year == java.time.LocalDate.ofEpochDay(today).year) dayFormat else yearFormat)
     }
-    return Runs(index, count)
+}
+
+private val dayFormat = java.time.format.DateTimeFormatter.ofPattern("d MMM", java.util.Locale.US)
+private val yearFormat = java.time.format.DateTimeFormatter.ofPattern("d MMM yyyy", java.util.Locale.US)
+
+/** A list's name for its id as the engines record it ("hagezi-pro" → "HaGeZi Pro"); "user" is My rules. */
+internal fun listLabel(id: String, s: app.aduster.settings.Settings): String = when (id) {
+    "user" -> "My rules"
+    else -> app.aduster.filters.FilterCatalog.all(s).firstOrNull { it.id == id }?.name ?: app.aduster.filters.FilterCatalog.byIdAny(id)?.name ?: id
+}
+
+/** What happened, in a word at the row's right; nothing for a plain answer. */
+internal fun statusWord(r: LogLine.Query): String = when (r.e.action) {
+    QueryAction.BLOCKED, QueryAction.BLOCKED_CNAME -> "Blocked"
+    QueryAction.FILTERED -> "Page"
+    QueryAction.FAILED -> "Failed"
+    QueryAction.CACHE, QueryAction.STALE -> "Cached"
+    QueryAction.NO_IPV6 -> "No IPv6"
+    QueryAction.UNKNOWN -> "Other"
+    else -> ""
+}
+
+/** A row's second line: the app, with the page a request was blocked on ("Chrome on news.test") or the list that blocked the name ("Chrome, HaGeZi Multi PRO"). */
+internal fun secondLine(r: LogLine.Query, app: String, listName: (String) -> String = { it }): String {
+    val e = r.e
+    return when {
+        e.action == QueryAction.FILTERED -> e.page?.takeIf { it != e.name }?.let { "$app on $it" } ?: app
+        // "?" is what a refused connection carries when the rule's list is not known.
+        e.action.blocked -> e.list?.takeIf { it.isNotBlank() && it != "?" }?.let { "$app, ${listName(it)}" } ?: app
+        else -> app
+    }
 }
 
 @Composable
-private fun OfflineRow(r: LogLine.Offline) {
+private fun OfflineRow(r: LogLine.Offline, modifier: Modifier) {
     val p = LocalPalette.current
-    Column(Modifier.fillMaxWidth().padding(start = 4.dp + MarkInset, end = 16.dp, top = 12.dp, bottom = 12.dp)) {
-        Text("No network · ${fmt(r.count)} lookup${if (r.count == 1) "" else "s"} failed", style = Type.bodyStrong, color = p.muted)
-        Text(if (r.count == 1) clock(r.newest.time) else "${clock(r.oldest.time)} – ${clock(r.newest.time)}", style = Type.small, color = p.muted)
+    Column(modifier.fillMaxWidth().padding(start = Gutter + IconColumn, end = Gutter, top = 10.dp, bottom = 10.dp)) {
+        Text("No network: ${counted(r.count, "lookup", "lookups")} failed", style = Type.bodyStrong, color = p.muted)
+        Text(if (r.count == 1) clock(r.newest.time) else "${clock(r.oldest.time)} – ${clock(r.newest.time)}", style = Type.time, color = p.muted)
     }
 }
 
@@ -436,7 +579,7 @@ private fun MarkerRow(e: LogItem, modifier: Modifier) {
     Row(modifier.fillMaxWidth().padding(horizontal = Gutter, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.weight(1f).height(1.dp).background(if (paused) p.warn else p.line))
         Text(
-            "$what · ${clock(e.time)}",
+            "$what at ${clock(e.time)}",
             style = Type.small, color = if (paused) p.warn else p.muted,
             modifier = Modifier.padding(horizontal = 10.dp),
         )
@@ -449,68 +592,65 @@ private fun copy(ctx: Context, text: String) {
     Toast.makeText(ctx, "Copied $text", Toast.LENGTH_SHORT).show()
 }
 
-/** Where a row's text starts inside its card: the blocked mark, then the seconds column. */
-private val MarkInset = 10.dp
+/** The app icon's column: 24 dp and the space after it; texts and hairlines start after it. */
+private val IconColumn: Dp = 36.dp
 
-/** A minute's heading on the page colour, lined up with the rows' seconds; a past day adds its date. */
+/** A day's divider on the page colour, lined up with the rows' text. */
 @Composable
-private fun MinuteHeading(time: Long) {
+private fun DayHeading(label: String) {
     val p = LocalPalette.current
-    val today = Math.floorDiv(System.currentTimeMillis() + java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()), 86_400_000L)
-    val day = Math.floorDiv(time + java.util.TimeZone.getDefault().getOffset(time), 86_400_000L)
     Text(
-        if (day == today) hm(time) else "${dayFormat.format(java.time.Instant.ofEpochMilli(time).atZone(java.time.ZoneId.systemDefault()))} ${hm(time)}",
-        style = Type.mono,
-        color = p.muted,
+        label,
+        style = Type.heading,
+        color = p.text2,
         modifier = Modifier
             .fillMaxWidth()
             .background(p.bg)
-            .padding(start = Gutter + MarkInset + 4.dp, top = 14.dp, bottom = 6.dp)
+            .padding(start = Gutter, top = 14.dp, bottom = 6.dp)
             .semantics { heading() },
     )
 }
 
-private val dayFormat = java.time.format.DateTimeFormatter.ofPattern("d MMM", java.util.Locale.US)
-
 /**
- * One lookup as a ledger line: its second of the minute, the name, and the app with the record
- * types. A blocked line has a short bar in the accent at its start and the name in full
- * contrast; an allowed one has no bar and its name in the quieter grey (TalkBack says which).
+ * One row of the ledger, flat on the page: the app's icon, the domain (and how many times), the
+ * app with the page or list; the time and a word for what happened at the right. A blocked row
+ * has a bar in the blocked colour at its start and a faint wash of it; a hairline under each row.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun LogRow(r: LogLine.Query, app: String, icon: ImageBitmap?, onLongClick: () -> Unit, onClick: () -> Unit) {
+private fun LogRow(r: LogLine.Query, app: String, icon: ImageBitmap?, modifier: Modifier, listName: (String) -> String, onLongClick: () -> Unit, onClick: () -> Unit) {
     val p = LocalPalette.current
     val e = r.e
     val blocked = e.action.blocked
+    val word = statusWord(r)
     Row(
-        Modifier
+        modifier
             .fillMaxWidth()
-            .height(IntrinsicSize.Min)
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "Copy the domain")
-            .semantics { stateDescription = e.action.label }
-            .padding(start = 4.dp, end = 16.dp),
-    ) {
-        Box(
-            Modifier
-                .padding(vertical = 14.dp)
-                .width(2.dp)
-                .fillMaxHeight()
-                .clip(RoundedCornerShape(1.dp))
-                .background(if (blocked) p.accent else Color.Transparent),
-        )
-        Spacer(Modifier.width(MarkInset - 2.dp))
-        Text(":%02d".format(java.util.Locale.US, (e.time / 1000) % 60), style = Type.mono, color = p.muted, modifier = Modifier.padding(top = 13.dp))
-        Spacer(Modifier.width(10.dp))
-        Column(Modifier.weight(1f).padding(vertical = 12.dp)) {
-            Text(e.name, style = Type.monoBody, color = if (blocked) p.text else p.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Spacer(Modifier.height(2.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                AppIcon(icon, Modifier.size(16.dp))
-                Spacer(Modifier.width(6.dp))
-                val on = e.page?.takeIf { it != e.name }?.let { " · on $it" }.orEmpty()
-                Text("$app · ${r.types}$on", style = Type.small, color = p.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            .background(if (blocked) p.blockedTint() else Color.Transparent)
+            .drawBehind {
+                if (blocked) drawRect(p.blocked, size = Size(3.dp.toPx(), size.height))
+                val x = (Gutter + IconColumn).toPx()
+                drawRect(p.line, topLeft = Offset(x, size.height - 1f), size = Size(size.width - x, 1f))
             }
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick, onLongClickLabel = "Copy the domain")
+            .semantics { stateDescription = if (r.count > 1) "${e.action.label}, ${r.count} times" else e.action.label }
+            .heightIn(min = 52.dp)
+            .padding(start = Gutter, end = Gutter, top = 7.dp, bottom = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AppIcon(icon, Modifier.size(24.dp))
+        Spacer(Modifier.width(IconColumn - 24.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(e.name, style = Type.domain, color = if (blocked) p.text else p.text2, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                if (r.count > 1) Text("×${fmt(r.count)}", style = Type.time, color = p.muted, maxLines = 1, modifier = Modifier.padding(start = 6.dp))
+            }
+            Text(secondLine(r, app, listName), style = Type.small, color = p.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            Text(clock(r.newest.time), style = Type.time, color = p.muted, maxLines = 1)
+            if (word.isNotEmpty()) Text(word, style = Type.small, color = if (blocked) p.blocked else p.muted, maxLines = 1)
         }
     }
 }
@@ -529,44 +669,46 @@ private fun Empty(title: String, detail: String? = null) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onRuleAdded: (String) -> Unit, onDismiss: () -> Unit) {
+private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onChanged: (String, () -> Unit) -> Unit, onDismiss: () -> Unit) {
     val p = LocalPalette.current
     val ctx = LocalContext.current
     val view = LocalView.current
+    val e = r.e
+    fun rule(text: String, said: String) {
+        Haptics.confirm(view)
+        vm.addUserRule(text)
+        onChanged(said) { vm.undoAddedRule() }
+        onDismiss()
+    }
+    val s by vm.settings.collectAsStateWithLifecycle()
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = p.surface, dragHandle = null) {
         Column(Modifier.padding(horizontal = Gutter).padding(top = 24.dp, bottom = 16.dp).navigationBarsPadding()) {
-            Text(e.action.label, style = Type.heading, color = if (e.action.blocked) p.accent else p.muted)
+            Text(e.action.label, style = Type.heading, color = if (e.action.blocked) p.blocked else p.muted)
             Spacer(Modifier.height(8.dp))
-            Text(e.name, style = Type.title.copy(fontFamily = GoogleSansCode, fontSize = Type.title.fontSize * 0.8f), color = p.text)
+            Text(e.name, style = Type.title.copy(fontSize = Type.title.fontSize * 0.8f), color = p.text)
             Spacer(Modifier.height(16.dp))
             Field("App", app)
-            Field("Time", clock(e.time))
-            Field("Type", types)
+            Field("Time", if (r.count > 1) "${clock(r.newest.time)}, ${r.count} times since ${clock(r.oldest.time)}" else clock(r.newest.time))
+            Field("Type", r.types)
             // A request inside a page: where it was made and what it asked for, apart from the rule.
             e.page?.let { Field("On page", it) }
             e.path?.let { Field("Request", it, mono = true) }
             if (e.micros > 0) Field("Answered in", micros(e.micros))
             e.rule?.let { Field("Rule", it, mono = true) }
-            e.list?.let { Field("From", it) }
+            e.list?.takeIf { it != "?" }?.let { Field("From", listLabel(it, s)) }
             Spacer(Modifier.height(20.dp))
             val page = e.page
             if (e.action == QueryAction.FILTERED && page != null) {
                 // Allowing a page request must not unfilter a whole site. The first action
                 // allows this host only on pages of that site (a page rule); the second is
                 // the plain "everywhere" rule, explained.
-                PillButton("Allow ${e.name} on $page", Modifier.fillMaxWidth(), filled = true) {
-                    Haptics.confirm(view)
-                    vm.addUserRule("@@||${e.name}^\$domain=$page")
-                    onRuleAdded("${e.name} allowed on $page")
-                    onDismiss()
+                PillButton("Allow on $page", Modifier.fillMaxWidth(), filled = true) {
+                    rule("@@||${e.name}^\$domain=$page", "${e.name} allowed on $page")
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     PillButton("Allow everywhere", Modifier.weight(1f)) {
-                        Haptics.confirm(view)
-                        vm.addUserRule("@@||${e.name}^")
-                        onRuleAdded("${e.name} allowed everywhere; its pages are no longer filtered")
-                        onDismiss()
+                        rule("@@||${e.name}^", "${e.name} allowed everywhere; its pages are no longer filtered")
                     }
                     PillButton("Copy") {
                         copy(ctx, e.name)
@@ -577,28 +719,39 @@ private fun Details(e: LogItem, types: String, app: String, vm: MainViewModel, o
                 if (e.action.blocked) {
                     // One user rule, @@||name^: the domain is allowed everywhere, for every app
                     // and in every page (and pages on it are no longer filtered).
-                    PillButton("Allow this domain", Modifier.weight(1f), filled = true) {
-                        Haptics.confirm(view)
-                        vm.addUserRule("@@||${e.name}^")
-                        onRuleAdded("${e.name} allowed")
-                        onDismiss()
-                    }
+                    PillButton("Allow everywhere", Modifier.weight(1f), filled = true) { rule("@@||${e.name}^", "${e.name} allowed") }
                 } else {
-                    PillButton("Block this domain", Modifier.weight(1f), filled = true) {
-                        Haptics.confirm(view)
-                        vm.addUserRule("||${e.name}^")
-                        onRuleAdded("${e.name} blocked")
-                        onDismiss()
-                    }
+                    PillButton("Block this domain", Modifier.weight(1f), filled = true) { rule("||${e.name}^", "${e.name} blocked") }
                 }
                 PillButton("Copy") {
                     copy(ctx, e.name)
                     onDismiss()
                 }
             }
-            if (e.uid >= 0) {
-                Spacer(Modifier.height(4.dp))
-                TextAction("Show only $app", color = p.muted, onClick = onOnlyApp)
+            Spacer(Modifier.height(4.dp))
+            if (e.uid >= 0) TextAction("Show only $app", color = p.muted, onClick = onOnlyApp)
+            // Leave the app out of protection altogether (Settings › Excluded apps).
+            val packages = remember(e.uid) { if (e.uid >= Process.FIRST_APPLICATION_UID) vm.packagesOf(e.uid) else emptySet() }
+            val added = packages - s.excludedApps
+            if (added.isNotEmpty()) {
+                TextAction("Exclude $app", color = p.muted) {
+                    Haptics.confirm(view)
+                    vm.update { it.copy(excludedApps = it.excludedApps + added) }
+                    onChanged("$app excluded from protection") { vm.update { it.copy(excludedApps = it.excludedApps - added) } }
+                    onDismiss()
+                }
+            }
+            // What the page filter saw: its site can be left undecrypted (Page filtering › Never decrypted).
+            val site = if (e.qtype == 0) page ?: e.name else null
+            if (site != null && !vm.userExcludes(site, s)) {
+                TextAction("Never decrypt $site", color = p.muted) {
+                    Haptics.confirm(view)
+                    vm.update { it.copy(httpsExclusions = (it.httpsExclusions.trim() + "\n" + site).trim()) }
+                    onChanged("$site is no longer decrypted") {
+                        vm.update { cur -> cur.copy(httpsExclusions = cur.httpsExclusions.lines().filterNot { it.trim() == site }.joinToString("\n").trim()) }
+                    }
+                    onDismiss()
+                }
             }
         }
     }

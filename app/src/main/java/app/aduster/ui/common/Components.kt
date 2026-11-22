@@ -31,6 +31,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -73,11 +74,11 @@ import kotlinx.coroutines.launch
 
 val Gutter = 16.dp
 
-/** Corner radii on the website's scale: standalone cards and dialogs 24, grouped rows 18 outside and 8 where they meet. */
+/** Corner radii: standalone cards and dialogs 14, grouped rows and controls 10 outside, 5 where rows meet. */
 object Corners {
-    val card = 24.dp
-    val outer = 18.dp
-    val inner = 8.dp
+    val card = 14.dp
+    val outer = 10.dp
+    val inner = 5.dp
 }
 
 /** Segment [index] of a group of [count]: round outside, tighter where segments meet; one alone is round all over. */
@@ -87,7 +88,7 @@ fun segmentShape(index: Int, count: Int): Shape {
     return RoundedCornerShape(topStart = top, topEnd = top, bottomStart = bottom, bottomEnd = bottom)
 }
 
-/** A standalone card: 24 dp corners, 20 dp padding, inside the screen gutter. */
+/** A standalone card: 14 dp corners, 20 dp padding, inside the screen gutter. */
 @Composable
 fun Card(
     modifier: Modifier = Modifier,
@@ -118,16 +119,32 @@ class GroupScope internal constructor() {
 /**
  * Rows that belong together, as one card split into segments 2 dp apart (see [segmentShape]).
  * Each [GroupScope.row] is one segment; rows added under a condition count only when present.
+ * [flat]: a read-out (Diagnostics): rows on the page itself, a hairline between them.
  */
 @Composable
-fun Group(modifier: Modifier = Modifier, content: GroupScope.() -> Unit) {
+fun Group(modifier: Modifier = Modifier, flat: Boolean = false, content: GroupScope.() -> Unit) {
     val p = LocalPalette.current
     val rows = GroupScope().apply(content).rows
+    if (flat) {
+        Column(modifier.fillMaxWidth()) {
+            rows.forEachIndexed { i, row ->
+                if (i > 0) Hairline()
+                row()
+            }
+        }
+        return
+    }
     Column(modifier.padding(horizontal = Gutter).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         rows.forEachIndexed { i, row ->
             Box(Modifier.fillMaxWidth().clip(segmentShape(i, rows.size)).background(p.surface)) { row() }
         }
     }
+}
+
+/** A 1 px line in the line colour, from the gutter to the edge (after [start] more), between flat rows. */
+@Composable
+fun Hairline(start: Dp = 0.dp) {
+    Box(Modifier.padding(start = Gutter + start).fillMaxWidth().height(Dp.Hairline).background(LocalPalette.current.line))
 }
 
 /**
@@ -153,7 +170,7 @@ fun GroupSegment(index: Int, count: Int, modifier: Modifier = Modifier, content:
     ) { content() }
 }
 
-/** One row as a standalone card (24 dp corners), as each list on Filters: no hairline, 8 dp below. */
+/** One row as a standalone card (14 dp corners), as each list on Filters: no hairline, 8 dp below. */
 @Composable
 fun RowCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
     val p = LocalPalette.current
@@ -167,8 +184,8 @@ fun RowCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
 }
 
 /**
- * Pill chips, one selected (filled), the others outlined: Filters' three views, the Log's
- * filters and the kind of list in Add a list. The row scrolls sideways when the chips do not
+ * Chips, one selected (filled), the others outlined: Filters' three views and the kind of
+ * list in Add a list. The row scrolls sideways when the chips do not
  * fit (large fonts). [inset]: the screen gutter, or none inside a dialog.
  */
 @Composable
@@ -191,9 +208,9 @@ fun ChipTabs(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modi
                 modifier = Modifier
                     // A 48 dp touch target around the 36 dp chip.
                     .minimumInteractiveComponentSize()
-                    .clip(CircleShape)
+                    .clip(RoundedCornerShape(Corners.outer))
                     .background(fill)
-                    .then(if (on) Modifier else Modifier.border(1.dp, p.line, CircleShape))
+                    .then(if (on) Modifier else Modifier.border(1.dp, p.line, RoundedCornerShape(Corners.outer)))
                     .selectable(selected = on, role = Role.Tab) { onSelect(i) }
                     .heightIn(min = 36.dp)
                     .padding(horizontal = 16.dp, vertical = 8.dp),
@@ -201,6 +218,60 @@ fun ChipTabs(options: List<String>, selected: Int, onSelect: (Int) -> Unit, modi
         }
         trailing()
     }
+}
+
+/**
+ * One choice of a few, as one control with its segments side by side (the Log's All / Blocked /
+ * Allowed): the chosen segment filled, the control outlined.
+ */
+@Composable
+fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+    val p = LocalPalette.current
+    val shape = RoundedCornerShape(Corners.outer)
+    Row(
+        Modifier.minimumInteractiveComponentSize().clip(shape).border(1.dp, p.line, shape).selectableGroup(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        options.forEachIndexed { i, o ->
+            val on = i == selected
+            val fill by animateColorAsState(if (on) p.surfaceHigh else Color.Transparent, tween(Motion.MEDIUM), label = "segment fill")
+            val ink by animateColorAsState(if (on) p.text else p.muted, tween(Motion.MEDIUM), label = "segment ink")
+            Text(
+                o,
+                style = Type.bodyStrong.copy(fontSize = Type.heading.fontSize),
+                color = ink,
+                maxLines = 1,
+                modifier = Modifier
+                    .background(fill)
+                    .selectable(selected = on, role = Role.Tab) { onSelect(i) }
+                    .heightIn(min = 36.dp)
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+            )
+        }
+    }
+}
+
+/** A chip that narrows a list and combines with the others: filled while on. */
+@Composable
+fun FilterChip(text: String, on: Boolean, onToggle: (Boolean) -> Unit) {
+    val p = LocalPalette.current
+    val shape = RoundedCornerShape(Corners.outer)
+    val fill by animateColorAsState(if (on) p.surfaceHigh else Color.Transparent, tween(Motion.MEDIUM), label = "chip fill")
+    val ink by animateColorAsState(if (on) p.text else p.muted, tween(Motion.MEDIUM), label = "chip ink")
+    Text(
+        text,
+        style = Type.bodyStrong.copy(fontSize = Type.heading.fontSize),
+        color = ink,
+        maxLines = 1,
+        modifier = Modifier
+            .minimumInteractiveComponentSize()
+            .clip(shape)
+            .background(fill)
+            .then(if (on) Modifier else Modifier.border(1.dp, p.line, shape))
+            .toggleable(value = on, role = Role.Checkbox, onValueChange = onToggle)
+            .heightIn(min = 36.dp)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+    )
 }
 
 /** A row's icon in a quiet circle, in the accent (or muted while the row is unavailable). */
@@ -225,13 +296,15 @@ fun ScreenTitle(text: String, modifier: Modifier = Modifier, trailing: @Composab
 
 /** A group's heading, in sentence case, lined up with the text of the group's rows. */
 @Composable
-fun SectionHeading(text: String, modifier: Modifier = Modifier) {
+fun SectionHeading(text: String, modifier: Modifier = Modifier, flat: Boolean = false) {
+    // Over a flat group the rows' text starts at the gutter, inside a card one gutter further.
+    val inset = if (flat) Gutter else Gutter + 16.dp
     Text(
         text,
         style = Type.heading,
         color = LocalPalette.current.text2,
         modifier = modifier
-            .padding(start = Gutter + 16.dp, end = Gutter + 16.dp, top = 22.dp, bottom = 8.dp)
+            .padding(start = inset, end = inset, top = 22.dp, bottom = if (flat) 4.dp else 8.dp)
             .semantics { heading() },
     )
 }
