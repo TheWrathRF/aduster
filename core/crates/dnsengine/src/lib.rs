@@ -192,6 +192,11 @@ pub struct Shared {
     /// The current pause's "Resumed" marker is in the log (put there by the first record after
     /// a timed pause ran out, or by the config that ended it).
     resume_logged: AtomicBool,
+    /// Serializes stats writes and holds the highest snapshot number written to disk, so a
+    /// synchronous `persist_stats` waits for any write in flight even when nothing new is dirty.
+    stats_writing: Arc<Mutex<u64>>,
+    /// Highest stats snapshot number taken; ahead of `stats_writing` while an async write is queued.
+    stats_seq: AtomicU64,
 }
 
 /// One stretch without a usable network, recorded as a single event.
@@ -248,6 +253,8 @@ impl Shared {
             lookups: Mutex::new(std::collections::HashMap::new()),
             log_seen: Mutex::new(LruCache::new(NonZeroUsize::new(512).unwrap())),
             resume_logged: AtomicBool::new(false),
+            stats_writing: Arc::new(Mutex::new(0)),
+            stats_seq: AtomicU64::new(0),
             config: ArcSwap::from_pointee(config),
         })
     }
@@ -757,12 +764,13 @@ impl Shared {
     /// Writes stats without holding up the caller: inside a runtime (the proxy's workers, the
     /// DNS thread) the file write goes to its blocking pool.
     fn persist_stats_soon(&self) {
-        let Some((path, bytes, seq)) = self.stats_snapshot() else { return };
+        let Some((path, bytes, seq)) = self.stats_snapshot(false) else { return };
+        let writing = self.stats_writing.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
-                h.spawn_blocking(move || write_atomic(&path, &bytes, seq));
+                h.spawn_blocking(move || write_atomic(&writing, &path, &bytes, seq));
             }
-            Err(_) => write_atomic(&path, &bytes, seq),
+            Err(_) => write_atomic(&writing, &path, &bytes, seq),
         }
     }
 
@@ -776,10 +784,15 @@ impl Shared {
         true
     }
 
-    /// Writes stats atomically (temp file + rename).
+    /// Writes stats atomically (temp file + rename), waiting for any write already in flight even
+    /// when nothing new is dirty.
     pub fn persist_stats(&self) {
-        if let Some((path, bytes, seq)) = self.stats_snapshot() {
-            write_atomic(&path, &bytes, seq);
+        let mut last = self.stats_writing.lock();
+        // If an asynchronous snapshot cleared `dirty` before reaching disk, write current stats now
+        // so `onDestroy` never returns with those counts only in memory.
+        let pending = *last < self.stats_seq.load(Ordering::Acquire);
+        if let Some((path, bytes, seq)) = self.stats_snapshot(pending) {
+            write_atomic_locked(&mut last, &path, &bytes, seq);
         }
     }
 
@@ -790,18 +803,17 @@ impl Shared {
         self.upstream.load().close_idle();
     }
 
-    /// The stats file's path and contents, if there is anything new to write, with the
-    /// snapshot's number (see [`write_atomic`]).
-    fn stats_snapshot(&self) -> Option<(String, Vec<u8>, u64)> {
-        static SEQ: AtomicU64 = AtomicU64::new(1);
+    /// The stats file's path and contents, if there is anything new to write (or `force`), with
+    /// the snapshot's number (see [`write_atomic`]).
+    fn stats_snapshot(&self, force: bool) -> Option<(String, Vec<u8>, u64)> {
         let cfg = self.config.load();
         let path = cfg.stats_path.clone()?;
         let mut s = self.stats.lock();
-        if !s.dirty {
+        if !s.dirty && !force {
             return None;
         }
         s.dirty = false;
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let seq = self.stats_seq.fetch_add(1, Ordering::AcqRel) + 1;
         serde_json::to_vec(&*s).ok().map(|b| (path, b, seq))
     }
 
@@ -940,9 +952,32 @@ fn private_reverse_zone(name: &str) -> bool {
     false
 }
 
+/// Removes stale `<stats>.<n>.tmp` files left if the process was killed before a rename.
+fn remove_stale_temps(path: &str) {
+    let p = std::path::Path::new(path);
+    let Some(base) = p.file_name().and_then(|n| n.to_str()) else { return };
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    let prefix = format!("{base}.");
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(mid) = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".tmp"))
+            && !mid.is_empty()
+            && mid.bytes().all(|b| b.is_ascii_digit())
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// The stats in `path`. A file that does not parse is kept as `.bad` rather than silently
 /// overwritten later, which would lose 30 days of history with no trace.
 fn load_stats(path: &str) -> stats::Stats {
+    remove_stale_temps(path);
     let Ok(b) = std::fs::read(path) else { return stats::Stats::default() };
     match serde_json::from_slice::<stats::Stats>(&b) {
         Ok(s) => s,
@@ -958,14 +993,16 @@ fn load_stats(path: &str) -> stats::Stats {
 /// temp name (with a shared one, the DNS thread and a proxy worker could interleave in it and
 /// leave a corrupt file).
 /// `seq`: the snapshot's number; an older snapshot arriving late is not written over a newer one.
-fn write_atomic(path: &str, bytes: &[u8], seq: u64) {
-    static WRITING: Mutex<u64> = Mutex::new(0);
+fn write_atomic(writing: &Mutex<u64>, path: &str, bytes: &[u8], seq: u64) {
+    let mut last = writing.lock();
+    write_atomic_locked(&mut last, path, bytes, seq);
+}
+
+fn write_atomic_locked(last: &mut u64, path: &str, bytes: &[u8], seq: u64) {
     static N: AtomicU64 = AtomicU64::new(0);
-    let mut last = WRITING.lock();
     if seq != 0 && seq <= *last {
         return;
     }
-    *last = seq;
     let tmp = format!("{path}.{}.tmp", N.fetch_add(1, Ordering::Relaxed));
     // On disk before the rename: a power cut right after it must not leave an empty file in
     // place of the history. A write that fails half-way (a full disk) leaves no temp file.
@@ -977,7 +1014,9 @@ fn write_atomic(path: &str, bytes: &[u8], seq: u64) {
         drop(f);
         std::fs::rename(&tmp, path)
     })();
-    if written.is_err() {
+    if written.is_ok() {
+        *last = seq;
+    } else {
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -1370,5 +1409,107 @@ mod tests {
         assert_eq!(r["queries"], 3);
         assert!(r["latency"]["upstream_p50_us"].as_u64().unwrap() >= 4096, "{}", r["latency"]);
         assert_eq!(r["latency"]["local_p50_us"], 0);
+    }
+
+    /// `persist_stats` waits for a write already in flight on another thread even when nothing new
+    /// is dirty, and loading stats cleans up stale `<stats>.<n>.tmp` files left by an earlier kill.
+    #[test]
+    fn persist_stats_waits_for_in_flight_write_and_cleans_stale_tmps() {
+        let dir = std::env::temp_dir().join(format!("aduster-stats-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.json").to_string_lossy().to_string();
+
+        // Repeat a few times so a concurrent `persist_stats` sees `dirty == false` while thread 1
+        // is writing/syncing/renaming.
+        for round in 0..5 {
+            let p = dir.join(format!("stats-{round}.json")).to_string_lossy().to_string();
+            let s = Shared::new(Config { stats_path: Some(p.clone()), ..Config::default() });
+            for i in 0..500 {
+                s.record(&format!("host-{i}.example.test"), 1, 1000, Action::Blocked, None, 10);
+            }
+            let s1 = s.clone();
+            let t1 = std::thread::spawn(move || s1.persist_stats());
+            // Wait until thread 1 has taken the snapshot (cleared `dirty`) and is writing.
+            while s.stats.lock().dirty {
+                std::hint::spin_loop();
+            }
+            // Must not return until thread 1's write + rename is complete on disk.
+            s.persist_stats();
+            let raw = std::fs::read(&p).expect("stats file must be complete when persist_stats returns");
+            let parsed: stats::Stats = serde_json::from_slice(&raw).expect("stats file must parse");
+            assert_eq!(parsed.queries, 500);
+            t1.join().unwrap();
+        }
+
+        // Deterministic check: while thread 1 holds the write lock mid-write (with `dirty` already
+        // cleared), `persist_stats` on thread 2 stays blocked until thread 1 finishes and renames.
+        {
+            let p = dir.join("stats-barrier.json").to_string_lossy().to_string();
+            let s = Shared::new(Config { stats_path: Some(p.clone()), ..Config::default() });
+            s.record("blocked.example.test", 1, 1000, Action::Blocked, None, 10);
+            let (snap_path, snap_bytes, snap_seq) = s.stats_snapshot(false).unwrap();
+            let held = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let writing = s.stats_writing.clone();
+            let (held1, release1) = (held.clone(), release.clone());
+            let t1 = std::thread::spawn(move || {
+                let mut last = writing.lock();
+                held1.wait();
+                release1.wait();
+                write_atomic_locked(&mut last, &snap_path, &snap_bytes, snap_seq);
+            });
+            held.wait();
+            let (s2, done2) = (s.clone(), done.clone());
+            let t2 = std::thread::spawn(move || {
+                s2.persist_stats();
+                done2.store(true, Ordering::Release);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert!(!done.load(Ordering::Acquire), "persist_stats must wait for the write in flight");
+            release.wait();
+            t2.join().unwrap();
+            let raw = std::fs::read(&p).expect("file must exist once persist_stats returns");
+            let parsed: stats::Stats = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(parsed.queries, 1);
+            t1.join().unwrap();
+        }
+
+        // Pre-lock gap: an async snapshot cleared `dirty` but has not taken the write lock yet;
+        // `persist_stats` writes current stats itself and the delayed snapshot does not overwrite.
+        {
+            let p = dir.join("stats-gap.json").to_string_lossy().to_string();
+            let s = Shared::new(Config { stats_path: Some(p.clone()), ..Config::default() });
+            s.record("first.example.test", 1, 1000, Action::Blocked, None, 10);
+            let (old_path, old_bytes, old_seq) = s.stats_snapshot(false).unwrap();
+            s.persist_stats();
+            let parsed: stats::Stats = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(parsed.queries, 1);
+            s.record("second.example.test", 1, 1000, Action::Blocked, None, 10);
+            s.persist_stats();
+            // Delayed async write with `old_seq` arrives late and must be ignored.
+            write_atomic(&s.stats_writing, &old_path, &old_bytes, old_seq);
+            let parsed: stats::Stats = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(parsed.queries, 2);
+        }
+
+        // Stale `<stats>.<n>.tmp` files are removed when stats load; unrelated files stay.
+        let stale0 = dir.join("stats.json.0.tmp");
+        let stale42 = dir.join("stats.json.42.tmp");
+        let other = dir.join("other.tmp");
+        let non_numeric = dir.join("stats.json.keep.tmp");
+        let bad = dir.join("stats.json.bad");
+        for f in [&stale0, &stale42, &other, &non_numeric, &bad] {
+            std::fs::write(f, b"leftover").unwrap();
+        }
+        let _ = Shared::new(Config { stats_path: Some(path.clone()), ..Config::default() });
+        assert!(!stale0.exists(), "stale stats.json.0.tmp must be removed");
+        assert!(!stale42.exists(), "stale stats.json.42.tmp must be removed");
+        assert!(other.exists(), "unrelated .tmp file must stay");
+        assert!(non_numeric.exists(), "non-numeric .tmp file must stay");
+        assert!(bad.exists(), ".bad file must stay");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
