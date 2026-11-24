@@ -24,8 +24,11 @@ use tokio::sync::Notify;
 const MAX_PAYLOAD: usize = 8900;
 /// How long the log waits for an app's UID (a binder call, run on the blocking pool so that
 /// queries never queue behind it on the DNS thread) before it records the query without one.
-/// The answer itself never waits for it.
+/// An upstream answer never waits for it; a local one waits [`LOCAL_UID_WAIT`] at most.
 const UID_WAIT: Duration = Duration::from_millis(500);
+/// How long a local answer (a block, the cache) waits for its app's UID: the lookup needs the
+/// app's socket, which the app closes once answered. Only while the log names apps.
+const LOCAL_UID_WAIT: Duration = Duration::from_millis(5);
 /// At most this many distinct names asked upstream at once; beyond, SERVFAIL at once (a
 /// burst of unique names would hold a socket each, from the budget every browser connection shares).
 const MAX_INFLIGHT: usize = 512;
@@ -227,8 +230,11 @@ fn reply<W: TunWrite>(ctx: &Ctx<W>, client: SocketAddr, resolver: SocketAddr, pa
     write_tun(ctx, &out);
 }
 
-/// Answers now; the log records it once the app's UID is known (at most [`UID_WAIT`]), without
-/// holding up the loop.
+/// Answers a query from here (a block, the cache, a failure). Without an app lookup, at once.
+/// With one, the answer waits for it at most [`LOCAL_UID_WAIT`], on its own task so the loop
+/// goes on: the app closes its socket once answered, and Android names a socket's app only while
+/// it is open, so an answer sent first left most cached and blocked lookups as "Unknown" in the
+/// log. A slower lookup is not waited for; the log then takes its UID within [`UID_WAIT`].
 #[allow(clippy::too_many_arguments)]
 fn answer<W: TunWrite + 'static>(
     ctx: &Rc<Ctx<W>>,
@@ -240,18 +246,26 @@ fn answer<W: TunWrite + 'static>(
     why: Option<(String, String)>,
     t0: Instant,
 ) {
-    reply(ctx, u.src, u.dst, &resp, u.payload, q);
-    let us = micros(t0);
-    match uid {
-        Uid::Known(uid) => ctx.shared.record(&q.name, q.qtype, uid, action, why, us),
-        pending => {
-            let (shared, name, qtype) = (ctx.shared.clone(), q.name.clone(), q.qtype);
-            tokio::task::spawn_local(async move {
-                let uid = pending.resolve(UID_WAIT).await;
-                shared.record(&name, qtype, uid, action, why, us);
-            });
+    let h = match uid {
+        Uid::Known(uid) => {
+            reply(ctx, u.src, u.dst, &resp, u.payload, q);
+            ctx.shared.record(&q.name, q.qtype, uid, action, why, micros(t0));
+            return;
         }
-    }
+        Uid::Pending(h) => h,
+    };
+    let (ctx, src, dst, raw, q) = (ctx.clone(), u.src, u.dst, u.payload.to_vec(), q.clone());
+    tokio::task::spawn_local(async move {
+        let mut h = h;
+        let early = tokio::time::timeout(LOCAL_UID_WAIT, &mut h).await;
+        reply(&ctx, src, dst, &resp, &raw, &q);
+        let us = micros(t0);
+        let uid = match early {
+            Ok(r) => r.unwrap_or(-1),
+            Err(_) => Uid::Pending(h).resolve(UID_WAIT).await,
+        };
+        ctx.shared.record(&q.name, q.qtype, uid, action, why, us);
+    });
 }
 
 fn handle_packet<W: TunWrite + 'static>(ctx: &Rc<Ctx<W>>, p: &[u8]) {
@@ -708,10 +722,10 @@ mod tests {
         assert!(took < Duration::from_millis(280), "answers waited for the app lookups: {took:?}");
     }
 
-    /// A blocked answer goes out at once, before the app lookup ends; the log then still names
-    /// the app, and the answer's recorded time is its own, not the lookup's.
+    /// A slow app lookup holds a blocked answer back only [`LOCAL_UID_WAIT`]; the log then still
+    /// names the app, and the answer's recorded time is its own, not the lookup's.
     #[tokio::test]
-    async fn local_answers_do_not_wait_for_the_app_lookup() {
+    async fn local_answers_do_not_wait_for_a_slow_app_lookup() {
         let (up, _) = fake_resolver(0).await;
         let shared = Shared::new(Config { resolve_uids: true, ..Config::default() });
         let (bytes, _) = matcher::compile(&[Source { name: "test", text: "||ads.test^\n", user: false, allow: false }]);
@@ -735,8 +749,49 @@ mod tests {
             })
             .await;
         let s = shared.stats.lock();
-        assert!(s.local_latency.percentile(0.99) < 3_000, "the answer waited: {} µs", s.local_latency.percentile(0.99));
+        // 5 ms of waiting, plus the timer's resolution on a desktop OS (up to ~16 ms on Windows).
+        assert!(s.local_latency.percentile(0.99) < 40_000, "the answer waited: {} µs", s.local_latency.percentile(0.99));
         assert!(s.apps.contains_key(&10_123), "the app was not named");
+    }
+
+    /// Writes like [`VecWriter`] and notes that an answer went out.
+    #[derive(Clone, Default)]
+    struct FlagWriter(VecWriter, Arc<std::sync::atomic::AtomicBool>);
+
+    impl TunWrite for FlagWriter {
+        fn write(&self, bytes: &[u8]) -> bool {
+            self.1.store(true, Ordering::SeqCst);
+            self.0.write(bytes)
+        }
+    }
+
+    /// Android names a socket's app only while the socket is open, and an app closes it once
+    /// answered: a cached or blocked answer still names its app when the lookup is quick.
+    #[tokio::test]
+    async fn local_answers_name_an_app_that_closes_its_socket_once_answered() {
+        let (up, _) = fake_resolver(0).await;
+        let shared = Shared::new(Config { resolve_uids: true, ..Config::default() });
+        let (bytes, _) = matcher::compile(&[Source { name: "test", text: "||ads.test^\n", user: false, allow: false }]);
+        shared.set_filters(Filters { lists: Table::from_bytes(bytes).unwrap(), user: Table::empty() });
+        shared.set_network(vec![up], true, false, 1);
+        let out = FlagWriter::default();
+        let answered = out.1.clone();
+        let _ = shared.uid_lookup.set(Box::new(move |_, _, _| {
+            std::thread::sleep(Duration::from_millis(1));
+            if answered.load(Ordering::SeqCst) { -1 } else { 10_123 }
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(serve(shared.clone(), ChanReader(rx), out.clone(), Arc::new(Notify::new())));
+        local
+            .run_until(async {
+                tx.send(query_packet(1, "ads.test", 53)).unwrap();
+                wait_for(&out.0, 1).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            })
+            .await;
+        let s = shared.stats.lock();
+        assert!(s.apps.contains_key(&10_123), "the app was not named: {:?}", s.apps.keys().collect::<Vec<_>>());
     }
 
     /// A slow answer nobody waited for (the background refresh of an answer the app already got)
