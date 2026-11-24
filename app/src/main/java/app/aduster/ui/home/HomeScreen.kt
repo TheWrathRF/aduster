@@ -1,5 +1,6 @@
 package app.aduster.ui.home
 
+import android.content.Context
 import android.content.Intent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.Animatable
@@ -22,14 +23,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -49,14 +53,20 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import app.aduster.core.Upstreams
 import app.aduster.https.HttpsConfig
+import app.aduster.ui.DayStat
 import app.aduster.ui.MainViewModel
 import app.aduster.ui.Stats
 import app.aduster.ui.Sub
@@ -66,9 +76,9 @@ import app.aduster.ui.common.AdDialog
 import app.aduster.ui.common.AppIcon
 import app.aduster.ui.common.Card
 import app.aduster.ui.common.Chevron
-import app.aduster.ui.common.ChoiceDialog
 import app.aduster.ui.common.Corners
 import app.aduster.ui.common.Group
+import app.aduster.ui.common.Gutter
 import app.aduster.ui.common.Haptics
 import app.aduster.ui.common.ListRow
 import app.aduster.ui.common.Metric
@@ -77,6 +87,7 @@ import app.aduster.ui.common.PillButton
 import app.aduster.ui.common.Protection
 import app.aduster.ui.common.ProtectionMark
 import app.aduster.ui.common.RollingNumber
+import app.aduster.ui.common.RowIcon
 import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.common.groupItems
@@ -88,27 +99,35 @@ import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
 import app.aduster.ui.theme.pastBar
-import app.aduster.ui.theme.shareLine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
 @Composable
-fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, openSettings: () -> Unit, openFilters: () -> Unit) {
+fun HomeScreen(
+    vm: MainViewModel,
+    onStart: () -> Unit,
+    open: (Sub) -> Unit,
+    openSettings: () -> Unit,
+    openFilters: () -> Unit,
+    openLog: () -> Unit = {},
+) {
     val p = LocalPalette.current
     val view = LocalView.current
     val ctx = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
     val known by vm.stats.collectAsStateWithLifecycle()
     val s by vm.settings.collectAsStateWithLifecycle()
     val meta by vm.filterMeta.collectAsStateWithLifecycle()
     val labels by vm.labels.collectAsStateWithLifecycle()
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
-    var pauseDialog by remember { mutableStateOf(false) }
+    var pauseSheet by remember { mutableStateOf(false) }
     var offDialog by remember { mutableStateOf(false) }
     // The top lists' share lines rise once, like the chart's bars, not each time Home is shown.
     // By row: each rises the first time it shows (rows further down compose only when scrolled to).
-    val risen = rememberSaveable(saver = androidx.compose.runtime.saveable.listSaver<MutableSet<String>, String>({ it.toList() }, { it.toMutableSet() })) { mutableSetOf() }
 
     // Until the core answers, the state comes from what the user last chose and the
     // buttons wait: no false "Off" and no tap on a "Turn on" that is not real.
@@ -121,75 +140,89 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
         running -> Protection.ON
         else -> Protection.OFF
     }
-    // Why it is off, when the user did not turn it off (read from the timeline while off).
-    var stopped by remember { mutableStateOf<String?>(null) }
-    // Read again with every status poll while off: a start that failed leaves it off, with a new
-    // reason, and the note's "5 min ago" moves on.
-    LaunchedEffect(known) {
-        stopped = if (unknown || running) null else kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { stopNote(vm.timeline()) }
+
+    // Re-checked when returning from system Settings or Page filtering.
+    var localPrivateDnsStrict by remember { mutableStateOf(false) }
+    var caInstalled by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            localPrivateDnsStrict = withContext(Dispatchers.IO) { vm.privateDnsStrict() }
+            caInstalled = if (HttpsConfig.available) withContext(Dispatchers.IO) { vm.caInstalled() } else false
+        }
     }
-    val note = stopped?.takeIf { !running }
-    val warnings = if (unknown) emptyList() else listOfNotNull(note?.let { Warning(it, Fix.DIAGNOSTICS) }) + homeWarnings(stats, s.httpsFiltering)
+
+    // Timeline while off: explains an unexpected stop and tells whether protection has ever run.
+    var timeline by remember { mutableStateOf<List<app.aduster.vpn.Timeline.Entry>?>(null) }
+    LaunchedEffect(known) {
+        timeline = if (unknown || running) null else withContext(Dispatchers.IO) { vm.timeline() }
+    }
+    val stopped = timeline?.let { stopNote(it) }?.takeIf { !running }
+    val firstRun = !unknown && timeline != null && isFirstRun(running, stats, timeline!!)
+    val privateDnsStrict = stats.privateDnsStrict || localPrivateDnsStrict
+    val setupRow = if (unknown) null else homeSetupRow(
+        privateDnsStrict = privateDnsStrict,
+        httpsAvailable = HttpsConfig.available,
+        httpsOn = s.httpsFiltering,
+        caInstalled = caInstalled != false,
+    )
+    // Avoid showing Private DNS twice when the Setup row already surfaces it.
+    val warnings = if (unknown) emptyList() else listOfNotNull(stopped?.let { Warning(it, Fix.DIAGNOSTICS) }) +
+        homeWarnings(stats, s.httpsFiltering).filterNot { setupRow?.fix == SetupFix.PRIVATE_DNS && it.text.startsWith("Private DNS") }
 
     LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 16.dp, bottom = 28.dp)) {
         item(key = "status") {
-            // The status card: the state at a glance, its actions, and what needs fixing.
-            Card(color = p.tone, horizontalAlignment = Alignment.CenterHorizontally) {
-                Box(Modifier.fillMaxWidth()) {
-                    ProtectionMark(state, p.text, p.accent, p.warn, p.faint, Modifier.align(Alignment.TopCenter).padding(top = 12.dp), size = 112.dp)
-                    // Turn off is rare and asks first, so it sits in the corner and leaves the
-                    // centre column and the full-width action to the state.
-                    if (running && !unknown) {
-                        OffButton(Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp)) { offDialog = true }
+            // The status card: a large mark and state word, centred, the actions full width under
+            // them, then any first-run note and warnings.
+            Card(color = p.tone) {
+                Column(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    ProtectionMark(state, p.text, p.accent, p.warn, p.faint, size = 104.dp)
+                    Spacer(Modifier.height(16.dp))
+                    AnimatedContent(
+                        targetState = state,
+                        transitionSpec = { fadeIn(tween(Motion.MEDIUM, delayMillis = Motion.SHORT)) togetherWith fadeOut(tween(Motion.SHORT)) },
+                        label = "state title",
+                    ) { st ->
+                        Text(
+                            stateTitle(st),
+                            // TalkBack says the new state when it changes, also when a tap elsewhere changed it.
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                            style = Type.display,
+                            color = when (st) {
+                                Protection.ON -> p.text
+                                Protection.PAUSED -> p.warn
+                                Protection.OFF -> p.muted
+                            },
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                    val detail = statusDetail(state, stats.httpsActive, s.pausedUntil, unknown)
+                    if (detail != null) {
+                        Spacer(Modifier.height(2.dp))
+                        Text(detail, style = Type.body, color = p.text2, textAlign = TextAlign.Center)
+                    }
+                    Spacer(Modifier.height(24.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        val wide = Modifier.weight(1f)
+                        when {
+                            unknown -> PillButton("…", wide, height = ActionHeight, enabled = false) {}
+                            paused -> {
+                                PillButton("Resume", wide, filled = true, color = p.warn, height = ActionHeight) { Haptics.confirm(view); vm.resume() }
+                                OffButton { offDialog = true }
+                            }
+                            running -> {
+                                PauseButton(wide) { pauseSheet = true }
+                                OffButton { offDialog = true }
+                            }
+                            else -> PillButton("Turn on", wide, filled = true, height = ActionHeight) { Haptics.toggle(view, true); onStart() }
+                        }
                     }
                 }
-                Spacer(Modifier.height(14.dp))
-                AnimatedContent(
-                    targetState = state,
-                    transitionSpec = { fadeIn(tween(Motion.MEDIUM, delayMillis = Motion.SHORT)) togetherWith fadeOut(tween(Motion.SHORT)) },
-                    label = "state title",
-                ) { st ->
-                    Text(
-                        when (st) {
-                            Protection.PAUSED -> "Paused"
-                            Protection.ON -> "Protected"
-                            Protection.OFF -> "Off"
-                        },
-                        // TalkBack says the new state when it changes, also when a tap elsewhere changed it.
-                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-                        style = Type.display,
-                        color = when (st) {
-                            Protection.ON -> p.text
-                            Protection.PAUSED -> p.warn
-                            Protection.OFF -> p.muted
-                        },
-                    )
-                }
-                when {
-                    paused -> Text(
-                        if (s.pausedUntil == Long.MAX_VALUE) "Until you resume" else "Until ${hm(s.pausedUntil)}",
-                        style = Type.body,
-                        color = p.text2,
-                    )
-                    running && !unknown -> Row(
-                        Modifier.semantics(mergeDescendants = true) {},
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        RollingNumber(fmt(stats.blocked), Type.number.copy(fontSize = Type.body.fontSize), p.accent, value = stats.blocked)
-                        Text(" blocked today", style = Type.body, color = p.text2)
-                    }
-                }
-                Spacer(Modifier.height(20.dp))
-                val wide = Modifier.fillMaxWidth()
-                when {
-                    unknown -> PillButton("…", wide, enabled = false, height = 56.dp) {}
-                    paused -> PillButton("Resume", wide, filled = true, color = p.warn, height = 56.dp) { Haptics.confirm(view); vm.resume() }
-                    // Asks how long, so the timed pause needs no hint.
-                    running -> PillButton("Pause", wide, filled = true, height = 56.dp) { pauseDialog = true }
-                    else -> PillButton("Turn on", wide, filled = true, height = 56.dp) { Haptics.toggle(view, true); onStart() }
+                if (firstRun) {
+                    Spacer(Modifier.height(16.dp))
+                    FirstRunNote()
                 }
                 if (warnings.isNotEmpty()) {
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(14.dp))
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         warnings.forEach { w ->
                             WarningRow(w.text) {
@@ -207,23 +240,68 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
         }
 
         item(key = "numbers") {
-            // Blocked is in the status card; what it is made of and the last 30 days here.
+            // Today's blocked count, its breakdown, and the 30-day chart above the fold.
             Card(Modifier.padding(top = 12.dp)) {
-                Row {
-                    homeNumbers(stats, HttpsConfig.available).forEach { n ->
-                        Metric(n.value, n.label, Modifier.weight(1f), raw = n.raw, animate = !unknown)
+                Column(Modifier.clearAndSetSemantics { contentDescription = "Blocked today: ${fmt(stats.blocked)}" }) {
+                    RollingNumber(fmt(stats.blocked), Type.display, p.text, value = stats.blocked, animate = !unknown)
+                    val trend = remember(stats.history, stats.day, stats.blocked) {
+                        weekTrend(app.aduster.ui.historySlots(stats.history, DayStat(stats.day, stats.queries, stats.blocked), 14))
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Blocked today", style = Type.small, color = p.muted)
+                        if (trend != null) {
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                trend,
+                                style = Type.small,
+                                color = p.accent,
+                                modifier = Modifier.clip(RoundedCornerShape(10.dp)).background(p.surfaceHigh).padding(horizontal = 8.dp, vertical = 2.dp),
+                            )
+                        }
                     }
                 }
+                Spacer(Modifier.height(14.dp))
+                // How much of what apps asked for today was blocked: one bar and one line.
+                val share by animateFloatAsState(stats.dnsRatio.toFloat().coerceIn(0f, 1f), tween(Motion.LONG * 2, easing = Motion.Emphasized), label = "share")
+                Canvas(Modifier.fillMaxWidth().height(8.dp)) {
+                    val r = CornerRadius(size.height / 2, size.height / 2)
+                    drawRoundRect(p.surfaceHigh, cornerRadius = r)
+                    if (share > 0f) drawRoundRect(p.blocked, size = Size((size.width * share).coerceAtLeast(size.height), size.height), cornerRadius = r)
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(requestShare(stats, HttpsConfig.available), style = Type.small, color = p.muted)
                 Spacer(Modifier.height(18.dp))
-                History(stats)
+                WeekChart(stats)
+            }
+        }
+
+        if (setupRow != null) {
+            item(key = "setup-row") {
+                Group(Modifier.padding(top = 12.dp)) {
+                    row {
+                        ListRow(
+                            title = setupRow.title,
+                            detail = setupRow.detail,
+                            onClick = {
+                                when (setupRow.fix) {
+                                    SetupFix.PRIVATE_DNS -> openPrivateDnsSettings(ctx)
+                                    SetupFix.HTTPS -> open(Sub.HTTPS)
+                                }
+                            },
+                            leading = { RowIcon(if (setupRow.warn) AdIcons.Warn else AdIcons.Filters, tint = if (setupRow.warn) p.warn else p.accent) },
+                        ) { Chevron() }
+                    }
+                }
             }
         }
 
         if (stats.topBlocked.isNotEmpty()) {
             item(key = "top-label") { SectionHeading("Top blocked today") }
-            val max = stats.topBlocked.maxOf { it.second }.coerceAtLeast(1)
             groupItems(stats.topBlocked.take(8), key = { "b" + it.first }) { (name, n) ->
-                CountRow(name, fmt(n), share = n.toFloat() / max, rise = "b$name" !in risen) { risen += "b$name" }
+                CountRow(name, fmt(n)) {
+                    vm.openLogFilter(query = name)
+                    openLog()
+                }
             }
         }
 
@@ -232,23 +310,21 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
             item(key = "apps-label") { SectionHeading("Top apps") }
             groupItems(apps, key = { "a" + it.uid }) { a ->
                 val icon = remember(iconVersion, a.uid) { vm.appIconForUid(a.uid) }
-                CountRow(
-                    appName(labels, a.uid), "${fmt(a.blocked)} of ${fmt(a.queries)}",
-                    share = if (a.queries > 0) a.blocked.toFloat() / a.queries else 0f,
-                    rise = "a${a.uid}" !in risen,
-                    leading = { AppIcon(icon) },
-                ) { risen += "a${a.uid}" }
+                CountRow(appName(labels, a.uid), "${fmt(a.blocked)} of ${fmt(a.queries)}", leading = { AppIcon(icon) }) {
+                    vm.openLogFilter(appUid = a.uid)
+                    openLog()
+                }
             }
         }
 
         item(key = "setup") {
-            SectionHeading("Setup")
+            SectionHeading("DNS and filters")
             Group {
                 // The resolver is chosen in Settings; the rules come from the lists on Filters (the
                 // count adds page rules while they are in use).
                 row { ListRow("DNS server", onClick = openSettings) { ValueText(Upstreams.label(s.upstream, s.customUpstream)) } }
                 val rules = meta.compiledRules + if (s.httpsFiltering && HttpsConfig.available) meta.webRules else 0
-                row { ListRow("Rules", onClick = openFilters) { ValueText("${fmt(rules)} · ${ago(rulesAge(meta))}") } }
+                row { ListRow("Rules", rulesDetail(rulesAge(meta)), onClick = openFilters) { ValueText(fmt(rules)) } }
             }
         }
     }
@@ -283,40 +359,56 @@ fun HomeScreen(vm: MainViewModel, onStart: () -> Unit, open: (Sub) -> Unit, open
         )
     }
 
-    if (pauseDialog) {
-        ChoiceDialog(
-            title = "Pause protection",
-            options = listOf(0, 5, 60),
-            selected = -1,
-            label = {
-                when (it) {
-                    0 -> "Until you resume"
-                    60 -> "1 hour"
-                    else -> "$it minutes"
-                }
-            },
-            onDismiss = { pauseDialog = false },
-            onSelect = {
-                pauseDialog = false
+    if (pauseSheet) {
+        PauseSheet(
+            onDismiss = { pauseSheet = false },
+            onSelect = { minutes ->
+                pauseSheet = false
                 Haptics.confirm(view)
-                vm.pause(it)
+                vm.pause(minutes)
             },
         )
     }
+}
+
+private fun openPrivateDnsSettings(ctx: Context) {
+    val wireless = Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val fallback = Intent(android.provider.Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { ctx.startActivity(wireless) }.onFailure { runCatching { ctx.startActivity(fallback) } }
 }
 
 /** On the status card's tint: the card colour in Light, where the tint and the pill colour are one. */
 @Composable
 private fun onTone() = LocalPalette.current.let { if (it.dark) it.surfaceHigh else it.surface }
 
-/** Turn off, beside the main button: round, its name for TalkBack. */
+/** The status card's buttons: a little taller than the app's other buttons. */
+private val ActionHeight = 52.dp
+
+/** Pause, the wide button beside the power icon on the status card. */
+@Composable
+private fun PauseButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val p = LocalPalette.current
+    Box(
+        modifier
+            .heightIn(min = ActionHeight)
+            .clip(CircleShape)
+            .background(onTone())
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 22.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("Pause", style = Type.bodyStrong, color = p.text)
+    }
+}
+
+/** Turn off, beside the pause or resume button: round, its name for TalkBack. */
 @Composable
 private fun OffButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
     val p = LocalPalette.current
     // Asks first: a mis-tap would leave protection off.
     Box(
         modifier
-            .size(48.dp)
+            .size(ActionHeight)
             .clip(CircleShape)
             .background(onTone())
             .clickable(role = Role.Button, onClick = onClick)
@@ -324,6 +416,36 @@ private fun OffButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
         contentAlignment = Alignment.Center,
     ) {
         Icon(AdIcons.Power, null, tint = p.text, modifier = Modifier.size(20.dp))
+    }
+}
+
+/** In-app pause choices as plain tappable rows: one tap pauses. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PauseSheet(onDismiss: () -> Unit, onSelect: (Int) -> Unit) {
+    val p = LocalPalette.current
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = p.surface, dragHandle = null) {
+        Column(Modifier.padding(top = 20.dp, bottom = 16.dp).navigationBarsPadding()) {
+            Text(
+                "Pause protection",
+                style = Type.dialogTitle,
+                color = p.text,
+                modifier = Modifier.padding(horizontal = Gutter + 4.dp, vertical = 4.dp),
+            )
+            Spacer(Modifier.height(8.dp))
+            PAUSE_CHOICES.forEach { choice ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(role = Role.Button) { onSelect(choice.minutes) }
+                        .heightIn(min = 52.dp)
+                        .padding(horizontal = Gutter + 4.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(choice.label, style = Type.body, color = p.text)
+                }
+            }
+        }
     }
 }
 
@@ -350,19 +472,22 @@ private fun WarningRow(text: String, onClick: () -> Unit) {
 }
 
 /**
- * One row of a top list: name, count and a thin line showing its share, which rises from nothing
- * when [rise] (the first time the list shows) and else starts where it is.
+ * One row of a top list: name and count; a tap opens the Log filtered to it.
  */
 @Composable
-private fun CountRow(name: String, value: String, share: Float, rise: Boolean, leading: (@Composable () -> Unit)? = null, onRisen: () -> Unit) {
+private fun CountRow(
+    name: String,
+    value: String,
+    leading: (@Composable () -> Unit)? = null,
+    onClick: (() -> Unit)? = null,
+) {
     val p = LocalPalette.current
-    var shown by remember { mutableStateOf(!rise) }
-    LaunchedEffect(Unit) {
-        shown = true
-        onRisen()
-    }
-    val w by animateFloatAsState(if (shown) share.coerceIn(0f, 1f) else 0f, tween(Motion.LONG * 2, easing = Motion.Emphasized), label = "share")
-    Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 10.dp)) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
         Row(Modifier.heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically) {
             if (leading != null) {
                 leading()
@@ -371,161 +496,242 @@ private fun CountRow(name: String, value: String, share: Float, rise: Boolean, l
             Text(name, style = Type.body, color = p.text, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             Spacer(Modifier.width(12.dp))
             Text(value, style = Type.number, color = p.muted)
-        }
-        Spacer(Modifier.height(8.dp))
-        Canvas(Modifier.fillMaxWidth().height(2.dp)) {
-            drawRect(p.line)
-            drawRect(p.shareLine, size = Size(size.width * w, size.height))
+            if (onClick != null) {
+                Spacer(Modifier.width(4.dp))
+                Chevron()
+            }
         }
     }
 }
 
-private val ChartGap = 4.dp
-
 private val dayFormat = SimpleDateFormat("d MMM", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
 
+/** Weekday names under the week chart, in the phone's language ("Mon"); days are UTC day numbers. */
+private val weekdayFormat = SimpleDateFormat("EEE", Locale.getDefault()).apply { timeZone = TimeZone.getTimeZone("UTC") }
+private val weekdayLetter = SimpleDateFormat("EEEEE", Locale.getDefault()).apply { timeZone = TimeZone.getTimeZone("UTC") }
+
 /**
- * Blocked per day, from the first day with data, at most 30: each day a rounded track with its
- * bar inside, past days in a softer accent and today in the full one, a day with nothing blocked
- * a dot. The days keep a 30-day width and end at the right edge, so today is always in the same
- * place. The bars rise from the base when the chart first shows; dragging a finger across it
- * reads out that day.
+ * The last seven days as labelled bars: past days in a softer accent, today in the blocked colour,
+ * the count of the day shown above its bar (today's unless a bar is tapped), days without data an
+ * empty track. The bars rise from the base when the chart first shows.
  */
 @Composable
-private fun History(stats: Stats) {
+private fun WeekChart(stats: Stats) {
     val p = LocalPalette.current
     val view = LocalView.current
-    val slots = 30
-    // Calendar days: a day without data is an empty slot, not skipped.
+    val now = System.currentTimeMillis()
+    val today = if (stats.day > 0) stats.day else Math.floorDiv(now + TimeZone.getDefault().getOffset(now), 86_400_000L)
     val days = remember(stats.history, stats.day, stats.queries, stats.blocked) {
-        app.aduster.ui.historySlots(stats.history, app.aduster.ui.DayStat(stats.day, stats.queries, stats.blocked), slots)
+        app.aduster.ui.historySlots(stats.history, DayStat(today, stats.queries, stats.blocked), WEEK)
     }
-    val currentDays by androidx.compose.runtime.rememberUpdatedState(days)
-    val currentRtl by androidx.compose.runtime.rememberUpdatedState(androidx.compose.ui.platform.LocalLayoutDirection.current == androidx.compose.ui.unit.LayoutDirection.Rtl)
-    // Slots left empty before the first day with data.
-    val lead = slots - days.size
-    val values = days.map { it?.blocked }
-    val total = values.sumOf { it ?: 0L }
     var selected by remember { mutableStateOf<Int?>(null) }
     var grown by rememberSaveable { mutableStateOf(false) }
     val appear = remember { Animatable(if (grown) 1f else 0f) }
-    val hasData = stats.day > 0
-    LaunchedEffect(hasData) {
-        if (hasData && !grown) {
+    LaunchedEffect(Unit) {
+        if (!grown) {
             appear.animateTo(1f, tween(700, easing = Motion.Emphasized))
             grown = true
         }
     }
-    val span = if (days.size == 1) "Today" else "${days.size} days"
-    val description = "Blocked per day, ${counted(days.size, "day")}: ${fmt(total)} in all, today ${fmt(stats.blocked)}"
-    Column {
-        Canvas(
-            Modifier
-                .fillMaxWidth()
-                .height(72.dp)
-                .semantics { contentDescription = description }
-                // One gesture handler for the chart's life: it reads the days of now, not those
-                // of when it started (a poll changes them while the same count of days stays).
-                .pointerInput(Unit) {
-                    val gap = ChartGap.toPx()
-                    fun pick(at: Float) {
-                        val ds = currentDays
-                        // Today is at the end of the reading direction, as the labels under it.
-                        val x = if (currentRtl) size.width - at else at
-                        val w = (size.width - gap * (slots - 1)) / slots
-                        val i = (x / (w + gap)).toInt().coerceIn(0, slots - 1) - (slots - ds.size)
-                        val v = i.takeIf { it in ds.indices && ds[it] != null }
-                        if (v != selected) {
-                            selected = v
-                            if (v != null) Haptics.tick(view)
-                        }
+    val max = days.maxOf { it?.blocked ?: 0L }.coerceAtLeast(1L)
+    val shown = selected ?: days.lastIndex
+    val narrow = androidx.compose.ui.platform.LocalDensity.current.fontScale > 1.3f
+    Row(
+        Modifier.fillMaxWidth().semantics { contentDescription = weekDescription(days) },
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        days.forEachIndexed { i, d ->
+            val isToday = i == days.lastIndex
+            Column(
+                Modifier
+                    .weight(1f)
+                    .clickable(interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }, indication = null) {
+                        selected = if (selected == i || d == null) null else i
+                        if (selected != null) Haptics.tick(view)
+                    },
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                // Centred over its bar. A count wider than its bar (a large font) may reach past
+                // it; then today's, at the right edge, grows to the left instead.
+                Text(
+                    if (i == shown && d != null) fmt(d.blocked) else "",
+                    style = Type.number,
+                    color = if (isToday) p.blocked else p.text,
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier.fillMaxWidth().wrapContentWidth(if (isToday && narrow) Alignment.End else Alignment.CenterHorizontally, unbounded = true),
+                )
+                Spacer(Modifier.height(4.dp))
+                Canvas(Modifier.fillMaxWidth().height(WeekChartHeight)) {
+                    val r = CornerRadius(8.dp.toPx(), 8.dp.toPx())
+                    drawRoundRect(p.surfaceHigh.copy(alpha = 0.45f), cornerRadius = r)
+                    if (d == null) return@Canvas
+                    // Left to right, each bar a little after the one before.
+                    val grow = ((appear.value - i / 7f * 0.4f) / 0.6f).coerceIn(0f, 1f)
+                    val h = (d.blocked.toFloat() / max * size.height * grow).coerceAtLeast(6.dp.toPx())
+                    val color = when {
+                        isToday -> p.blocked
+                        i == selected -> p.text
+                        else -> p.pastBar()
                     }
-                    awaitEachGesture {
-                        val down = awaitFirstDown()
-                        pick(down.position.x)
-                        var last = down.position
-                        while (true) {
-                            val e = awaitPointerEvent()
-                            val c = e.changes.firstOrNull() ?: break
-                            if (!c.pressed) break
-                            val d = c.position - last
-                            last = c.position
-                            // Horizontal drags belong to the chart; vertical ones scroll the page.
-                            if (kotlin.math.abs(d.x) >= kotlin.math.abs(d.y)) c.consume()
-                            pick(c.position.x)
-                        }
-                        selected = null
-                    }
-                },
-        ) {
-            val gap = ChartGap.toPx()
-            val w = (size.width - gap * (slots - 1)) / slots
-            val round = CornerRadius(w / 2, w / 2)
-            val max = (values.maxOf { it ?: 0L }).coerceAtLeast(1L)
-            val t = appear.value
-            val rtl = layoutDirection == androidx.compose.ui.unit.LayoutDirection.Rtl
-            for (i in days.indices) {
-                val x = ((lead + i) * (w + gap)).let { if (rtl) size.width - it - w else it }
-                drawRoundRect(p.surfaceHigh, Offset(x, 0f), Size(w, size.height), round)
-                val v = values[i] ?: continue
-                // Left to right, each bar a little after the one before.
-                val start = i.toFloat() / slots * 0.4f
-                val grow = ((t - start) / 0.6f).coerceIn(0f, 1f)
-                // Never shorter than its width: a day with nothing blocked is a dot.
-                val h = (v.toFloat() / max * size.height * grow).coerceAtLeast(w)
-                val color = when {
-                    selected == i -> p.text
-                    i == days.lastIndex -> p.accent
-                    // Also while a day is picked: its own colour sets it apart.
-                    else -> p.pastBar()
+                    drawRoundRect(color, Offset(0f, size.height - h), Size(size.width, h), r)
                 }
-                drawRoundRect(color, Offset(x, size.height - h), Size(w, h), round)
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        // The first day's date under its bar, once there is room beside "Today" for it.
-        if (hasData) {
-            Row(Modifier.fillMaxWidth()) {
-                if (days.size >= 8) {
-                    if (lead > 0) Spacer(Modifier.fillMaxWidth(lead.toFloat() / slots))
-                    Text(dayFormat.format(Date((stats.day - days.size + 1) * 86_400_000L)), style = Type.small, color = p.muted, modifier = Modifier.weight(1f))
-                } else {
-                    Spacer(Modifier.weight(1f))
-                }
-                Text("Today", style = Type.small, color = p.muted)
-            }
-        }
-        Spacer(Modifier.height(10.dp))
-        val sel = selected?.let { days.getOrNull(it) }
-        AnimatedContent(
-            targetState = sel,
-            transitionSpec = { fadeIn(tween(Motion.SHORT)) togetherWith fadeOut(tween(Motion.SHORT)) },
-            label = "chart label",
-        ) { d ->
-            if (d == null) {
-                Text("$span: ${fmt(total)} blocked", style = Type.small, color = p.muted)
-            } else {
-                val date = if (d.day == stats.day) "Today" else dayFormat.format(Date(d.day * 86_400_000L))
-                Text("$date: ${fmt(d.blocked)} blocked", style = Type.small, color = p.text)
+                Spacer(Modifier.height(6.dp))
+                val date = Date((today - (days.lastIndex - i)) * 86_400_000L)
+                Text(
+                    when {
+                        // With a large font a day name does not fit its bar: one letter each.
+                        narrow -> weekdayLetter.format(date)
+                        isToday -> "Today"
+                        else -> weekdayFormat.format(date)
+                    },
+                    style = Type.small,
+                    color = if (isToday) p.text else p.muted,
+                    maxLines = 1,
+                    softWrap = false,
+                )
             }
         }
     }
 }
 
-internal data class HomeNumber(val value: String, val label: String, val raw: Long)
+private const val WEEK = 7
+private val WeekChartHeight = 112.dp
+
+/** Screen-reader description for the week chart, counting only days with recorded stats. */
+internal fun weekDescription(days: List<DayStat?>): String {
+    val recorded = days.filterNotNull()
+    if (recorded.isEmpty()) return "Blocked per day: no data yet"
+    val total = recorded.sumOf { it.blocked }
+    val today = days.last()?.blocked ?: 0L
+    return "Blocked in the last ${counted(recorded.size, "day")}: ${fmt(total)}, today ${fmt(today)}"
+}
 
 /**
- * Today's numbers under the status card, each of one kind of count: the lookups, the share of
- * them blocked, and (with the page engine) what was blocked inside browsers. The last two add up
- * to the card's "blocked today"; allowed page requests are never counted, so no share is given
- * for them.
+ * This week against the one before, for the badge beside "Blocked today" ("+18% vs last week"):
+ * [days] are the last 14 days, oldest first. Null until the earlier week has something blocked.
  */
-internal fun homeNumbers(stats: Stats, pages: Boolean): List<HomeNumber> = buildList {
-    add(HomeNumber(fmt(stats.dnsQueries), "DNS lookups", stats.dnsQueries))
-    add(HomeNumber(percent(stats.dnsRatio), "DNS lookups blocked", (stats.dnsRatio * 1000).toLong()))
-    if (pages) {
-        add(HomeNumber(fmt(stats.blockedInBrowsers), "Blocked in browsers", stats.blockedInBrowsers))
+internal fun weekTrend(days: List<DayStat?>): String? {
+    if (days.size < 2 * WEEK) return null
+    val before = days.take(WEEK).filterNotNull()
+    val now = days.takeLast(WEEK).filterNotNull()
+    val was = before.sumOf { it.blocked }
+    if (before.isEmpty() || was == 0L || now.isEmpty()) return null
+    val change = Math.round((now.sumOf { it.blocked } - was) * 100.0 / was)
+    return when {
+        change > 0 -> "+$change% vs last week"
+        change < 0 -> "−${-change}% vs last week"
+        else -> "Same as last week"
     }
+}
+
+/** Shown on the status card until protection has run once: what Android's VPN prompt means. */
+@Composable
+private fun FirstRunNote() {
+    val p = LocalPalette.current
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(onTone()).padding(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        // A phone outline in an accent disc.
+        Canvas(Modifier.size(38.dp)) {
+            drawCircle(p.accent)
+            val w = 12.dp.toPx()
+            val h = 19.dp.toPx()
+            val stroke = 2.2.dp.toPx()
+            val tl = Offset((size.width - w) / 2, (size.height - h) / 2)
+            drawRoundRect(p.onAccent, tl, Size(w, h), CornerRadius(3.dp.toPx()), style = androidx.compose.ui.graphics.drawscope.Stroke(stroke))
+            val y = tl.y + h - 4.dp.toPx()
+            drawLine(p.onAccent, Offset(center.x - 2.dp.toPx(), y), Offset(center.x + 2.dp.toPx(), y), stroke, androidx.compose.ui.graphics.StrokeCap.Round)
+        }
+        Column(Modifier.weight(1f)) {
+            Text(FIRST_RUN_TITLE, style = Type.bodyStrong, color = p.text)
+            Spacer(Modifier.height(2.dp))
+            Text(FIRST_RUN_VPN_NOTE, style = Type.small, color = p.text2)
+        }
+    }
+}
+
+internal const val FIRST_RUN_TITLE = "Everything stays on this phone"
+
+/** The first-run note's line on Android's VPN permission prompt. */
+internal const val FIRST_RUN_VPN_NOTE =
+    "Android will ask to allow a VPN connection. That is how Aduster filters, and nothing is sent anywhere."
+
+/** One pause choice in the in-app pause sheet ([minutes] 0 means until you resume). */
+internal data class PauseChoice(val label: String, val minutes: Int)
+
+internal val PAUSE_CHOICES = listOf(
+    PauseChoice("5 min", 5),
+    PauseChoice("15 min", 15),
+    PauseChoice("1 hour", 60),
+    PauseChoice("Until you resume", 0),
+)
+
+/** State word on Home's status card. */
+internal fun stateTitle(state: Protection): String = when (state) {
+    Protection.PAUSED -> "Paused"
+    Protection.ON -> "Protected"
+    Protection.OFF -> "Off"
+}
+
+/** One line under the protection state: what is active, or when a pause ends. */
+internal fun statusDetail(state: Protection, httpsActive: Boolean, pausedUntil: Long, unknown: Boolean = false): String? = when (state) {
+    Protection.PAUSED -> if (pausedUntil == Long.MAX_VALUE) "Until you resume" else "Until ${hm(pausedUntil)}"
+    Protection.ON -> if (unknown) null else if (httpsActive) "DNS and browser pages" else "DNS only"
+    Protection.OFF -> "Not filtering"
+}
+
+/**
+ * Protection has never run on this install: off, an empty timeline and no lookup ever counted
+ * ([Stats.day] is today's date even then, so it says nothing about a first run).
+ */
+internal fun isFirstRun(running: Boolean, stats: Stats, timeline: List<app.aduster.vpn.Timeline.Entry>): Boolean =
+    !running && timeline.isEmpty() && stats.queries == 0L && stats.history.none { it.queries > 0 }
+
+/** Where the Setup row on Home leads. */
+internal enum class SetupFix { PRIVATE_DNS, HTTPS }
+
+internal data class SetupRow(val title: String, val detail: String, val fix: SetupFix, val warn: Boolean)
+
+/**
+ * Optional Setup row on Home: strict Private DNS (bypasses DNS filtering, takes priority) or
+ * page filtering when this build includes it and it was never set up. Null when neither applies.
+ */
+internal fun homeSetupRow(
+    privateDnsStrict: Boolean,
+    httpsAvailable: Boolean,
+    httpsOn: Boolean,
+    caInstalled: Boolean,
+): SetupRow? = when {
+    privateDnsStrict -> SetupRow(
+        title = "Setup",
+        detail = "Private DNS is set to a strict hostname and bypasses filtering",
+        fix = SetupFix.PRIVATE_DNS,
+        warn = true,
+    )
+    httpsAvailable && !httpsOn && !caInstalled -> SetupRow(
+        title = "Setup",
+        detail = "Set up page filtering in browsers",
+        fix = SetupFix.HTTPS,
+        warn = false,
+    )
+    else -> null
+}
+
+/** Detail line under Home's Rules row. */
+internal fun rulesDetail(ageMs: Long, now: Long = System.currentTimeMillis()): String =
+    if (ageMs <= 0) "Not updated yet" else "Updated ${ago(ageMs, now)}"
+
+/**
+ * The line under today's share bar, in everyday words: the share of the apps' requests (DNS
+ * lookups) blocked and, with the page engine, what was blocked inside browser pages besides. The
+ * blocked requests and the page blocks add up to "Blocked today"; allowed page requests are never
+ * counted, so no share is given for them.
+ */
+internal fun requestShare(stats: Stats, pages: Boolean): String {
+    val base = "${percent(stats.dnsRatio)} of ${counted(stats.dnsQueries, "request")}"
+    return if (pages && stats.blockedInBrowsers > 0) "$base, plus ${fmt(stats.blockedInBrowsers)} in browser pages" else base
 }
 
 /** Why browser pages are not filtered, from `Stats.httpsState`, as the status card says it. */

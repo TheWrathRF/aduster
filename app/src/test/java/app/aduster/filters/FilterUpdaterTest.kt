@@ -781,4 +781,64 @@ class FilterUpdaterTest {
             tmp.deleteRecursively()
         }
     }
+
+    @Test
+    fun dnsRulesApplyWhilePageListsStillDownload() {
+        val webGate = java.util.concurrent.CountDownLatch(1)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.executor = java.util.concurrent.Executors.newFixedThreadPool(4)
+        server.createContext("/") { ex ->
+            try {
+                val page = ex.requestURI.path == "/w.txt"
+                if (page) webGate.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                val b = (if (page) "##.ad" else "||ads.test^").toByteArray()
+                ex.sendResponseHeaders(200, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            } finally {
+                ex.close()
+            }
+        }
+        server.start()
+        val tmp = Files.createTempDirectory("aduster-dns-first").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val base = "http://127.0.0.1:${server.address.port}"
+            val d = FilterList("custom-00000001", "DNS", "$base/d.txt", false, Group.CUSTOM, true, "")
+            val w = FilterList("custom-00000002", "Web", "$base/w.txt", true, Group.CUSTOM, true, "")
+            val settings = app.aduster.settings.Settings(httpsFiltering = true, userRules = "")
+            val dnsApplied = java.util.concurrent.CountDownLatch(1)
+            val phases = java.util.Collections.synchronizedList(mutableListOf<UpdatePhase>())
+            val error = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+            val worker = Thread {
+                try {
+                    FilterUpdater.updateStore(
+                        store = store,
+                        readSettings = { settings },
+                        check = FilterUpdater.Check.ALL,
+                        webWanted = { it.httpsFiltering },
+                        compileDns = { true },
+                        compileWeb = { false },
+                        dnsListsOf = { listOf(d) },
+                        webListsOf = { listOf(w) },
+                        onDns = { dnsApplied.countDown() },
+                        progress = { phases += it.phase },
+                    )
+                } catch (t: Throwable) {
+                    error.set(t)
+                }
+            }
+            worker.start()
+            // The page list is still held by the server: the new DNS rules must not wait for it.
+            assertEquals("DNS rules waited for the page lists", true, dnsApplied.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            webGate.countDown()
+            worker.join(10_000)
+            assertNull(error.get())
+            assertEquals(UpdatePhase.BUILDING_PAGES, phases.last())
+            assertEquals(phases.sortedBy { it.ordinal }, phases.toList())
+        } finally {
+            webGate.countDown()
+            server.stop(0)
+            tmp.deleteRecursively()
+        }
+    }
 }

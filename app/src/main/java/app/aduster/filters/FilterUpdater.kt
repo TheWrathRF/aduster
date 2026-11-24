@@ -25,6 +25,14 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
+/** Phases of a filter update or compile, in order. [BUILDING_PAGES] is omitted when page filtering cannot run. */
+enum class UpdatePhase {
+    WAITING_NETWORK,
+    CHECKING,
+    APPLYING_DNS,
+    BUILDING_PAGES,
+}
+
 /** Downloads lists (conditional GET) and compiles the DNS table. Blocking; call off the main thread. */
 object FilterUpdater {
     private const val MAX_BYTES = 64L * 1024 * 1024
@@ -152,17 +160,17 @@ object FilterUpdater {
     }
 
     /**
-     * Checks the lists [check] calls for and rebuilds what changed. The DNS lists come first: as
-     * soon as they are in, the DNS table is compiled and [onDns] told (`:core` loads it at once)
-     * while the page lists are still downloading; the page engine follows. [progress] gets the
-     * last list checked, how many are done and how many there are.
+     * Checks the lists [check] calls for and rebuilds what changed. All due lists download in
+     * parallel while [progress] counts only the lists the user sees; then the DNS table is
+     * compiled and [onDns] told (`:core` loads it at once), followed by the page engine when page
+     * filtering can run.
      */
     fun update(
         context: Context,
         readSettings: suspend () -> Settings,
         check: Check,
         onDns: (Boolean) -> Unit = {},
-        progress: (String, Int, Int) -> Unit = { _, _, _ -> },
+        progress: (FilterJobs.Progress) -> Unit = {},
     ): Result =
         // One update at a time (the periodic one and "Update now" may overlap): each reads what
         // meta.json knows of the files before it downloads and records it after, and two at once
@@ -196,7 +204,7 @@ object FilterUpdater {
         webListsOf: (Settings) -> List<FilterList> = { FilterCatalog.enabledWeb(it) + FilterCatalog.exclusionLists },
         onDns: (Boolean) -> Unit = {},
         onExclusionsChanged: () -> Unit = {},
-        progress: (String, Int, Int) -> Unit = { _, _, _ -> },
+        progress: (FilterJobs.Progress) -> Unit = {},
     ): Result {
         // Read current settings under the lock so a custom list added while waiting is not removed.
         val initial = store.locked {
@@ -211,7 +219,9 @@ object FilterUpdater {
         val dueDns = dnsLists.filter { due(it, meta, store, check, now) }
         val dueWeb = webLists.filter { due(it, meta, store, check, now) }
         val total = dueDns.size + dueWeb.size
-        var done = 0
+        val visibleTotal = (dueDns + dueWeb).count(::isVisible)
+        var visibleDone = 0
+        val visibleFailed = mutableListOf<String>()
         var lastDone = t0
         val shown = Any()
         val limits = Limits()
@@ -220,14 +230,18 @@ object FilterUpdater {
         var dnsMs = 0L
         var dnsReady = 0L
         var webMs = 0L
+        if (total > 0) progress(FilterJobs.Progress(UpdatePhase.CHECKING, 0, visibleTotal, withPages = web))
         val checked = runBlocking(Dispatchers.IO) {
             fun start(lists: List<FilterList>) = lists.map { l ->
                 async {
                     checkOne(store, l, meta.lists[l.id], limits, now).also {
                         synchronized(shown) {
-                            done++
                             lastDone = android.os.SystemClock.elapsedRealtime()
-                            progress(l.name, done, total)
+                            if (isVisible(l)) {
+                                visibleDone++
+                                if (it.fetch is Fetch.Failed || it.fetch is Fetch.Shrunk || it.inc?.error != null) visibleFailed += l.name
+                                progress(FilterJobs.Progress(UpdatePhase.CHECKING, visibleDone, visibleTotal, withPages = web, failed = visibleFailed.toList()))
+                            }
                         }
                     }
                 }
@@ -235,6 +249,13 @@ object FilterUpdater {
             val dnsJobs = start(dueDns)
             val webJobs = start(dueWeb)
             val dnsChecked = dnsJobs.awaitAll()
+            // The DNS table is compiled while page lists may still be downloading; the strip says
+            // "Applying DNS rules" only once nothing is left to check, so its count stays true.
+            synchronized(shown) {
+                if (webJobs.all { it.isCompleted }) {
+                    progress(FilterJobs.Progress(UpdatePhase.APPLYING_DNS, visibleDone, visibleTotal, withPages = web, failed = visibleFailed.toList()))
+                }
+            }
             // Signatures (size + mtime of every input) decide what needs rebuilding: an updated
             // DNS list does not recompile the page engine unless it changes what the engine
             // relies on, and vice versa. Re-read settings under the lock so changes saved while
@@ -249,16 +270,20 @@ object FilterUpdater {
             dnsReady = android.os.SystemClock.elapsedRealtime() - t0
             onDns(dnsCompiled)
             val webChecked = webJobs.awaitAll()
-            synchronized(shown) { if (web) progress("Compiling", total, total) }
+            val failedNow = synchronized(shown) { visibleFailed.toList() }
             // The page engine goes second: it leaves hosts the DNS table already blocks to it.
             // Re-read settings under the lock so a page rule saved and compiled while downloads
             // ran is kept instead of reverted by an older snapshot.
             store.locked {
                 record(store, webChecked, now)
                 val current = runBlocking { readSettings() }
-                val t = android.os.SystemClock.elapsedRealtime()
-                webCompiled = webWanted(current) && compileWeb(current)
-                webMs = android.os.SystemClock.elapsedRealtime() - t
+                val buildWeb = webWanted(current)
+                if (buildWeb) {
+                    progress(FilterJobs.Progress(UpdatePhase.BUILDING_PAGES, visibleDone, visibleTotal, withPages = true, failed = failedNow))
+                    val t = android.os.SystemClock.elapsedRealtime()
+                    webCompiled = compileWeb(current)
+                    webMs = android.os.SystemClock.elapsedRealtime() - t
+                }
                 store.writeMeta(store.readMeta().copy(lastRun = now))
             }
             dnsChecked + webChecked
@@ -321,15 +346,18 @@ object FilterUpdater {
     /** How many of the lists [ids] have a failed download (their rows say why). */
     internal fun failedOf(meta: FilterMeta, ids: List<String>): Int = ids.count { meta.lists[it]?.error != null }
 
+    /** Whether [l] is a downloaded list with a row of its own on Filters (not built-in, companion or never-decrypt). */
+    internal fun isVisible(l: FilterList): Boolean = l.asset == null && !l.neverDecrypt && l.adguardTrustedOf == null
+
     /**
      * The lists in use that an update downloads ([web]: page filtering runs) and that have a row
      * on Filters, which says why one failed: not the app's own lists (they come with it), the
      * never-decrypt lists or the lists that ride along with another.
      */
-    fun downloaded(settings: Settings, web: Boolean): List<String> {
+    fun downloaded(settings: Settings, web: Boolean, device: Device = Device.current()): List<String> {
         val rows = FilterCatalog.all(settings).map { it.id }.toSet()
-        return (FilterCatalog.enabledDns(settings) + if (web) FilterCatalog.enabledWeb(settings) else emptyList())
-            .filter { it.asset == null && it.id in rows }.map { it.id }
+        return (FilterCatalog.enabledDns(settings, device) + if (web) FilterCatalog.enabledWeb(settings, device) else emptyList())
+            .filter { isVisible(it) && it.id in rows }.map { it.id }
     }
 
     /** A list's metadata after one download ([r]) of it and its parts ([inc]) from [url]. */

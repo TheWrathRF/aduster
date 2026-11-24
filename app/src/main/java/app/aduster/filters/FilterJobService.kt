@@ -82,7 +82,13 @@ object FilterJobs {
     private const val EXTRA_WIFI_ONLY = "wifi_only"
 
     /** What a job of this process is doing right now (null = nothing), for the Filters screen. */
-    data class Progress(val text: String, val done: Int = 0, val total: Int = 0)
+    data class Progress(
+        val phase: UpdatePhase,
+        val done: Int = 0,
+        val total: Int = 0,
+        val withPages: Boolean = false,
+        val failed: List<String> = emptyList(),
+    )
 
     private val _progress = MutableStateFlow<Progress?>(null)
     val progress: StateFlow<Progress?> = _progress
@@ -195,7 +201,7 @@ object FilterJobs {
         // A pending forced check already covers an unforced one.
         val pending = js.getPendingJob(ID_NOW)
         val forced = force || pending?.extras?.getBoolean(EXTRA_FORCE) == true
-        if (active[ID_NOW] == null) publish(ID_NOW, Progress("Starting"))
+        if (active[ID_NOW] == null) publish(ID_NOW, Progress(UpdatePhase.CHECKING))
         // No network constraint (see [schedule]); without a network the job retries with backoff.
         js.schedule(
             builder(ctx, ID_NOW)
@@ -220,7 +226,7 @@ object FilterJobs {
             askAgain(ctx, ID_COMPILE, forceWeb)
             return
         }
-        if (active[ID_COMPILE] == null) publish(ID_COMPILE, Progress("Compiling"))
+        if (active[ID_COMPILE] == null) publish(ID_COMPILE, Progress(UpdatePhase.APPLYING_DNS))
         scheduler(ctx).schedule(
             builder(ctx, ID_COMPILE).setExpedited(true)
                 .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forceWeb) })
@@ -293,12 +299,16 @@ object FilterJobs {
     }
 
     /** Rebuilds the engines whose inputs changed and tells :core which ones to load. */
-    private fun compileNow(ctx: Context, id: Int, readSettings: suspend () -> Settings, forceWeb: Boolean) {
-        publish(id, Progress("Compiling"))
+    private suspend fun compileNow(ctx: Context, id: Int, readSettings: suspend () -> Settings, forceWeb: Boolean) {
+        val web = FilterUpdater.webWanted(ctx, readSettings())
+        publish(id, Progress(UpdatePhase.APPLYING_DNS, withPages = web))
         val dns = FilterUpdater.compile(ctx, readSettings)
         if (dns) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false)
-        val web = FilterUpdater.compileWeb(ctx, readSettings, forceWeb)
-        if (web) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
+        if (FilterUpdater.webWanted(ctx, readSettings())) {
+            publish(id, Progress(UpdatePhase.BUILDING_PAGES, withPages = true))
+            val webBuilt = FilterUpdater.compileWeb(ctx, readSettings, forceWeb)
+            if (webBuilt) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
+        }
         FilterUpdater.noteAppVersion(ctx)
     }
 
@@ -329,10 +339,10 @@ object FilterJobs {
                             // periodic update or the next app open catches up.
                             if (!keepTrying(ctx)) return false
                             waiting = true
-                            publish(id, Progress("Waiting for network"))
+                            publish(id, Progress(UpdatePhase.WAITING_NETWORK))
                             return true
                         }
-                        publish(id, Progress("Starting"))
+                        publish(id, Progress(UpdatePhase.CHECKING))
                         val check = when {
                             id == ID_PERIODIC -> FilterUpdater.Check.STALE
                             force -> FilterUpdater.Check.ALL
@@ -340,8 +350,8 @@ object FilterJobs {
                         }
                         // New DNS rules are loaded as soon as they are compiled, not after the
                         // page engine.
-                        val r = FilterUpdater.update(ctx, readSettings, check, onDns = { if (it) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false) }) { name, done, total ->
-                            publish(id, Progress(name, done, total))
+                        val r = FilterUpdater.update(ctx, readSettings, check, onDns = { if (it) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false) }) { p ->
+                            publish(id, p)
                         }
                         if (r.webCompiled) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
                         FilterUpdater.noteAppVersion(ctx)

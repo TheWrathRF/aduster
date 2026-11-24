@@ -42,15 +42,17 @@ object AdIcons {
     /** The mark as the launcher draws it: the ring cut by a slot (square ends), its bar inside, the stem. */
     val Home: ImageVector = ImageVector.Builder("home", 24.dp, 24.dp, 24f, 24f).apply {
         val ink = SolidColor(Color.Black)
-        // Ring centre (10.5, 13), radius 6; the slot 3.2 units tall through its middle.
+        // Ring centre (12.5, 13), radius 6; the slot 3.2 units tall through its middle. Each half is
+        // the short arc between the slot's edges (the long one draws a figure eight).
         path(fill = null, stroke = ink, strokeLineWidth = 2f, strokeLineCap = StrokeCap.Butt) {
-            moveTo(4.717f, 11.4f)
-            arcTo(6f, 6f, 0f, isMoreThanHalf = true, isPositiveArc = true, x1 = 16.283f, y1 = 11.4f)
-            moveTo(16.283f, 14.6f)
-            arcTo(6f, 6f, 0f, isMoreThanHalf = true, isPositiveArc = true, x1 = 4.717f, y1 = 14.6f)
+            moveTo(6.717f, 11.4f)
+            arcTo(6f, 6f, 0f, isMoreThanHalf = false, isPositiveArc = true, x1 = 18.283f, y1 = 11.4f)
+            moveTo(18.283f, 14.6f)
+            arcTo(6f, 6f, 0f, isMoreThanHalf = false, isPositiveArc = true, x1 = 6.717f, y1 = 14.6f)
         }
-        path(fill = null, stroke = ink, strokeLineWidth = 2f, strokeLineCap = StrokeCap.Round) { line(19f, 5f, 19f, 20f) }
-        path(fill = null, stroke = ink, strokeLineWidth = 1.4f, strokeLineCap = StrokeCap.Round) { line(6.6f, 13f, 10.6f, 13f) }
+        // The stem on the ring's right side, rising above it as in the launcher's mark.
+        path(fill = null, stroke = ink, strokeLineWidth = 2f, strokeLineCap = StrokeCap.Round) { line(18.5f, 5f, 18.5f, 19f) }
+        path(fill = null, stroke = ink, strokeLineWidth = 1.4f, strokeLineCap = StrokeCap.Round) { line(8.6f, 13f, 12.6f, 13f) }
     }.build()
 
     val Log = icon("log", mirror = true) {

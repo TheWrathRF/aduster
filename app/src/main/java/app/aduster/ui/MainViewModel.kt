@@ -64,6 +64,9 @@ data class InstalledApp(
     val note: String? = null,
 )
 
+/** One-shot filter Home passes when opening the Log on a domain or app. */
+data class LogFilterRequest(val query: String = "", val appUid: Int? = null)
+
 /** Log entries fetched per binder call (forward paging). */
 private const val LOG_PAGE = 1000
 
@@ -117,6 +120,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** One log poll at a time: two overlapping polls would read the same entries twice. */
     private val logPoll = Mutex()
 
+    /** Installed browsers, for Page filtering's list and the Log's Browsers filter. */
+    private val _browsers = MutableStateFlow<List<app.aduster.https.Browser>>(emptyList())
+    val browsers: StateFlow<List<app.aduster.https.Browser>> = _browsers
+
     /** The browsers' UIDs, for the Log's "Browsers" filter. */
     private val _browserUids = MutableStateFlow<Set<Int>>(emptySet())
     val browserUids: StateFlow<Set<Int>> = _browserUids
@@ -126,7 +133,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val s = store.data.first()
             withContext(Dispatchers.IO) {
                 FilterJobs.schedule(ctx, s)
-                _browserUids.value = HttpsConfig.browsers(ctx).map { it.uid }.toSet()
+                val list = HttpsConfig.browsers(ctx)
+                _browsers.value = list
+                _browserUids.value = list.map { it.uid }.toSet()
                 // A list that was never downloaded (new in the catalog, or first HTTPS enable
                 // interrupted) is fetched now rather than at the next daily check. Otherwise an
                 // engine built by an older version (or from other rules) is rebuilt; unchanged
@@ -238,6 +247,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** The name the certificate was last saved under in Downloads, or null. */
     fun caSavedName(): String? = CaManager.lastSavedName(ctx)
 
+    /** Private DNS set to a strict hostname: works even while protection is off. */
+    fun privateDnsStrict(): Boolean = runCatching {
+        android.provider.Settings.Global.getString(ctx.contentResolver, "private_dns_mode") == "hostname" ||
+            ctx.getSystemService(android.net.ConnectivityManager::class.java)?.let { cm ->
+                cm.getLinkProperties(cm.activeNetwork)?.privateDnsServerName != null
+            } == true
+    }.getOrDefault(false)
+
+    /** Refreshes installed browsers (for example after returning from installing one). */
+    fun refreshBrowsers() {
+        viewModelScope.launch(Dispatchers.IO) {
+            HttpsConfig.forgetBrowsers()
+            val list = HttpsConfig.browsers(ctx)
+            _browsers.value = list
+            _browserUids.value = list.map { it.uid }.toSet()
+        }
+    }
+
     /** The user asked for a new certificate (the old one cannot be used); saved to Downloads. */
     suspend fun recreateCa(): String? = withContext(Dispatchers.IO) {
         runCatching { if (CaManager.recreate(ctx) == null) null else CaManager.exportToDownloads(ctx)?.let { CaManager.savedName(ctx, it) } }.getOrNull()
@@ -317,6 +344,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun timeline(): List<app.aduster.vpn.Timeline.Entry> = app.aduster.vpn.Timeline.read(ctx)
 
     // ---- log ----
+
+    private val _pendingLogFilter = MutableStateFlow<LogFilterRequest?>(null)
+    val pendingLogFilter: StateFlow<LogFilterRequest?> = _pendingLogFilter
+
+    fun openLogFilter(query: String = "", appUid: Int? = null) {
+        _pendingLogFilter.value = LogFilterRequest(query = query, appUid = appUid)
+    }
+
+    fun consumeLogFilter() {
+        _pendingLogFilter.value = null
+    }
 
     fun pollLog() {
         if (!logPoll.tryLock()) return

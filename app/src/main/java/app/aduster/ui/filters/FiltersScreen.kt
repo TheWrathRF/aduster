@@ -1,18 +1,16 @@
 package app.aduster.ui.filters
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -20,64 +18,90 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.semantics.heading
-import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import app.aduster.filters.Device
 import app.aduster.filters.FilterCatalog
 import app.aduster.filters.FilterJobs
 import app.aduster.filters.FilterList
+import app.aduster.filters.FilterMeta
+import app.aduster.filters.FilterUpdater
 import app.aduster.filters.Group
 import app.aduster.filters.ListMeta
 import app.aduster.filters.UserRules
 import app.aduster.https.HttpsConfig
 import app.aduster.settings.CustomList
 import app.aduster.settings.DeviceProfile
+import app.aduster.settings.Settings
+import app.aduster.ui.DomainCheck
 import app.aduster.ui.MainViewModel
+import app.aduster.ui.SiteCheck
 import app.aduster.ui.Sub
 import app.aduster.ui.ago
 import app.aduster.ui.common.AdDialog
 import app.aduster.ui.common.AdusterSwitch
+import app.aduster.ui.common.Card
 import app.aduster.ui.common.ChipTabs
 import app.aduster.ui.common.Chevron
 import app.aduster.ui.common.ChoiceDialog
 import app.aduster.ui.common.Corners
 import app.aduster.ui.common.FoldLabel
 import app.aduster.ui.common.Gutter
+import app.aduster.ui.common.Haptics
 import app.aduster.ui.common.InputField
 import app.aduster.ui.common.ListRow
 import app.aduster.ui.common.Motion
 import app.aduster.ui.common.PillButton
+import app.aduster.ui.common.ProgressStrip
 import app.aduster.ui.common.RowCard
+import app.aduster.ui.common.ScreenTitle
 import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ToggleRow
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.counted
 import app.aduster.ui.fmt
-import androidx.compose.ui.text.font.FontWeight
+import app.aduster.ui.hm
+import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 /** Filters' three views: what filters every app, what filters pages in browsers, and the user's own. */
 internal enum class FilterTab(val label: String) { DNS("All apps (DNS)"), PAGES("Browser pages"), YOURS("Custom") }
+
+/** Actions offered for a checked site in "Fix a site". */
+internal enum class SiteFixAction { FILTER_AGAIN, ALLOW, NEVER_DECRYPT }
 
 /**
  * The list groups a view shows, in order. The Device group holds only the phone maker's own
@@ -90,12 +114,100 @@ internal fun tabGroups(tab: FilterTab, all: List<FilterList>, deviceList: String
     FilterTab.YOURS -> listOf(Group.CUSTOM to all.filter { it.group == Group.CUSTOM })
 }
 
+/** The Update button is disabled while an update or compile job runs. */
+internal fun updateButtonEnabled(progress: FilterJobs.Progress?): Boolean = progress == null
+
+/** Page rules appear in the header summary only when page filtering can actually run. */
+internal fun showPageRulesSummary(available: Boolean, httpsFiltering: Boolean, caTrusted: Boolean): Boolean =
+    available && httpsFiltering && caTrusted
+
+/** Plain summary text for the Filters header, matching what [SummaryLine] displays. */
+internal fun filtersSummaryText(meta: FilterMeta, inUse: List<String>, pageRules: Boolean, now: Long = System.currentTimeMillis()): String {
+    val dns = counted(meta.compiledRules, "DNS rule")
+    val updated = updateLine(meta, inUse, now)
+    return if (pageRules && meta.webError == null) {
+        "$dns, ${counted(meta.webRules, "page rule")}, $updated"
+    } else {
+        "$dns, $updated"
+    }
+}
+
+/** Visible list names whose last download failed (companion and never-decrypt lists excluded). */
+internal fun failedListNames(meta: FilterMeta, settings: Settings, web: Boolean, device: Device = Device.current()): List<String> {
+    val ids = FilterUpdater.downloaded(settings, web, device).toSet()
+    return FilterCatalog.all(settings)
+        .filter { it.id in ids && meta.lists[it.id]?.error != null }
+        .map { it.name }
+}
+
+/** Site exception rule for "Allow on this site". */
+internal fun allowSiteRule(host: String): String = "@@||$host^"
+
+/** Adds [host] to the user's never-decrypt list once. */
+internal fun withNeverDecrypt(exclusions: String, host: String): String =
+    if (exclusions.lines().any { it.trim().equals(host, ignoreCase = true) }) exclusions.trim()
+    else (exclusions.trim() + "\n" + host).trim()
+
+/** Removes [host] from the user's never-decrypt list (for Undo). */
+internal fun withoutNeverDecrypt(exclusions: String, host: String): String =
+    exclusions.lines().filterNot { it.trim().equals(host, ignoreCase = true) }.joinToString("\n").trim()
+
+/** Which actions "Fix a site" offers for [host], in priority order. */
+internal fun siteFixActions(
+    host: String,
+    settings: Settings,
+    site: SiteCheck?,
+    pagesAvailable: Boolean,
+    userExcluded: Boolean,
+): List<SiteFixAction> = buildList {
+    if (site?.bypassed == true) add(SiteFixAction.FILTER_AGAIN)
+    val alreadyAllowed = host in UserRules.sites(settings.userRules).allowed ||
+        site?.reasons?.any { it.kind == "user_allowed" } == true
+    if (!alreadyAllowed) add(SiteFixAction.ALLOW)
+    val alreadyExcluded = userExcluded || site?.reasons?.any { it.kind == "never_decrypt" } == true
+    if (pagesAvailable && settings.httpsFiltering && !alreadyExcluded) add(SiteFixAction.NEVER_DECRYPT)
+}
+
+/** The browser part of "Fix a site" as lines: (text, worth a look). */
+internal fun browserLines(
+    c: SiteCheck?,
+    s: Settings,
+    pagesAvailable: Boolean,
+    userExcluded: Boolean,
+    now: Long = System.currentTimeMillis(),
+): List<Pair<String, Boolean>> {
+    if (!pagesAvailable) return listOf("Pages: no page filtering in this build" to false)
+    if (!s.httpsFiltering) return listOf("Pages: page filtering is off" to false)
+    if (c == null) return listOf("Pages: page filtering is not running" to true)
+    val out = ArrayList<Pair<String, Boolean>>()
+    fun until(sec: Long?) = sec?.let { hm(now + it * 1000) } ?: "?"
+    if (!c.filteringActive) out += "Pages: paused" to true
+    for (r in c.reasons) {
+        out += when (r.kind) {
+            "never_decrypt" -> (if (userExcluded) "Pages: skipped (your list)" else "Pages: skipped (sensitive site)") to false
+            "user_allowed" -> "Pages: allowed by your rules" to false
+            "bot_check" -> "Pages: skipped until ${until(r.remainingS)} for a bot check" to true
+            "media" -> "Pages: skipped until ${until(r.remainingS)} (video or audio)" to false
+            "opened_anyway" -> "Pages: opened anyway, until ${until(r.remainingS)}" to false
+            "network_block" -> "Pages: filtered (network blocks this site by name)" to false
+            "passed_through" -> "Pages: last passed without filtering: ${r.detail.orEmpty()}" to true
+            else -> "Pages: ${r.kind}" to false
+        }
+    }
+    if (c.decrypted && c.reasons.none { it.kind == "user_allowed" }) out += "Pages: filtered" to false
+    return out
+}
+
 @Composable
 fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
     val p = LocalPalette.current
+    val ctx = LocalContext.current
+    val view = LocalView.current
+    val scope = rememberCoroutineScope()
     val s by vm.settings.collectAsStateWithLifecycle()
     val meta by vm.filterMeta.collectAsStateWithLifecycle()
     val progress by vm.updateProgress.collectAsStateWithLifecycle()
+    var caTrusted by remember { mutableStateOf(false) }
     var deviceDialog by remember { mutableStateOf(false) }
     var addDialog by remember { mutableStateOf(false) }
     var removeCandidate by remember { mutableStateOf<FilterList?>(null) }
@@ -109,7 +221,34 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
         folded = set.joinToString(",")
     }
 
+    // State for "Fix a site" on the Custom tab, kept while scrolling.
+    var domain by rememberSaveable { mutableStateOf("") }
+    var checkedHost by remember { mutableStateOf<String?>(null) }
+    var verdict by remember { mutableStateOf<DomainCheck?>(null) }
+    var site by remember { mutableStateOf<SiteCheck?>(null) }
+    var recheck by remember { mutableIntStateOf(0) }
+    val undoBar = remember { SnackbarHostState() }
+
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(lifecycle) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            caTrusted = withContext(Dispatchers.IO) { vm.caInstalled() }
+        }
+    }
     LaunchedEffect(Unit) { vm.refreshFilterMeta() }
+    LaunchedEffect(domain, recheck, s.userRules, s.httpsExclusions) {
+        if (domain.isBlank()) {
+            checkedHost = null
+            verdict = null
+            site = null
+            return@LaunchedEffect
+        }
+        delay(250)
+        val d = UserRules.siteHost(domain)
+        checkedHost = d
+        verdict = if (d != null) withContext(Dispatchers.IO) { vm.checkDomain(d) } else null
+        site = if (d != null) withContext(Dispatchers.IO) { vm.checkSite(d) } else null
+    }
 
     val all = FilterCatalog.all(s)
     val device = remember { Device.current() }
@@ -119,94 +258,165 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
     // Generic hiding rules (`##.ad`) count too.
     val ruleCount = remember(s.userRules) { UserRules.ruleCount(s.userRules) }
     val sites = remember(s.userRules) { UserRules.sites(s.userRules) }
-    val view = FilterTab.entries[tab]
-    val groups = tabGroups(view, all, device.brandList, HttpsConfig.available)
+    val filterTab = FilterTab.entries[tab]
+    val groups = tabGroups(filterTab, all, device.brandList, HttpsConfig.available)
     val onChange = { l: FilterList, on: Boolean -> vm.setListEnabled(l.id, on) }
-    // The lists an update fetches (with page filtering on: its certificate is not checked here).
-    val inUse = remember(s) { app.aduster.filters.FilterUpdater.downloaded(s, s.httpsFiltering && HttpsConfig.available) }
+    val pagesActive = showPageRulesSummary(HttpsConfig.available, s.httpsFiltering, caTrusted)
+    val inUse = remember(s, pagesActive) { FilterUpdater.downloaded(s, pagesActive) }
+    val failedNames = remember(meta, s, pagesActive) { failedListNames(meta, s, pagesActive) }
+    val updateEnabled = updateButtonEnabled(progress)
 
-    LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)) {
-        item(key = "header") { Header(meta, inUse, progress, s.httpsFiltering && HttpsConfig.available) { vm.updateFiltersNow() } }
-        item(key = "chips") {
-            ChipTabs(FilterTab.entries.map { it.label }, tab, { tab = it }, Modifier.padding(top = 8.dp, bottom = 4.dp))
+    fun showUndo(text: String, undo: () -> Unit) {
+        scope.launch {
+            undoBar.currentSnackbarData?.dismiss()
+            val r = undoBar.showSnackbar(text, actionLabel = "Undo", duration = SnackbarDuration.Long)
+            if (r == SnackbarResult.ActionPerformed) undo()
         }
+    }
 
-        when (view) {
-            FilterTab.DNS -> for ((g, lists) in groups) {
-                item(key = "h-" + g.name) { SectionHeading(g.title) }
-                if (g == Group.DEVICE) {
-                    // The maker's own telemetry list: a profile to pick, then the list's state.
-                    val list = lists.single()
-                    item(key = "device") {
-                        RowCard(Modifier.animateItem()) {
-                            Column {
-                                ListRow(list.summary, profile.detail(allowlist), onClick = { deviceDialog = true }) { ValueText(profile.label) }
-                                val x = meta.lists[list.id]
-                                if (x != null && FilterCatalog.isEnabled(list, s, device)) {
-                                    val what = if (allowlist && profile == DeviceProfile.OFF) "Used as an allowlist · " else ""
-                                    ListRow(list.name, what + listDetail(x))
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            ScreenTitle("Filters") {
+                PillButton(
+                    text = "Update",
+                    modifier = Modifier.padding(end = 8.dp).minimumInteractiveComponentSize(),
+                    filled = updateEnabled,
+                    enabled = updateEnabled,
+                    height = 40.dp,
+                ) { vm.updateFiltersNow() }
+            }
+            SummaryLine(meta, inUse, pagesActive)
+            ProgressStrip(
+                phase = progress?.phase,
+                done = progress?.done ?: 0,
+                total = progress?.total ?: 0,
+                failed = progress?.failed ?: failedNames,
+                withPages = progress?.withPages ?: pagesActive,
+            )
+
+            LazyColumn(Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(top = 4.dp, bottom = 32.dp)) {
+                item(key = "chips") {
+                    ChipTabs(FilterTab.entries.map { it.label }, tab, { tab = it }, Modifier.padding(top = 8.dp, bottom = 4.dp))
+                }
+
+                when (filterTab) {
+                    FilterTab.DNS -> for ((g, lists) in groups) {
+                        item(key = "h-" + g.name) { SectionHeading(g.title) }
+                        if (g == Group.DEVICE) {
+                            // The maker's own telemetry list: a profile to pick, then the list's state.
+                            val list = lists.single()
+                            item(key = "device") {
+                                RowCard(Modifier.animateItem()) {
+                                    Column {
+                                        ListRow(list.summary, profile.detail(allowlist), onClick = { deviceDialog = true }) { ValueText(profile.label) }
+                                        val x = meta.lists[list.id]
+                                        if (x != null && FilterCatalog.isEnabled(list, s, device)) {
+                                            val what = if (allowlist && profile == DeviceProfile.OFF) "Used as an allowlist, " else ""
+                                            ListRow(list.name, what + listDetail(x))
+                                        }
+                                    }
                                 }
+                            }
+                        } else {
+                            listCards(lists, s, meta, onChange)
+                        }
+                    }
+
+                    FilterTab.PAGES -> {
+                        // Only said when the lists below do nothing.
+                        val note = when {
+                            !HttpsConfig.available -> "Not included in this build"
+                            s.httpsFiltering -> null
+                            else -> "Used when page filtering is on"
+                        }
+                        if (note != null) item(key = "pages-note") { Note(note) }
+                        for ((g, lists) in groups) {
+                            if (g == Group.WEB) {
+                                item(key = "h-" + g.name) { SectionHeading(g.title) }
+                                listCards(lists, s, meta, onChange)
+                            } else {
+                                // Many lists, rarely changed: folded until opened, with how many are on.
+                                item(key = "h-" + g.name) {
+                                    val on = lists.count { FilterCatalog.isEnabled(it, s) }
+                                    FoldLabel(g.title, expanded = !isFolded(g), summary = "$on of ${lists.size} on") { toggle(g) }
+                                }
+                                if (!isFolded(g)) listCards(lists, s, meta, onChange)
                             }
                         }
                     }
-                } else {
-                    listCards(lists, s, meta, onChange)
-                }
-            }
 
-            FilterTab.PAGES -> {
-                // Only said when the lists below do nothing.
-                val note = when {
-                    !HttpsConfig.available -> "Not included in this build"
-                    s.httpsFiltering -> null
-                    else -> "Used when page filtering is on"
-                }
-                if (note != null) item(key = "pages-note") { Note(note) }
-                for ((g, lists) in groups) {
-                    if (g == Group.WEB) {
-                        item(key = "h-" + g.name) { SectionHeading(g.title) }
-                        listCards(lists, s, meta, onChange)
-                    } else {
-                        // Many lists, rarely changed: folded until opened, with how many are on.
-                        item(key = "h-" + g.name) {
-                            val on = lists.count { FilterCatalog.isEnabled(it, s) }
-                            FoldLabel(g.title, expanded = !isFolded(g), summary = "$on of ${lists.size} on") { toggle(g) }
+                    FilterTab.YOURS -> {
+                        item(key = "fix-site") {
+                            FixSiteSection(
+                                domain = domain,
+                                onDomainChange = { domain = it },
+                                host = checkedHost,
+                                verdict = verdict,
+                                site = site,
+                                settings = s,
+                                userExcluded = checkedHost?.let { vm.userExcludes(it, s) } ?: false,
+                                onAllow = { h ->
+                                    Haptics.confirm(view)
+                                    vm.addUserRule(allowSiteRule(h))
+                                    recheck++
+                                    showUndo("$h allowed") {
+                                        vm.undoAddedRule()
+                                        recheck++
+                                    }
+                                },
+                                onNeverDecrypt = { h ->
+                                    Haptics.confirm(view)
+                                    vm.update { it.copy(httpsExclusions = withNeverDecrypt(it.httpsExclusions, h)) }
+                                    recheck++
+                                    showUndo("$h is no longer decrypted") {
+                                        vm.update { cur -> cur.copy(httpsExclusions = withoutNeverDecrypt(cur.httpsExclusions, h)) }
+                                        recheck++
+                                    }
+                                },
+                                onFilterAgain = { h ->
+                                    Haptics.confirm(view)
+                                    scope.launch {
+                                        val ok = vm.unbypass(h)
+                                        Toast.makeText(ctx, if (ok) "$h is filtered again" else "$h was not bypassed any more", Toast.LENGTH_SHORT).show()
+                                        recheck++
+                                    }
+                                },
+                            )
                         }
-                        if (!isFolded(g)) listCards(lists, s, meta, onChange)
+                        item(key = "sites") {
+                            Column(Modifier.padding(top = 12.dp)) {
+                                RowCard {
+                                    ListRow(
+                                        "Sites",
+                                        "${fmt(sites.allowed.size)} allowed, ${fmt(sites.blocked.size)} blocked",
+                                        onClick = { open(Sub.SITES) },
+                                    ) { Chevron() }
+                                }
+                                RowCard {
+                                    ListRow("My rules", counted(ruleCount, "rule"), onClick = { open(Sub.RULES) }) { Chevron() }
+                                }
+                            }
+                        }
+                        item(key = "h-custom") { SectionHeading("Custom lists") }
+                        // Custom lists switch off like catalog lists; a tap on the row offers removal.
+                        items(groups.single().second, key = { it.id }) { l ->
+                            val on = FilterCatalog.isEnabled(l, s)
+                            RowCard(Modifier.animateItem()) {
+                                ListRow(
+                                    l.name, (if (l.web) "Browser pages: " else "DNS: ") + (meta.lists[l.id]?.let(::listDetail) ?: "not downloaded yet"),
+                                    onClick = { removeCandidate = l },
+                                ) { AdusterSwitch(on, label = "Use ${l.name}") { vm.setListEnabled(l.id, it) } }
+                            }
+                        }
+                        item(key = "custom-add") {
+                            RowCard { ListRow("Add a list by URL", onClick = { addDialog = true }, titleColor = p.accent) }
+                        }
                     }
                 }
             }
-
-            FilterTab.YOURS -> {
-                item(key = "sites") {
-                    Column(Modifier.padding(top = 12.dp)) {
-                        RowCard {
-                            ListRow(
-                                "Sites",
-                                "${fmt(sites.allowed.size)} allowed · ${fmt(sites.blocked.size)} blocked",
-                                onClick = { open(Sub.SITES) },
-                            ) { Chevron() }
-                        }
-                        RowCard {
-                            ListRow("My rules", counted(ruleCount, "rule"), onClick = { open(Sub.RULES) }) { Chevron() }
-                        }
-                    }
-                }
-                item(key = "h-custom") { SectionHeading("Custom lists") }
-                // Custom lists switch off like catalog lists; a tap on the row offers removal.
-                items(groups.single().second, key = { it.id }) { l ->
-                    val on = FilterCatalog.isEnabled(l, s)
-                    RowCard(Modifier.animateItem()) {
-                        ListRow(
-                            l.name, (if (l.web) "Browser pages · " else "DNS · ") + (meta.lists[l.id]?.let(::listDetail) ?: "not downloaded yet"),
-                            onClick = { removeCandidate = l },
-                        ) { AdusterSwitch(on, label = "Use ${l.name}") { vm.setListEnabled(l.id, it) } }
-                    }
-                }
-                item(key = "custom-add") {
-                    RowCard { ListRow("Add a list by URL", onClick = { addDialog = true }, titleColor = p.accent) }
-                }
-            }
+        }
+        SnackbarHost(undoBar, Modifier.align(Alignment.BottomCenter).padding(horizontal = Gutter, vertical = 12.dp)) { d ->
+            Snackbar(d, containerColor = p.surfaceHigh, contentColor = p.text, actionColor = p.accent, shape = RoundedCornerShape(Corners.outer))
         }
     }
 
@@ -247,69 +457,103 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
     }
 }
 
-/**
- * The header card in the tint: the title, the rule count with when the lists last updated (or how
- * far an update is), and Update now. While an update runs, a thin accent bar fills along the
- * card's bottom edge.
- */
+/** Pinned rule summary under the Filters title row. */
 @Composable
-private fun Header(meta: app.aduster.filters.FilterMeta, inUse: List<String>, progress: FilterJobs.Progress?, pageRules: Boolean, onUpdate: () -> Unit) {
+private fun SummaryLine(meta: FilterMeta, inUse: List<String>, pageRules: Boolean) {
     val p = LocalPalette.current
-    Box(
-        Modifier
-            .padding(horizontal = Gutter)
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(Corners.card))
-            .background(p.tone),
-    ) {
-        Column(Modifier.padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 22.dp)) {
-            Text("Filters", style = Type.screenTitle, color = p.text, modifier = Modifier.semantics { heading() })
-            Spacer(Modifier.height(6.dp))
-            AnimatedContent(
-                targetState = progress?.let(::progressText),
-                transitionSpec = { fadeIn(tween(Motion.MEDIUM)) togetherWith fadeOut(tween(Motion.SHORT)) },
-                label = "update state",
-            ) { text ->
-                if (text != null) {
-                    Text(text, style = Type.body, color = p.accent)
-                } else {
-                    Text(
-                        buildAnnotatedString {
-                            withStyle(SpanStyle(fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum", color = p.accent)) { append(fmt(meta.compiledRules)) }
-                            append(" DNS rules · ")
-                            append(updateLine(meta, inUse))
-                        },
-                        style = Type.body,
-                        color = p.text2,
-                    )
+    Column(Modifier.fillMaxWidth().padding(start = Gutter + 4.dp, end = Gutter, bottom = 4.dp)) {
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum", color = p.text)) { append(fmt(meta.compiledRules)) }
+                append(if (meta.compiledRules == 1) " DNS rule" else " DNS rules")
+                if (pageRules && meta.webError == null) {
+                    append(", ")
+                    withStyle(SpanStyle(fontWeight = FontWeight.Medium, fontFeatureSettings = "tnum", color = p.text)) { append(fmt(meta.webRules)) }
+                    append(if (meta.webRules == 1) " page rule" else " page rules")
                 }
-            }
-            if (pageRules) {
-                Text(
-                    meta.webError?.let { "Page rules failed to build: $it" } ?: counted(meta.webRules, "page rule"),
-                    style = Type.small,
-                    color = if (meta.webError != null) p.warn else p.muted,
-                )
-            }
-            Spacer(Modifier.height(16.dp))
-            PillButton(if (progress != null) "Updating…" else "Update now", filled = true) {
-                if (progress == null) onUpdate()
+                append(", ")
+                append(updateLine(meta, inUse))
+            },
+            style = Type.small,
+            color = p.muted,
+        )
+        if (pageRules && meta.webError != null) {
+            Spacer(Modifier.height(2.dp))
+            Text("Page rules failed to build: ${meta.webError}", style = Type.small, color = p.warn)
+        }
+    }
+}
+
+/** Check how one site is handled across DNS and browsers, with one-tap fixes. */
+@Composable
+private fun FixSiteSection(
+    domain: String,
+    onDomainChange: (String) -> Unit,
+    host: String?,
+    verdict: DomainCheck?,
+    site: SiteCheck?,
+    settings: Settings,
+    userExcluded: Boolean,
+    onAllow: (String) -> Unit,
+    onNeverDecrypt: (String) -> Unit,
+    onFilterAgain: (String) -> Unit,
+) {
+    val p = LocalPalette.current
+    Column(Modifier.fillMaxWidth()) {
+        SectionHeading("Fix a site")
+        InputField(
+            domain,
+            onDomainChange,
+            "example.com",
+            Modifier.fillMaxWidth().padding(horizontal = Gutter),
+            label = "Site to check",
+            icon = AdIcons.Search,
+        )
+        AnimatedContent(
+            targetState = Triple(host, verdict, site),
+            transitionSpec = { fadeIn(tween(Motion.MEDIUM)) togetherWith fadeOut(tween(Motion.SHORT)) },
+            label = "verdict",
+        ) { (h, v, c) ->
+            if (h != null && v != null) {
+                val actions = siteFixActions(h, settings, c, HttpsConfig.available, userExcluded)
+                Card(Modifier.padding(top = 10.dp)) {
+                    Text(
+                        "DNS: " + if (v.blocked) "Blocked" else "Allowed",
+                        style = Type.bodyStrong,
+                        color = if (v.blocked) p.blocked else p.text,
+                    )
+                    val why = listOfNotNull(v.rule, v.list?.let { "from $it" }).joinToString(" ")
+                    Text(why.ifEmpty { "No rule matches this name" }, style = Type.mono, color = p.muted)
+                    if (!v.running) Text("Protection is off; checked against the saved lists", style = Type.small, color = p.warn)
+                    Spacer(Modifier.height(8.dp))
+                    browserLines(c, settings, HttpsConfig.available, userExcluded).forEach { (line, warn) ->
+                        Text(line, style = Type.small, color = if (warn) p.warn else p.muted)
+                    }
+                    if (actions.isNotEmpty()) {
+                        Spacer(Modifier.height(14.dp))
+                        actions.forEachIndexed { i, action ->
+                            if (i > 0) Spacer(Modifier.height(8.dp))
+                            val filled = i == 0
+                            when (action) {
+                                SiteFixAction.FILTER_AGAIN -> PillButton("Filter again", Modifier.fillMaxWidth(), filled = filled) { onFilterAgain(h) }
+                                SiteFixAction.ALLOW -> PillButton("Allow on this site", Modifier.fillMaxWidth(), filled = filled) { onAllow(h) }
+                                SiteFixAction.NEVER_DECRYPT -> PillButton("Never decrypt", Modifier.fillMaxWidth(), filled = filled) { onNeverDecrypt(h) }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Spacer(Modifier.height(4.dp))
             }
         }
-        AnimatedVisibility(
-            visible = progress != null,
-            enter = fadeIn(tween(Motion.MEDIUM)),
-            exit = fadeOut(tween(Motion.LONG)),
-            modifier = Modifier.align(Alignment.BottomStart),
-        ) { ProgressLine(progress) }
     }
 }
 
 /** Each list as its own card: name, rules and age (or what it is), and its switch. */
 private fun LazyListScope.listCards(
     lists: List<FilterList>,
-    s: app.aduster.settings.Settings,
-    meta: app.aduster.filters.FilterMeta,
+    s: Settings,
+    meta: FilterMeta,
     onChange: (FilterList, Boolean) -> Unit,
 ) {
     items(lists, key = { it.id }) { l ->
@@ -322,45 +566,27 @@ private fun Note(text: String) {
     Text(text, style = Type.small, color = LocalPalette.current.muted, modifier = Modifier.padding(start = Gutter + 16.dp, end = Gutter + 16.dp, top = 16.dp))
 }
 
-private fun progressText(p: FilterJobs.Progress): String =
-    if (p.total > 0 && p.done < p.total) "Updating ${p.done + 1} of ${p.total} · ${p.text}" else "Updating · ${p.text}"
-
-/** How far an update is, along the header card's bottom edge. */
-@Composable
-private fun ProgressLine(progress: FilterJobs.Progress?) {
-    val p = LocalPalette.current
-    val target = when {
-        progress == null -> 1f
-        progress.total > 0 -> (progress.done.toFloat() / progress.total).coerceIn(0.04f, 1f)
-        else -> 0.04f
-    }
-    val f by animateFloatAsState(target, tween(Motion.LONG, easing = Motion.Emphasized), label = "update progress")
-    Canvas(Modifier.fillMaxWidth().height(3.dp)) {
-        drawRect(p.accent, size = Size(size.width * f, size.height))
-    }
-}
-
 /**
  * When the lists were last updated, for the header, and how many of the lists in use ([ids])
  * failed their last download (as their rows say): when every one did, nothing was updated, only
  * checked.
  */
-internal fun updateLine(m: app.aduster.filters.FilterMeta, ids: List<String>, now: Long = System.currentTimeMillis()): String {
+internal fun updateLine(m: FilterMeta, ids: List<String>, now: Long = System.currentTimeMillis()): String {
     if (m.lastRun <= 0) return "not updated yet"
-    val n = app.aduster.filters.FilterUpdater.failedOf(m, ids)
+    val n = FilterUpdater.failedOf(m, ids)
     if (n <= 0) return "updated ${ago(m.lastRun, now)}"
     // No-break spaces: the line wraps before "1 list failed", never inside it.
     val failed = "$n\u00A0list${if (n == 1) "" else "s"}\u00A0failed"
-    return if (n >= ids.size) "checked ${ago(m.lastRun, now)} · $failed" else "updated ${ago(m.lastRun, now)} · $failed"
+    return if (n >= ids.size) "checked ${ago(m.lastRun, now)}, $failed" else "updated ${ago(m.lastRun, now)}, $failed"
 }
 
-private fun listDetail(m: ListMeta): String {
+internal fun listDetail(m: ListMeta, now: Long = System.currentTimeMillis()): String {
     // Hostname rules the DNS layer already enforces are not duplicated in the page filter; the
     // count includes them, as the list itself does.
     val n = m.rules + m.dnsCovered
     val rules = if (n > 0) counted(n, "rule") else "not compiled"
-    val when_ = if (m.updatedAt > 0) ago(m.updatedAt) else "built in"
-    return if (m.error != null) "$rules · update failed: ${m.error}" else "$rules · $when_"
+    val when_ = if (m.updatedAt > 0) ago(m.updatedAt, now) else "built in"
+    return if (m.error != null) "$rules, update failed: ${m.error}" else "$rules, $when_"
 }
 
 @Composable

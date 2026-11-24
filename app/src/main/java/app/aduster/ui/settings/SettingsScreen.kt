@@ -192,8 +192,8 @@ fun SettingsScreen(vm: MainViewModel, open: (Sub) -> Unit) {
             "DNS server",
             Upstreams.presets,
             Upstreams.byId(s.upstream),
-            label = { it.label },
-            detail = { it.detail },
+            label = { Upstreams.pickerLabel(it) },
+            detail = { Upstreams.pickerDetail(it) },
             onDismiss = { dialog = null },
         ) { preset ->
             if (preset.id == "custom") {

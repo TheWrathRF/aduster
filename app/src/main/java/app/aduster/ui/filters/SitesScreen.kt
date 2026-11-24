@@ -79,15 +79,17 @@ fun SitesScreen(vm: MainViewModel, onBack: () -> Unit) {
             PillButton("Block", Modifier.weight(1f), enabled = host != null) { set(false) }
         }
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 32.dp)) {
-            item(key = "allowed") { SectionHeading("Allowed · ${sites.allowed.size}") }
+            item(key = "allowed") { SectionHeading(sitesHeading("Allowed", sites.allowed.size)) }
             if (sites.allowed.isEmpty()) item(key = "allowed-none") { None("No allowed sites") }
             groupItems(sites.allowed, key = { "a-$it" }) { h -> SiteRow(h) { vm.setSite(h, null) } }
-            item(key = "blocked") { SectionHeading("Blocked · ${sites.blocked.size}") }
+            item(key = "blocked") { SectionHeading(sitesHeading("Blocked", sites.blocked.size)) }
             if (sites.blocked.isEmpty()) item(key = "blocked-none") { None("No blocked sites") }
             groupItems(sites.blocked, key = { "b-$it" }) { h -> SiteRow(h) { vm.setSite(h, null) } }
         }
     }
 }
+
+internal fun sitesHeading(label: String, count: Int): String = "$label ($count)"
 
 @Composable
 private fun SiteRow(host: String, onRemove: () -> Unit) {

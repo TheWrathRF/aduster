@@ -100,13 +100,15 @@ data class Stats(
 }
 
 /**
- * The calendar days from the first one with data to [today], at most [slots]: days without data
- * in between are empty slots, so the bars are real days even after days off. A new install or a
- * reset shows today alone, not a row of empty days. Oldest first, today last.
+ * The last [slots] calendar days ending at [today], oldest first: days without data are null,
+ * so the chart draws all [slots] tracks and a new install does not show a lone bar. When no day
+ * has been recorded yet ([today].day <= 0), every slot is null.
  */
 fun historySlots(history: List<DayStat>, today: DayStat, slots: Int = 30): List<DayStat?> {
-    val byDay = history.associateBy { it.day } + (today.day to today)
-    val first = maxOf(byDay.keys.min(), today.day - slots + 1)
+    if (slots <= 0) return emptyList()
+    if (today.day <= 0) return List(slots) { null }
+    val byDay = history.filter { it.day > 0 }.associateBy { it.day } + (today.day to today)
+    val first = today.day - slots + 1
     return (first..today.day).map { byDay[it] }
 }
 
@@ -236,7 +238,10 @@ fun parseDomainCheck(json: String): DomainCheck? =
 data class SiteReason(val kind: String, val remainingS: Long?, val detail: String?)
 
 /** "Check a site", browser part: null = the proxy is not running. */
-data class SiteCheck(val decrypted: Boolean, val filteringActive: Boolean, val reasons: List<SiteReason>)
+data class SiteCheck(val decrypted: Boolean, val filteringActive: Boolean, val reasons: List<SiteReason>) {
+    /** True when the engine passed the site through automatically (a bot-check or pass-through bypass). */
+    val bypassed: Boolean get() = reasons.any { it.kind == "bot_check" || it.kind == "passed_through" }
+}
 
 fun parseSiteCheck(json: String): SiteCheck? =
     runCatching {
@@ -247,7 +252,7 @@ fun parseSiteCheck(json: String): SiteCheck? =
             o["filtering_active"]?.jsonPrimitive?.content != "false",
             (o["reasons"] as? JsonArray).orEmpty().mapNotNull { e ->
                 val r = e as? JsonObject ?: return@mapNotNull null
-                val detail = listOfNotNull(r["reason"]?.jsonPrimitive?.content?.replace('_', ' '), r["detail"]?.jsonPrimitive?.content).joinToString(" · ").ifEmpty { null }
+                val detail = listOfNotNull(r["reason"]?.jsonPrimitive?.content?.replace('_', ' '), r["detail"]?.jsonPrimitive?.content).joinToString(", ").ifEmpty { null }
                 SiteReason(r["kind"]?.jsonPrimitive?.content.orEmpty(), r["remaining_s"]?.jsonPrimitive?.longOrNull, detail)
             },
         )

@@ -71,6 +71,7 @@ import androidx.lifecycle.viewModelScope
 import app.aduster.ui.LogItem
 import app.aduster.ui.MainViewModel
 import app.aduster.ui.QueryAction
+import app.aduster.ui.SiteCheck
 import app.aduster.ui.appName
 import app.aduster.ui.clock
 import app.aduster.ui.common.AppIcon
@@ -120,6 +121,16 @@ fun LogScreen(vm: MainViewModel) {
     var clearDialog by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf<LogLine.Query?>(null) }
     val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
+    val pendingFilter by vm.pendingLogFilter.collectAsStateWithLifecycle()
+    LaunchedEffect(pendingFilter) {
+        val req = pendingFilter ?: return@LaunchedEffect
+        query = req.query
+        app = req.appUid
+        kind = 0
+        inBrowsers = false
+        pages = false
+        vm.consumeLogFilter()
+    }
 
     // Poll only while this screen is shown (not while the app sits in the background), and not
     // at all while the log is off.
@@ -667,6 +678,10 @@ private fun Empty(title: String, detail: String? = null) {
     }
 }
 
+/** The site host the page filter handled for [r], or null for plain DNS rows. */
+internal fun proxySiteOf(r: LogLine.Query): String? =
+    if (r.entries.any { it.qtype == 0 }) r.e.page ?: r.e.name else null
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onChanged: (String, () -> Unit) -> Unit, onDismiss: () -> Unit) {
@@ -681,6 +696,11 @@ private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp:
         onDismiss()
     }
     val s by vm.settings.collectAsStateWithLifecycle()
+    val proxySite = proxySiteOf(r)
+    var siteCheck by remember(proxySite) { mutableStateOf<SiteCheck?>(null) }
+    LaunchedEffect(proxySite) {
+        if (proxySite != null) siteCheck = withContext(Dispatchers.IO) { vm.checkSite(proxySite) }
+    }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = p.surface, dragHandle = null) {
         Column(Modifier.padding(horizontal = Gutter).padding(top = 24.dp, bottom = 16.dp).navigationBarsPadding()) {
             Text(e.action.label, style = Type.heading, color = if (e.action.blocked) p.blocked else p.muted)
@@ -751,6 +771,19 @@ private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp:
                         vm.update { cur -> cur.copy(httpsExclusions = cur.httpsExclusions.lines().filterNot { it.trim() == site }.joinToString("\n").trim()) }
                     }
                     onDismiss()
+                }
+            }
+            // A site the page engine automatically passed through can be filtered again right here.
+            if (proxySite != null && siteCheck?.bypassed == true) {
+                TextAction("Filter again", color = p.accent) {
+                    Haptics.confirm(view)
+                    onDismiss()
+                    vm.viewModelScope.launch {
+                        val ok = vm.unbypass(proxySite)
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(ctx, if (ok) "$proxySite is filtered again" else "$proxySite was not bypassed any more", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                 }
             }
         }

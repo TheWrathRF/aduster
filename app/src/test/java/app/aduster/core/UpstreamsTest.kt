@@ -12,7 +12,7 @@ class UpstreamsTest {
     fun oneProviderIsDescribedAlikeInBothProtocols() {
         val byProvider = Upstreams.presets.filter { it.id.endsWith("-doh") || it.id.endsWith("-dot") }.groupBy { it.id.substringBeforeLast('-') }
         for ((provider, presets) in byProvider) {
-            val notes = presets.map { it.detail.substringAfter(" · ") }.toSet()
+            val notes = presets.map { it.detail.substringAfter(", ") }.toSet()
             assertEquals(provider, 1, notes.size)
         }
     }

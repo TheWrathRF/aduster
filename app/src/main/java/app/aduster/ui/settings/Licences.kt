@@ -42,7 +42,7 @@ import kotlinx.coroutines.withContext
 /**
  * The licence texts the app ships, in a dialog from Settings: one block per file in
  * `assets/licenses/`, which opens to its text. A file named `<Component>-<Licence>.txt` is
- * headed "<Component> · <Licence>".
+ * headed "<Component>, <Licence>".
  */
 @Composable
 fun LicencesDialog(onDismiss: () -> Unit) {
@@ -109,8 +109,8 @@ private fun Header(title: String, expanded: Boolean, onToggle: () -> Unit) {
 private const val DIR = "licenses"
 
 /**
- * "GoogleSansCode-OFL.txt" → "Google Sans Code · OFL", "Rust libraries-Apache-2.0.txt" →
- * "Rust libraries · Apache-2.0": the component ends at the first dash (licence ids have their
+ * "GoogleSansCode-OFL.txt" → "Google Sans Code, OFL", "Rust libraries-Apache-2.0.txt" →
+ * "Rust libraries, Apache-2.0": the component ends at the first dash (licence ids have their
  * own), and only a name without spaces is split, before each capital that starts a word
  * ("ABCLib" keeps its acronym).
  */
@@ -119,5 +119,5 @@ internal fun licenceTitle(file: String): String {
     val dash = name.indexOf('-')
     val raw = if (dash > 0) name.substring(0, dash) else name
     val component = if (' ' in raw) raw else raw.replace(Regex("(?<=[a-z])(?=[A-Z][a-z])"), " ")
-    return if (dash > 0) component + " · " + name.substring(dash + 1) else component
+    return if (dash > 0) component + ", " + name.substring(dash + 1) else component
 }

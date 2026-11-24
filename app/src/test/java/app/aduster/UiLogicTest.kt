@@ -24,7 +24,6 @@ import app.aduster.ui.settings.timelineLines
 import app.aduster.ui.theme.blockedTint
 import app.aduster.ui.theme.pastBar
 import app.aduster.ui.theme.radioRing
-import app.aduster.ui.theme.shareLine
 import app.aduster.ui.theme.switchEdge
 import app.aduster.vpn.Timeline
 import app.aduster.vpn.realignedPauseEnd
@@ -123,11 +122,14 @@ class UiLogicTest {
 
     @Test
     fun historySlotsKeepGaps() {
-        // Calendar days from the first day with data; missing days in between are empty slots.
+        // All slots ending at today; missing days before or in between are empty slots.
         val slots = historySlots(listOf(DayStat(95, 10, 1), DayStat(98, 20, 2)), DayStat(100, 5, 1), slots = 7)
-        assertEquals(listOf(95L, null, null, 98L, null, 100L), slots.map { it?.day })
-        // A new install shows today alone, not 29 empty days before it.
-        assertEquals(listOf(100L), historySlots(emptyList(), DayStat(100, 5, 1)).map { it?.day })
+        assertEquals(listOf(null, 95L, null, null, 98L, null, 100L), slots.map { it?.day })
+        // A new install still fills all 30 slots, with today at the end.
+        val fresh = historySlots(emptyList(), DayStat(100, 5, 1))
+        assertEquals(30, fresh.size)
+        assertTrue(fresh.take(29).all { it == null })
+        assertEquals(100L, fresh.last()?.day)
         // Older data is cut at the chart's width.
         assertEquals(7, historySlots(listOf(DayStat(50, 1, 1)), DayStat(100, 5, 1), slots = 7).size)
     }
@@ -139,13 +141,13 @@ class UiLogicTest {
     @Test
     fun homeNumbersAgree() {
         val s = Stats.parse("""{"running":true,"queries":1047,"blocked":895,"dns_queries":1000,"dns_blocked":180}""", running = true)
-        val full = app.aduster.ui.home.homeNumbers(s, pages = true)
-        assertEquals(listOf("DNS lookups", "DNS lookups blocked", "Blocked in browsers"), full.map { it.label })
-        assertEquals(listOf("1,000", "18%", "715"), full.map { it.value })
-        assertEquals(s.blocked, s.dnsBlocked + full[2].raw)
+        assertEquals("18% of 1,000 requests, plus 715 in browser pages", app.aduster.ui.home.requestShare(s, pages = true))
+        assertEquals(s.blocked, s.dnsBlocked + s.blockedInBrowsers)
         // A build without the page engine has nothing to count in browsers.
         val public = Stats.parse("""{"running":true,"queries":1000,"blocked":180,"dns_queries":1000,"dns_blocked":180}""", running = true)
-        assertEquals(listOf("DNS lookups", "DNS lookups blocked"), app.aduster.ui.home.homeNumbers(public, pages = false).map { it.label })
+        assertEquals("18% of 1,000 requests", app.aduster.ui.home.requestShare(public, pages = false))
+        val one = Stats.parse("""{"running":true,"queries":1,"blocked":0,"dns_queries":1,"dns_blocked":0}""", running = true)
+        assertEquals("0% of 1 request", app.aduster.ui.home.requestShare(one, pages = false))
     }
 
     /**
@@ -289,7 +291,7 @@ class UiLogicTest {
         val lines = app.aduster.ui.settings.exitLines(
             listOf(x("app.aduster", 4_000, "app updated"), x("app.aduster", 3_000, "app updated"), x("app.aduster:core", 2_000, "crash", "foreground service"), x("app.aduster", 1_000, "app updated")),
         )
-        assertEquals(listOf("App · Updated", "Protection · Crashed"), lines.map { it.first })
+        assertEquals(listOf("App: updated", "Protection: crashed"), lines.map { it.first })
         assertTrue(lines[0].second, lines[0].second.startsWith("3 times, last "))
         assertEquals(listOf(false, true), lines.map { it.third })
         // The system's own text stays in the report, off the screen.
@@ -785,13 +787,13 @@ class UiLogicTest {
             assertEquals(p.accent, scheme.primary)
             assertEquals(p.surface, scheme.surfaceContainerHigh)
         }
-        assertEquals("Google Sans Code · OFL", app.aduster.ui.settings.licenceTitle("GoogleSansCode-OFL.txt"))
+        assertEquals("Google Sans Code, OFL", app.aduster.ui.settings.licenceTitle("GoogleSansCode-OFL.txt"))
         // Licence ids hold dashes and versions; a component with spaces keeps its own casing.
-        assertEquals("Rust libraries · Apache-2.0", app.aduster.ui.settings.licenceTitle("Rust libraries-Apache-2.0.txt"))
-        assertEquals("uBlock Origin scriptlets · GPL-3.0", app.aduster.ui.settings.licenceTitle("uBlock Origin scriptlets-GPL-3.0.txt"))
-        assertEquals("Rust libraries · BSD-3-Clause", app.aduster.ui.settings.licenceTitle("Rust libraries-BSD-3-Clause.txt"))
+        assertEquals("Rust libraries, Apache-2.0", app.aduster.ui.settings.licenceTitle("Rust libraries-Apache-2.0.txt"))
+        assertEquals("uBlock Origin scriptlets, GPL-3.0", app.aduster.ui.settings.licenceTitle("uBlock Origin scriptlets-GPL-3.0.txt"))
+        assertEquals("Rust libraries, BSD-3-Clause", app.aduster.ui.settings.licenceTitle("Rust libraries-BSD-3-Clause.txt"))
         // An acronym inside a name stays whole.
-        assertEquals("ABCLib · MIT", app.aduster.ui.settings.licenceTitle("ABCLib-MIT.txt"))
+        assertEquals("ABCLib, MIT", app.aduster.ui.settings.licenceTitle("ABCLib-MIT.txt"))
     }
 
     /**
@@ -873,8 +875,7 @@ class UiLogicTest {
                 "past bar on its track" to contrast(over(p.pastBar(), p.surfaceHigh), p.surfaceHigh),
                 "past bar on the card" to contrast(over(p.pastBar(), p.surfaceHigh), p.surface),
                 "today's bar on its track" to contrast(p.accent, p.surfaceHigh),
-                "share line on its track" to contrast(p.shareLine, p.line),
-                "share line on the card" to contrast(p.shareLine, p.surface),
+                "today's share bar on its track" to contrast(p.blocked, p.surfaceHigh),
                 "switch edge on a row" to contrast(p.switchEdge, p.surface),
                 "switch edge on the page" to contrast(p.switchEdge, p.bg),
                 "unselected radio ring in a dialog" to contrast(p.radioRing, p.surface),
@@ -893,8 +894,8 @@ class UiLogicTest {
         fun line(vararg lists: Pair<String, app.aduster.filters.ListMeta>, inUse: List<String> = lists.map { it.first }) =
             app.aduster.ui.filters.updateLine(app.aduster.filters.FilterMeta(lists = mapOf(*lists), lastRun = now - 30_000), inUse, now).replace('\u00A0', ' ')
         assertEquals("updated just now", line("a" to ok, "b" to ok))
-        assertEquals("updated just now · 1 list failed", line("a" to bad, "b" to ok))
-        assertEquals("checked just now · 2 lists failed", line("a" to bad, "b" to bad))
+        assertEquals("updated just now, 1 list failed", line("a" to bad, "b" to ok))
+        assertEquals("checked just now, 2 lists failed", line("a" to bad, "b" to bad))
         // A list no longer in use (switched off, removed) does not count, though its meta is still there.
         assertEquals("updated just now", line("a" to ok, "gone" to bad, inUse = listOf("a")))
         assertEquals("not updated yet", app.aduster.ui.filters.updateLine(app.aduster.filters.FilterMeta(), listOf("a"), now))

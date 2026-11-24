@@ -22,11 +22,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -42,11 +42,14 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import app.aduster.https.Browser
 import app.aduster.https.HttpsConfig
 import app.aduster.ui.BackBar
 import app.aduster.ui.MainViewModel
 import app.aduster.ui.common.AdDialog
+import app.aduster.ui.common.AppIcon
 import app.aduster.ui.common.Card
+import app.aduster.ui.common.Chevron
 import app.aduster.ui.common.Corners
 import app.aduster.ui.common.Group
 import app.aduster.ui.common.Gutter
@@ -64,7 +67,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Page filtering in browsers: what it does, the one-time certificate install, and exclusions. */
+/** Page filtering in browsers: what it does, the one-time certificate install, browsers and exclusions. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
@@ -72,11 +75,16 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
     val p = LocalPalette.current
     val ctx = LocalContext.current
     val s by vm.settings.collectAsStateWithLifecycle()
+    val stats by vm.stats.collectAsStateWithLifecycle()
+    val browsers by vm.browsers.collectAsStateWithLifecycle()
+    val progress by vm.updateProgress.collectAsStateWithLifecycle()
+    val iconVersion by vm.iconVersion.collectAsStateWithLifecycle()
     var installed by remember { mutableStateOf<Boolean?>(null) }
     var fingerprint by remember { mutableStateOf<String?>(null) }
     var needsNew by remember { mutableStateOf(false) }
     var savedAs by remember { mutableStateOf<String?>(null) }
     var recreateDialog by remember { mutableStateOf(false) }
+    var showCertDetails by rememberSaveable { mutableStateOf(false) }
     // Null until the stored list is read: the editor never starts from placeholder settings,
     // where "Save" would erase the list (the same guard as My rules).
     var edited by rememberSaveable(stateSaver = app.aduster.ui.filters.EditorTextSaver) { mutableStateOf<String?>(null) }
@@ -94,6 +102,7 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
             fingerprint = withContext(Dispatchers.IO) { vm.caFingerprint() }
             needsNew = withContext(Dispatchers.IO) { vm.caNeedsNew() }
             savedAs = withContext(Dispatchers.IO) { vm.caSavedName() }
+            vm.refreshBrowsers()
             // Just installed: the core re-checks at once instead of trusting its cached "no".
             if (installed == true && was != true) vm.notifyCore()
         }
@@ -116,70 +125,72 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
         if (latestDirty && activity?.isChangingConfigurations != true) vm.update { it.copy(httpsExclusions = latestText.trim()) }
     }
 
+    val folded = certificateStepsFolded(installed, needsNew)
+
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         BackBar("Page filtering", onBack)
-        Intro("Removes ads inside web pages in browsers, using a certificate made on this phone.")
+        Intro("Removes ads inside web pages in Chromium browsers, using a certificate made on this phone. Firefox gets DNS filtering only.")
 
-        SectionHeading("1 · Save the certificate")
-        Card {
-            // The first thing to do while the certificate is not installed.
-            PillButton("Save to Downloads", Modifier.fillMaxWidth(), filled = installed == false) {
-                scope.launch {
-                    val name = vm.exportCa()
-                    fingerprint = withContext(Dispatchers.IO) { vm.caFingerprint() }
-                    if (name != null) savedAs = name
-                    Toast.makeText(ctx, if (name != null) "Saved as Downloads/$name" else "Could not save the certificate", Toast.LENGTH_SHORT).show()
+        if (!folded) {
+            SectionHeading("Save the certificate")
+            Card {
+                // The first thing to do while the certificate is not installed.
+                PillButton("Save to Downloads", Modifier.fillMaxWidth(), filled = installed == false) {
+                    scope.launch {
+                        val name = vm.exportCa()
+                        fingerprint = withContext(Dispatchers.IO) { vm.caFingerprint() }
+                        if (name != null) savedAs = name
+                        Toast.makeText(ctx, if (name != null) "Saved as Downloads/$name" else "Could not save the certificate", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                fingerprint?.let { fp ->
+                    Spacer(Modifier.height(16.dp))
+                    CertificateFingerprint(fp)
+                }
+                // The old certificate is never replaced silently; only this explicit action does it.
+                if (needsNew) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("This certificate can no longer be used. Create a new one and install it.", style = Type.small, color = p.warn)
+                    Spacer(Modifier.height(12.dp))
+                    PillButton("Create a new certificate", Modifier.fillMaxWidth()) { recreateDialog = true }
                 }
             }
-            fingerprint?.let { fp ->
-                // Whole, as Android's certificate details show it, so the two can be compared; a
-                // long press copies it.
+
+            SectionHeading("Install the certificate")
+            Card {
+                // Menu paths differ by maker: Settings' own search finds the page on every phone.
+                Text(installStep(savedAs), style = Type.body, color = p.text)
                 Spacer(Modifier.height(16.dp))
-                Text("Certificate fingerprint (SHA-256)", style = Type.small, color = p.muted)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    fp,
-                    style = Type.mono,
-                    color = p.text2,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(Corners.inner))
-                        .combinedClickable(onClick = {}, onLongClickLabel = "Copy the fingerprint", onLongClick = {
-                            val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
-                            cm.setPrimaryClip(android.content.ClipData.newPlainText("fingerprint", fp))
-                            Toast.makeText(ctx, "Fingerprint copied", Toast.LENGTH_SHORT).show()
-                        }),
-                )
+                PillButton("Open Settings", Modifier.fillMaxWidth()) {
+                    ctx.startActivity(Intent(AndroidSettings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
             }
-            // The old certificate is never replaced silently; only this explicit action does it.
-            if (needsNew) {
-                Spacer(Modifier.height(12.dp))
-                Text("This certificate can no longer be used. Create a new one and install it.", style = Type.small, color = p.warn)
-                Spacer(Modifier.height(12.dp))
-                PillButton("Create a new certificate", Modifier.fillMaxWidth()) { recreateDialog = true }
-            }
+
+            SectionHeading("Turn it on")
+        } else {
+            Spacer(Modifier.height(8.dp))
         }
 
-        SectionHeading("2 · Install it")
-        Card {
-            // Menu paths differ by maker: Settings' own search finds the page on every phone.
-            Text(installStep(savedAs), style = Type.body, color = p.text)
-            Spacer(Modifier.height(16.dp))
-            PillButton("Open Settings", Modifier.fillMaxWidth()) {
-                ctx.startActivity(Intent(AndroidSettings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            }
-        }
-
-        SectionHeading("3 · Turn it on")
         Group {
             row {
-                ListRow(
-                    "Certificate",
-                    leading = { RowIcon(if (installed == true) AdIcons.Check else AdIcons.Warn, tint = if (installed == false) p.warn else p.accent) },
-                ) {
-                    when (installed) {
-                        null -> ValueText("Checking…")
-                        true -> ValueText("Installed", p.accent)
-                        false -> ValueText("Not installed", p.warn)
+                if (folded) {
+                    ListRow(
+                        "Certificate: installed",
+                        leading = { RowIcon(AdIcons.Check, tint = p.accent) },
+                        onClick = if (fingerprint != null) ({ showCertDetails = !showCertDetails }) else null,
+                    ) {
+                        if (fingerprint != null) Chevron()
+                    }
+                } else {
+                    ListRow(
+                        "Certificate",
+                        leading = { RowIcon(if (installed == true) AdIcons.Check else AdIcons.Warn, tint = if (installed == false) p.warn else p.accent) },
+                    ) {
+                        when (installed) {
+                            null -> ValueText("Checking…")
+                            true -> ValueText("Installed", p.accent)
+                            false -> ValueText("Not installed", p.warn)
+                        }
                     }
                 }
             }
@@ -196,6 +207,44 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
                     checked = s.httpsFiltering,
                     enabled = installed == true || s.httpsFiltering,
                 ) { vm.setHttpsFiltering(it) }
+            }
+        }
+
+        if (folded && showCertDetails) {
+            fingerprint?.let { fp ->
+                Card(Modifier.padding(top = 8.dp)) {
+                    CertificateFingerprint(fp)
+                }
+            }
+        }
+
+        // After page filtering is switched on its lists download and the page rules are built
+        // (30-40 s on a phone): the same strip as on Filters, only while that work runs.
+        val work = progress?.takeIf { it.withPages }
+        app.aduster.ui.common.ProgressStrip(
+            phase = work?.phase,
+            done = work?.done ?: 0,
+            total = work?.total ?: 0,
+            withPages = true,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+
+        SectionHeading("Browsers")
+        val browserRows = remember(browsers, stats?.filteredBrowsers, stats?.untrustedBrowsers) {
+            browserFilterRows(browsers, stats?.filteredBrowsers.orEmpty(), stats?.untrustedBrowsers.orEmpty())
+        }
+        if (browserRows.isEmpty()) {
+            Note("No browsers found on this phone.")
+        } else {
+            Group {
+                browserRows.forEach { r ->
+                    row {
+                        val icon = remember(iconVersion, r.browser.pkg) { vm.appIcon(r.browser.pkg) }
+                        ListRow(r.browser.name, leading = { AppIcon(icon) }) {
+                            ValueText(r.status, if (r.pageFiltered) p.accent else p.muted)
+                        }
+                    }
+                }
             }
         }
 
@@ -263,12 +312,106 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Whole SHA-256 fingerprint, matching Android's certificate details; a long press copies it. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CertificateFingerprint(fp: String) {
+    val p = LocalPalette.current
+    val ctx = LocalContext.current
+    Text("Certificate fingerprint (SHA-256)", style = Type.small, color = p.muted)
+    Spacer(Modifier.height(4.dp))
+    Text(
+        fp,
+        style = Type.mono,
+        color = p.text2,
+        modifier = Modifier
+            .clip(RoundedCornerShape(Corners.inner))
+            .combinedClickable(onClick = {}, onLongClickLabel = "Copy the fingerprint", onLongClick = {
+                val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("fingerprint", fp))
+                Toast.makeText(ctx, "Fingerprint copied", Toast.LENGTH_SHORT).show()
+            }),
+    )
+}
+
+/** Whether the save and install steps fold into the single "Certificate: installed" row. */
+internal fun certificateStepsFolded(installed: Boolean?, needsNew: Boolean): Boolean =
+    installed == true && !needsNew
+
 /**
  * The install step, naming the file as it was saved ([saved]; null before the first save): next
  * to a file an earlier install left, Downloads names it "Aduster_CA (1).crt".
  */
 internal fun installStep(saved: String?): String =
-    "In Settings, search for \"CA certificate\", tap Install anyway and pick ${saved ?: "Aduster_CA.crt"} from Downloads."
+    "In Settings, search for \"CA certificate\", tap Install anyway and pick ${saved?.takeIf { it.isNotBlank() } ?: "Aduster_CA.crt"} from Downloads."
+
+private val CHROMIUM_EXACT = setOf(
+    "com.android.chrome",
+    "com.chrome.beta",
+    "com.chrome.dev",
+    "com.chrome.canary",
+    "org.chromium.chrome",
+    "app.vanadium.browser",
+    "org.cromite.cromite",
+    "org.bromite.bromite",
+    "com.brave.browser",
+    "com.brave.browser_beta",
+    "com.brave.browser_nightly",
+    "com.microsoft.emmx",
+    "com.microsoft.emmx.beta",
+    "com.microsoft.emmx.dev",
+    "com.microsoft.emmx.canary",
+    "com.sec.android.app.sbrowser",
+    "com.sec.android.app.sbrowser.beta",
+    "com.vivaldi.browser",
+    "com.vivaldi.browser.snapshot",
+    "com.opera.browser",
+    "com.opera.browser.beta",
+    "com.opera.gx",
+    "com.opera.touch",
+    "com.kiwibrowser.browser",
+    "com.yandex.browser",
+    "com.yandex.browser.beta",
+    "com.yandex.browser.alpha",
+    "com.mi.globalbrowser",
+)
+
+private val CHROMIUM_PREFIXES = listOf(
+    "org.chromium.",
+    "org.ungoogled.chromium.",
+    "com.chrome.",
+    "com.brave.browser",
+    "com.microsoft.emmx",
+    "com.vivaldi.browser",
+    "com.sec.android.app.sbrowser",
+    "com.opera.browser",
+)
+
+/** Whether [pkg] is a Chromium browser whose pages can be filtered. */
+internal fun isChromiumBrowser(pkg: String): Boolean {
+    val id = pkg.lowercase()
+    return id in CHROMIUM_EXACT || CHROMIUM_PREFIXES.any { id.startsWith(it) }
+}
+
+internal data class BrowserFilterRow(val browser: Browser, val pageFiltered: Boolean, val status: String)
+
+/**
+ * Installed browsers with their filtering status: Chromium browsers (and any browser the proxy
+ * confirmed filtering) get page filtering; Firefox, other browsers, and any browser that refused
+ * the certificate get DNS only.
+ */
+internal fun browserFilterRows(
+    browsers: List<Browser>,
+    filteredBrowsers: List<String> = emptyList(),
+    untrustedBrowsers: List<String> = emptyList(),
+): List<BrowserFilterRow> = browsers.map { b ->
+    val filtered = when {
+        b.name in untrustedBrowsers -> false
+        b.name in filteredBrowsers -> true
+        else -> isChromiumBrowser(b.pkg)
+    }
+    BrowserFilterRow(b, filtered, if (filtered) "Page filtering" else "DNS only")
+}
 
 /** A build without the page engine: said plainly, with nothing to set up. */
 @Composable

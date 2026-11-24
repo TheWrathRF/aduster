@@ -139,11 +139,10 @@ internal fun colorScheme(p: Palette): ColorScheme = (if (p.dark) darkColorScheme
 
 /**
  * Data graphics and control edges, each at least 3:1 against what it sits on (a test checks):
- * a past day's bar in Home's chart (on its track and on the card), a top list's share line (on
+ * a past day's bar in Home's chart (on its track and on the card), the share bar of today's requests (on
  * its track), an unchecked switch's edge, an unselected radio button's ring.
  */
 internal fun Palette.pastBar(): Color = accent.copy(alpha = if (dark) 0.5f else 0.7f)
-internal val Palette.shareLine: Color get() = muted
 internal val Palette.switchEdge: Color get() = muted
 internal val Palette.radioRing: Color get() = muted
 

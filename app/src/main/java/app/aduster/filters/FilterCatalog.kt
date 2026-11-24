@@ -71,9 +71,9 @@ object FilterCatalog {
      * Their `$app=` lines (desktop apps) and AdGuard's per-platform files are not used.
      */
     val exclusionLists = listOf(
-        FilterList("adguard-https-banks", "AdGuard HTTPS exclusions · banks", "https://raw.githubusercontent.com/AdguardTeam/HttpsExclusions/master/exclusions/banks.txt", true, Group.WEB, true, "Banks and financial services: never decrypted", neverDecrypt = true),
-        FilterList("adguard-https-sensitive", "AdGuard HTTPS exclusions · sensitive", "https://raw.githubusercontent.com/AdguardTeam/HttpsExclusions/master/exclusions/sensitive.txt", true, Group.WEB, true, "Health, government, mail and other sensitive sites: never decrypted", neverDecrypt = true),
-        FilterList("adguard-https-issues", "AdGuard HTTPS exclusions · issues", "https://raw.githubusercontent.com/AdguardTeam/HttpsExclusions/master/exclusions/issues.txt", true, Group.WEB, true, "Sites known to break when decrypted", neverDecrypt = true),
+        FilterList("adguard-https-banks", "AdGuard HTTPS exclusions (banks)", "https://raw.githubusercontent.com/AdguardTeam/HttpsExclusions/master/exclusions/banks.txt", true, Group.WEB, true, "Banks and financial services: never decrypted", neverDecrypt = true),
+        FilterList("adguard-https-sensitive", "AdGuard HTTPS exclusions (sensitive)", "https://raw.githubusercontent.com/AdguardTeam/HttpsExclusions/master/exclusions/sensitive.txt", true, Group.WEB, true, "Health, government, mail and other sensitive sites: never decrypted", neverDecrypt = true),
+        FilterList("adguard-https-issues", "AdGuard HTTPS exclusions (issues)", "https://raw.githubusercontent.com/AdguardTeam/HttpsExclusions/master/exclusions/issues.txt", true, Group.WEB, true, "Sites known to break when decrypted", neverDecrypt = true),
     )
 
     val lists = listOf(
@@ -98,9 +98,9 @@ object FilterCatalog {
         FilterList("adguard-mobile", "AdGuard Mobile Ads", "$ADGUARD/11.txt", true, Group.WEB, true, "Mobile ad networks and in-page mobile ads"),
         FilterList("adguard-tracking", "AdGuard Tracking Protection", "$ADGUARD/3.txt", true, Group.WEB, true, "Trackers, analytics and fingerprinting", dropImageHosts = true),
         FilterList("ubo-filters", "uBlock filters", "$UASSETS/filters.txt", true, Group.WEB, true, "uBlock Origin's site fixes and anti-adblock defuses", trusted = true),
-        FilterList("ubo-quickfixes", "uBlock · Quick fixes", "$UASSETS/quick-fixes.txt", true, Group.WEB, true, "Fast fixes for fresh breakage", trusted = true),
-        FilterList("ubo-unbreak", "uBlock · Unbreak", "$UASSETS/unbreak.txt", true, Group.WEB, true, "Exceptions that keep sites working", trusted = true),
-        FilterList("ubo-badware", "uBlock · Badware risks", "$UASSETS/badware.txt", true, Group.WEB, true, "Scam and fake-download sites", trusted = true),
+        FilterList("ubo-quickfixes", "uBlock Quick fixes", "$UASSETS/quick-fixes.txt", true, Group.WEB, true, "Fast fixes for fresh breakage", trusted = true),
+        FilterList("ubo-unbreak", "uBlock Unbreak", "$UASSETS/unbreak.txt", true, Group.WEB, true, "Exceptions that keep sites working", trusted = true),
+        FilterList("ubo-badware", "uBlock Badware risks", "$UASSETS/badware.txt", true, Group.WEB, true, "Scam and fake-download sites", trusted = true),
         // Regional: on by default for the phone's languages (AdGuard's filter ids).
         FilterList("adguard-chinese", "AdGuard Chinese", "$ADGUARD/224.txt", true, Group.WEB_REGIONAL, false, "Ads and trackers on Chinese sites", languages = setOf("zh")),
         FilterList("adguard-dutch", "AdGuard Dutch", "$ADGUARD/8.txt", true, Group.WEB_REGIONAL, false, "Ads and trackers on Dutch sites", languages = setOf("nl")),
@@ -117,7 +117,7 @@ object FilterCatalog {
         // uBO's "Cookie notices" pair: the AdGuard list misses many sites (EasyList Cookie adds
         // ~18,500 domains, uBO's ~3,300 with scriptlets that press "reject" on consent platforms,
         // e.g. the Guardian's).
-        FilterList("ubo-cookies", "uBlock · Cookie Notices", "$UASSETS/annoyances-cookies.txt", true, Group.WEB_ANNOYANCES, true, "Consent platforms answered with \"reject\"", trusted = true),
+        FilterList("ubo-cookies", "uBlock Cookie Notices", "$UASSETS/annoyances-cookies.txt", true, Group.WEB_ANNOYANCES, true, "Consent platforms answered with \"reject\"", trusted = true),
         FilterList("easylist-cookies", "EasyList Cookie", "https://ublockorigin.github.io/uAssets/thirdparties/easylist-cookies.txt", true, Group.WEB_ANNOYANCES, true, "Cookie banners on sites the other lists miss"),
         FilterList("adguard-popups", "AdGuard Popups", "$ADGUARD/19.txt", true, Group.WEB_ANNOYANCES, true, "Newsletter, subscription and other pop-ups"),
         FilterList("adguard-appbanners", "AdGuard Mobile App Banners", "$ADGUARD/20.txt", true, Group.WEB_ANNOYANCES, true, "\"Open in app\" banners"),
@@ -138,12 +138,12 @@ object FilterCatalog {
      * worth a second download; Tracking's full build is 11 MB). Not shown as lists of their own.
      */
     val trustedCompanions = listOf(
-        FilterList("adguard-base-trusted", "AdGuard Base · trusted rules", "$ADGUARD_FULL/2.txt", true, Group.WEB, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-base"),
-        FilterList("adguard-turkish-trusted", "AdGuard Turkish · trusted rules", "$ADGUARD_FULL/13.txt", true, Group.WEB_REGIONAL, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-turkish"),
-        FilterList("adguard-cookies-trusted", "AdGuard Cookie Notices · trusted rules", "$ADGUARD_FULL/18.txt", true, Group.WEB_ANNOYANCES, true, "Consent windows answered with \"reject\"", adguardTrustedOf = "adguard-cookies"),
-        FilterList("adguard-popups-trusted", "AdGuard Popups · trusted rules", "$ADGUARD_FULL/19.txt", true, Group.WEB_ANNOYANCES, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-popups"),
-        FilterList("adguard-appbanners-trusted", "AdGuard Mobile App Banners · trusted rules", "$ADGUARD_FULL/20.txt", true, Group.WEB_ANNOYANCES, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-appbanners"),
-        FilterList("adguard-annoyances-trusted", "AdGuard Other Annoyances · trusted rules", "$ADGUARD_FULL/21.txt", true, Group.WEB_ANNOYANCES, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-annoyances"),
+        FilterList("adguard-base-trusted", "AdGuard Base (trusted rules)", "$ADGUARD_FULL/2.txt", true, Group.WEB, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-base"),
+        FilterList("adguard-turkish-trusted", "AdGuard Turkish (trusted rules)", "$ADGUARD_FULL/13.txt", true, Group.WEB_REGIONAL, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-turkish"),
+        FilterList("adguard-cookies-trusted", "AdGuard Cookie Notices (trusted rules)", "$ADGUARD_FULL/18.txt", true, Group.WEB_ANNOYANCES, true, "Consent windows answered with \"reject\"", adguardTrustedOf = "adguard-cookies"),
+        FilterList("adguard-popups-trusted", "AdGuard Popups (trusted rules)", "$ADGUARD_FULL/19.txt", true, Group.WEB_ANNOYANCES, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-popups"),
+        FilterList("adguard-appbanners-trusted", "AdGuard Mobile App Banners (trusted rules)", "$ADGUARD_FULL/20.txt", true, Group.WEB_ANNOYANCES, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-appbanners"),
+        FilterList("adguard-annoyances-trusted", "AdGuard Other Annoyances (trusted rules)", "$ADGUARD_FULL/21.txt", true, Group.WEB_ANNOYANCES, true, "Scriptlets AdGuard's uBO build leaves out", adguardTrustedOf = "adguard-annoyances"),
     )
 
     fun byId(id: String) = lists.firstOrNull { it.id == id }

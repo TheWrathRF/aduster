@@ -148,8 +148,8 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
         item(key = "resolver") { Column {
             SectionHeading("DNS server", flat = true)
             Group(flat = true) {
-                row { ListRow("In use") { ValueText(d?.get("upstream")?.jsonPrimitive?.content ?: "system") } }
-                row { ListRow("Network DNS servers") { ValueText(list("system_servers").ifEmpty { "none" }) } }
+                row { ListRow("In use") { ValueText(if (d == null) "…" else upstreamLabel(d?.get("upstream")?.jsonPrimitive?.content)) } }
+                row { ListRow("Network DNS servers") { ValueText(list("system_servers").ifEmpty { "None" }) } }
                 // Medians, and the slowest 1 % of the DNS server's answers.
                 row { ListRow("Local answer time") { ValueText(micros(stats?.localP50 ?: 0)) } }
                 row { ListRow("DNS server answer time") { ValueText(micros(stats?.upstreamP50 ?: 0)) } }
@@ -298,11 +298,22 @@ private fun None(text: String) {
     Text(text, style = Type.small, color = LocalPalette.current.muted, modifier = Modifier.padding(horizontal = Gutter, vertical = 4.dp))
 }
 
+/** Plain label for the engine's diagnostic upstream value ("system", "doh host", "dot host"). */
+internal fun upstreamLabel(raw: String?): String = when {
+    raw.isNullOrBlank() || raw == "system" -> app.aduster.core.Upstreams.SYSTEM.label
+    raw.startsWith("doh ") -> "DoH, ${raw.removePrefix("doh ")}"
+    raw.startsWith("dot ") -> "DoT, ${raw.removePrefix("dot ")}"
+    else -> raw
+}
+
 /**
  * Timeline entries as rows, newest first: (title, detail, worth a look). A pause and the resume
  * that ended it are one row ("Paused 13:02 – 13:10").
  */
 internal fun timelineLines(entries: List<Timeline.Entry>): List<Triple<String, String, Boolean>> {
+    fun detail(time: Long, vararg parts: String?): String =
+        (listOf(dateTime(time)) + parts.mapNotNull { it?.takeIf(String::isNotBlank) }).joinToString(", ")
+
     val out = ArrayList<Triple<String, String, Boolean>>()
     var i = 0
     while (i < entries.size) {
@@ -310,28 +321,29 @@ internal fun timelineLines(entries: List<Timeline.Entry>): List<Triple<String, S
         val next = entries.getOrNull(i + 1)
         when {
             e.event == Timeline.PAUSED && next?.event == Timeline.RESUMED -> {
-                out += Triple("Paused ${clock(e.time)} – ${clock(next.time)}", "${dateTime(e.time)} · ${e.reason.orEmpty()} · resumed ${next.reason.orEmpty()}", false)
+                val resumed = next.reason?.takeIf(String::isNotBlank)?.let { "resumed $it" } ?: "resumed"
+                out += Triple("Paused ${clock(e.time)} – ${clock(next.time)}", detail(e.time, e.reason, resumed), false)
                 i++
             }
             // A pause ended by turning off (older entries have no resume before the stop); any
             // other stop does not end it: it goes on after the next start.
             e.event == Timeline.PAUSED && next?.event == Timeline.STOPPED -> {
                 val off = next.code == "user_off" || (next.code == null && next.reason == "turned off in the app")
-                out += Triple("Paused ${clock(e.time)} – ${clock(next.time)}", "${dateTime(e.time)} · ${e.reason.orEmpty()} · ${if (off) "turned off" else "then protection stopped"}", false)
+                out += Triple("Paused ${clock(e.time)} – ${clock(next.time)}", detail(e.time, e.reason, if (off) "turned off" else "then protection stopped"), false)
             }
-            e.event == Timeline.PAUSED -> out += Triple("Paused since ${clock(e.time)}", "${dateTime(e.time)} · ${e.reason.orEmpty()}", true)
+            e.event == Timeline.PAUSED -> out += Triple("Paused since ${clock(e.time)}", detail(e.time, e.reason), true)
             // Turning it off, or an app update (Android ends the old process), is not a problem.
             // Decided by the entry's code; entries written before codes existed by their text.
             e.event == Timeline.STOPPED -> out += Triple(
-                "Stopped", "${dateTime(e.time)} · ${e.reason.orEmpty()}",
+                "Stopped", detail(e.time, e.reason),
                 when (e.code) {
                     "user_off", "app_updated", "process_ended" -> false
                     null -> e.reason != "turned off in the app" && e.reason?.contains("app updated") != true
                     else -> true
                 },
             )
-            e.event == Timeline.STARTED -> out += Triple("Started", "${dateTime(e.time)} · ${e.reason.orEmpty()}", false)
-            else -> out += Triple(e.event.replaceFirstChar { it.uppercase() }, "${dateTime(e.time)} · ${e.reason.orEmpty()}", false)
+            e.event == Timeline.STARTED -> out += Triple("Started", detail(e.time, e.reason), false)
+            else -> out += Triple(e.event.replaceFirstChar { it.uppercase() }, detail(e.time, e.reason), false)
         }
         i++
     }
@@ -340,13 +352,13 @@ internal fun timelineLines(entries: List<Timeline.Entry>): List<Triple<String, S
 
 /**
  * Process ends as rows, (title, detail, worth a look): one row per process and cause, newest
- * first, with how often and when last ("App · Updated", "6 times, last 29 Oct 14:02"). The
+ * first, with how often and when last ("App: updated", "6 times, last 29 Oct 14:02"). The
  * system's own wording and the process state stay in the report.
  */
 internal fun exitLines(exits: List<ProcessExits.Exit>): List<Triple<String, String, Boolean>> =
     exits.sortedByDescending { it.time }.groupBy { it.process.endsWith(":core") to it.reason }.map { (key, group) ->
         val last = group.first()
-        val title = "${if (key.first) "Protection" else "App"} · ${exitWords(key.second)}"
+        val title = "${if (key.first) "Protection" else "App"}: ${exitWords(key.second).replaceFirstChar { it.lowercase() }}"
         val detail = if (group.size == 1) dateTime(last.time) else "${group.size} times, last ${dateTime(last.time)}"
         Triple(title, detail, group.any { it.notable })
     }

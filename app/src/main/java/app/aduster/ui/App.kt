@@ -162,7 +162,7 @@ fun AdusterApp(vm: MainViewModel, onStart: () -> Unit) {
                     Sub.DIAGNOSTICS -> DiagnosticsScreen(vm, back)
                     Sub.HTTPS -> HttpsScreen(vm, back)
                     null -> when (n.tab) {
-                        Tab.HOME -> HomeScreen(vm, onStart, open, openSettings = { nav = Nav(Tab.SETTINGS) }, openFilters = { nav = Nav(Tab.FILTERS) })
+                        Tab.HOME -> HomeScreen(vm, onStart, open, openSettings = { nav = Nav(Tab.SETTINGS) }, openFilters = { nav = Nav(Tab.FILTERS) }, openLog = { nav = Nav(Tab.LOG) })
                         Tab.LOG -> LogScreen(vm)
                         Tab.FILTERS -> FiltersScreen(vm, open)
                         Tab.SETTINGS -> SettingsScreen(vm, open)

@@ -25,12 +25,12 @@ object Upstreams {
 
     val presets = listOf(
         SYSTEM,
-        Preset("cloudflare-doh", "Cloudflare", "DNS-over-HTTPS · 1.1.1.1", doh("https://cloudflare-dns.com/dns-query", "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111")),
-        Preset("quad9-doh", "Quad9", "DNS-over-HTTPS · 9.9.9.9, malware filtering", doh("https://dns.quad9.net/dns-query", "9.9.9.9", "149.112.112.112", "2620:fe::fe")),
-        Preset("google-doh", "Google", "DNS-over-HTTPS · 8.8.8.8", doh("https://dns.google/dns-query", "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888")),
-        Preset("adguard-doh", "AdGuard (unfiltered)", "DNS-over-HTTPS · 94.140.14.140", doh("https://unfiltered.adguard-dns.com/dns-query", "94.140.14.140", "94.140.14.141")),
-        Preset("cloudflare-dot", "Cloudflare", "DNS-over-TLS · 1.1.1.1", dot("one.one.one.one", "1.1.1.1", "1.0.0.1")),
-        Preset("quad9-dot", "Quad9", "DNS-over-TLS · 9.9.9.9, malware filtering", dot("dns.quad9.net", "9.9.9.9", "149.112.112.112")),
+        Preset("cloudflare-doh", "Cloudflare", "DNS-over-HTTPS, 1.1.1.1", doh("https://cloudflare-dns.com/dns-query", "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111")),
+        Preset("quad9-doh", "Quad9", "DNS-over-HTTPS, 9.9.9.9, malware filtering", doh("https://dns.quad9.net/dns-query", "9.9.9.9", "149.112.112.112", "2620:fe::fe")),
+        Preset("google-doh", "Google", "DNS-over-HTTPS, 8.8.8.8", doh("https://dns.google/dns-query", "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888")),
+        Preset("adguard-doh", "AdGuard (unfiltered)", "DNS-over-HTTPS, 94.140.14.140", doh("https://unfiltered.adguard-dns.com/dns-query", "94.140.14.140", "94.140.14.141")),
+        Preset("cloudflare-dot", "Cloudflare", "DNS-over-TLS, 1.1.1.1", dot("one.one.one.one", "1.1.1.1", "1.0.0.1")),
+        Preset("quad9-dot", "Quad9", "DNS-over-TLS, 9.9.9.9, malware filtering", dot("dns.quad9.net", "9.9.9.9", "149.112.112.112")),
         Preset("custom", "Custom", "https://… for DoH, tls://host for DoT", null),
     )
 
@@ -78,6 +78,24 @@ object Upstreams {
 
     fun label(id: String, custom: String): String {
         val p = byId(id)
-        return if (p.id == "custom") custom.ifBlank { "Custom" } else if (p.id == "system") p.label else "${p.label} · ${p.detail.substringBefore(" ·")}"
+        return when (p.id) {
+            "custom" -> custom.ifBlank { "Custom" }
+            "system" -> p.label
+            else -> "${p.label}, ${p.detail.substringBefore(',')}"
+        }
     }
+
+    /** Distinct row name for the DNS server picker (presets name their protocol variant). */
+    fun pickerLabel(p: Preset): String {
+        val proto = when {
+            p.id.endsWith("-doh") -> "DNS-over-HTTPS"
+            p.id.endsWith("-dot") -> "DNS-over-TLS"
+            else -> return p.label
+        }
+        return if (p.label.endsWith(")")) "${p.label.removeSuffix(")")}, $proto)" else "${p.label} ($proto)"
+    }
+
+    /** Row detail for the DNS server picker, omitting the protocol already in [pickerLabel]. */
+    fun pickerDetail(p: Preset): String =
+        if (p.id.endsWith("-doh") || p.id.endsWith("-dot")) p.detail.substringAfter(", ") else p.detail
 }
