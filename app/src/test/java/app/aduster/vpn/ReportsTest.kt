@@ -14,4 +14,17 @@ class ReportsTest {
         val other = listOf("Aduster_report_20261101-120000 (1).json", "aduster-settings.json", "Aduster_report_notes.txt")
         assertEquals(listOf("Aduster_report_20261101-120000 (1).json"), Reports.beyondNewest(other + names.drop(2), keep = 10))
     }
+
+    /** Share report sends the file just saved: by its name, or the system's renamed copy of it. */
+    @Test
+    fun theReportJustSavedIsTheOneShared() {
+        val saved = "Aduster_report_20261125-101500.json"
+        val older = "Aduster_report_20261125-090000.json" to 7L
+        assertEquals(12L, Reports.savedId(mapOf(older, saved to 12L), saved))
+        // A second report in the same second: the system names it "… (1).json"; the newest copy wins.
+        val copies = mapOf(saved to 12L, "Aduster_report_20261125-101500 (1).json" to 13L, older)
+        assertEquals(13L, Reports.savedId(copies, saved))
+        // Never another report, never a file that is not a report.
+        assertEquals(null, Reports.savedId(mapOf(older, "Aduster_report_20261125-101500.txt" to 20L), saved))
+    }
 }

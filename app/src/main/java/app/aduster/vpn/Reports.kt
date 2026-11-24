@@ -89,12 +89,11 @@ object Reports {
     /** A report's name, also as the system renames a second one of the same second ("… (1).json"). */
     private val REPORT = Regex("""^Aduster_report_\d{8}-\d{6}( \(\d+\))?\.json$""")
 
-    /** Deletes this install's reports beyond the newest [KEEP]. */
-    private fun prune(ctx: Context) {
-        val resolver = ctx.contentResolver
+    /** This install's reports in Downloads, name to MediaStore id. */
+    private fun saved(ctx: Context): Map<String, Long> {
         val found = HashMap<String, Long>()
         runCatching {
-            resolver.query(
+            ctx.contentResolver.query(
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                 arrayOf(MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME),
                 "${MediaStore.Downloads.DISPLAY_NAME} LIKE ? ESCAPE '\\'",
@@ -102,6 +101,41 @@ object Reports {
                 null,
             )?.use { c -> while (c.moveToNext()) found[c.getString(1)] = c.getLong(0) }
         }
+        return found
+    }
+
+    /**
+     * Of the [found] reports, the id of the one saved as [name]: the newest of it and the copies
+     * the system renamed when a report of the same second already existed ("… (1).json").
+     */
+    internal fun savedId(found: Map<String, Long>, name: String): Long? {
+        val stem = name.removeSuffix(".json")
+        val copy = Regex("^" + Regex.escape(stem) + """( \(\d+\))?\.json$""")
+        return found.filter { (n, _) -> copy.matches(n) }.values.maxOrNull()
+    }
+
+    /**
+     * The share menu for the report just saved as [name] (the main process can read it: both
+     * processes are one app to MediaStore); null when it is not found.
+     */
+    fun shareIntent(ctx: Context, name: String): android.content.Intent? {
+        val id = savedId(saved(ctx), name) ?: return null
+        val uri = android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id)
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "application/json"
+            putExtra(android.content.Intent.EXTRA_STREAM, uri)
+            putExtra(android.content.Intent.EXTRA_SUBJECT, "Aduster report")
+            // The clip carries the read grant through the chooser to the app picked.
+            clipData = android.content.ClipData.newRawUri(name, uri)
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        return android.content.Intent.createChooser(send, "Share report")
+    }
+
+    /** Deletes this install's reports beyond the newest [KEEP]. */
+    private fun prune(ctx: Context) {
+        val resolver = ctx.contentResolver
+        val found = saved(ctx)
         for (name in beyondNewest(found.keys.toList())) {
             val id = found[name] ?: continue
             runCatching { resolver.delete(android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id), null, null) }

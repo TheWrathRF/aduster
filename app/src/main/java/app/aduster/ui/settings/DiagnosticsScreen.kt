@@ -275,6 +275,21 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                         titleColor = p.accent,
                     )
                 }
+                // The same report, handed to an app of the person's choice (mail, chat, Drive).
+                row {
+                    ListRow(
+                        "Share report",
+                        "It names some of the sites you visited",
+                        onClick = {
+                            scope.launch {
+                                val share = withContext(Dispatchers.IO) { vm.saveReport()?.let { app.aduster.vpn.Reports.shareIntent(ctx, it) } }
+                                if (share != null) ctx.startActivity(share)
+                                else Toast.makeText(ctx, "Could not save the report", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        titleColor = p.accent,
+                    )
+                }
                 row {
                     ListRow(
                         "Delete saved reports",

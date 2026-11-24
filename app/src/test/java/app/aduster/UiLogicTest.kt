@@ -344,6 +344,25 @@ class UiLogicTest {
     }
 
     /**
+     * The widget's button pauses until resumed while protected (as the tile does) and resumes
+     * while paused; while off it is hidden (turning on may need Android's VPN prompt: the app
+     * opens instead). The dot says the same state in colour.
+     */
+    @Test
+    fun widgetButtonFollowsTheState() {
+        val w = app.aduster.widget.StatsWidget
+        assertEquals(app.aduster.widget.StatsWidget.Control.PAUSE, w.control(running = true, paused = false))
+        assertEquals(app.aduster.widget.StatsWidget.Control.RESUME, w.control(running = true, paused = true))
+        assertEquals(null, w.control(running = false, paused = false))
+        assertEquals("Pause protection", app.aduster.widget.StatsWidget.Control.PAUSE.label)
+        assertEquals("Resume protection", app.aduster.widget.StatsWidget.Control.RESUME.label)
+        val p = app.aduster.ui.theme.BlackPalette
+        assertEquals(p.accent, w.dot(running = true, paused = false, p))
+        assertEquals(p.warn, w.dot(running = true, paused = true, p))
+        assertEquals(p.muted, w.dot(running = false, paused = false, p))
+    }
+
+    /**
      * Widget redraws read `running` once and serialize state read + draw under one lock so an
      * in-flight screen-on redraw cannot overwrite a later "Off" draw.
      */

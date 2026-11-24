@@ -30,9 +30,16 @@ import java.util.TimeZone
 /**
  * RemoteViews widget (no Glance/Compose runtime in the always-on process). Never schedules
  * updates. It runs in :core, where the protection state is known: today's count while
- * protected, "Paused" or "Off" otherwise, in the app's theme.
+ * protected, "Paused" or "Off" otherwise, in the app's theme, with a dot in the state's colour
+ * and a Pause / Resume button.
  */
 class StatsWidget : AppWidgetProvider() {
+    /** The widget's button: what it does, and its words for TalkBack. */
+    enum class Control(val label: String, val icon: Int, val action: String, val code: Int) {
+        PAUSE("Pause protection", R.drawable.ic_stat_pause, AdusterVpnService.ACTION_PAUSE, 20),
+        RESUME("Resume protection", R.drawable.ic_stat_play, AdusterVpnService.ACTION_RESUME, 21),
+    }
+
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
         // Called only with widgets on the home screen.
         placed = true
@@ -88,6 +95,25 @@ class StatsWidget : AppWidgetProvider() {
                     setTextColor(R.id.widget_count, (if (paused) p.warn else if (running) p.text else p.muted).toArgb())
                     setTextViewText(R.id.widget_caption, small)
                     setTextColor(R.id.widget_caption, p.muted.toArgb())
+                    setInt(R.id.widget_dot, "setColorFilter", dot(running, paused, p).toArgb())
+                    val control = control(running, paused)
+                    if (control == null) {
+                        setViewVisibility(R.id.widget_button, android.view.View.GONE)
+                    } else {
+                        setViewVisibility(R.id.widget_button, android.view.View.VISIBLE)
+                        setImageViewResource(R.id.widget_button, control.icon)
+                        setInt(R.id.widget_button, "setColorFilter", p.text.toArgb())
+                        setInt(R.id.widget_button, "setBackgroundResource", if (p.dark) R.drawable.widget_button_bg else R.drawable.widget_button_bg_light)
+                        setContentDescription(R.id.widget_button, control.label)
+                        // The tile's pause: until resumed (EXTRA_MINUTES absent is 0).
+                        setOnClickPendingIntent(
+                            R.id.widget_button,
+                            PendingIntent.getService(
+                                ctx, control.code, Intent(ctx, AdusterVpnService::class.java).setAction(control.action),
+                                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                            ),
+                        )
+                    }
                     setOnClickPendingIntent(
                         R.id.widget_root,
                         PendingIntent.getActivity(ctx, 12, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE),
@@ -114,6 +140,20 @@ class StatsWidget : AppWidgetProvider() {
             running && paused -> "Paused" to "${fmt(blocked)} blocked today"
             running -> fmt(blocked) to "Blocked today"
             else -> "Off" to "${fmt(blocked)} blocked today"
+        }
+
+        /** The button for the state: Pause while protected, Resume while paused, none while off. */
+        fun control(running: Boolean, paused: Boolean): Control? = when {
+            running && paused -> Control.RESUME
+            running -> Control.PAUSE
+            else -> null
+        }
+
+        /** The dot's colour: the accent while protected, amber while paused, muted while off. */
+        fun dot(running: Boolean, paused: Boolean, p: app.aduster.ui.theme.Palette): androidx.compose.ui.graphics.Color = when {
+            running && paused -> p.warn
+            running -> p.accent
+            else -> p.muted
         }
 
         /** The app's theme, read from its settings file (a small file; the store's reader is asynchronous). */
