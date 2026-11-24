@@ -54,6 +54,8 @@ data class ListMeta(
     val heldSince: Long = 0,
     /** The stored file, as read while it was downloaded (see [FileScan]). */
     val scan: FileScan? = null,
+    /** When the list was last downloaded in full; patches keep it up to date in between (see [DiffUpdates]). */
+    val fullAt: Long = 0,
 )
 
 @Serializable

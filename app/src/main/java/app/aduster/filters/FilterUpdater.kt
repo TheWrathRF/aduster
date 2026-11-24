@@ -67,9 +67,13 @@ object FilterUpdater {
     private data class Source(val name: String, val file: File, val allow: Boolean = false)
 
     internal sealed interface Fetch {
-        data class Updated(val etag: String?, val lastModified: String?, val bytes: Long, val scan: FileScan) : Fetch
-        /** [scan]: the stored file read once, when its facts were not known yet (an older meta.json). */
-        data class NotModified(val scan: FileScan? = null) : Fetch
+        /** [patched]: brought up to date by the list's patches, not downloaded in full. */
+        data class Updated(val etag: String?, val lastModified: String?, val bytes: Long, val scan: FileScan, val patched: Boolean = false) : Fetch
+        /**
+         * [scan]: the stored file read once, when its facts were not known yet (an older
+         * meta.json). [patched]: the list's next patch is not out yet (the list was not asked).
+         */
+        data class NotModified(val scan: FileScan? = null, val patched: Boolean = false) : Fetch
         /** Downloaded in full, but identical to the stored copy (kept as it is). */
         data class Same(val etag: String?, val lastModified: String?, val scan: FileScan) : Fetch
         data class Failed(val reason: String) : Fetch
@@ -310,7 +314,12 @@ object FilterUpdater {
         // Validators only count for the URL they came from; what is known of the stored file
         // holds whatever URL it came from.
         val same = prev?.takeIf { it.url == l.url }
-        val r = limits.run(l.url) { fetch(l.url, raw, same?.etag, same?.lastModified, prev?.scan, same?.let { Held(it.heldBack, it.heldRules, it.heldSince) } ?: Held(), now) }
+        val r = limits.run(l.url) {
+            // A list that names its patches is brought up to date by them; a full download when
+            // that does not work out, and every few days anyway.
+            (if (same != null && raw.exists()) patched(l.url, raw, same, now) else null)
+                ?: fetch(l.url, raw, same?.etag, same?.lastModified, prev?.scan, same?.let { Held(it.heldBack, it.heldRules, it.heldSince) } ?: Held(), now)
+        }
         val inc = if (r !is Fetch.Failed && r !is Fetch.Shrunk && raw.exists()) {
             val names = when (r) {
                 is Fetch.Updated -> r.scan.includes
@@ -381,6 +390,13 @@ object FilterUpdater {
             heldBack = (r as? Fetch.Shrunk)?.held?.bytes ?: if (r is Fetch.Failed) old.heldBack else 0,
             heldRules = (r as? Fetch.Shrunk)?.held?.rules ?: if (r is Fetch.Failed) old.heldRules else 0,
             heldSince = (r as? Fetch.Shrunk)?.held?.since ?: if (r is Fetch.Failed) old.heldSince else 0,
+            // A full answer from the list's own address (a download, the same bytes, or "not modified").
+            fullAt = when (r) {
+                is Fetch.Updated -> if (r.patched) old.fullAt else now
+                is Fetch.NotModified -> if (r.patched) old.fullAt else now
+                is Fetch.Same -> now
+                else -> old.fullAt
+            },
         )
     }
 
@@ -925,6 +941,83 @@ object FilterUpdater {
     }
 
     private val downloads = java.util.concurrent.atomic.AtomicLong()
+
+    /** A full download at least this often, patches or not (a broken chain of patches heals). */
+    private const val FULL_EVERY_MS = 4L * 24 * 3600 * 1000
+
+    /** Patches applied in one check at most (a list a day behind needs one or two). */
+    private const val MAX_PATCHES = 8
+
+    /**
+     * [raw] brought up to date by the patches its header names ([DiffUpdates]): [Fetch.Updated]
+     * when one or more applied, [Fetch.NotModified] when the next one is not out yet; null when
+     * the list should be downloaded in full instead: no patches named, the last full download
+     * too long ago, a patch that does not apply or whose result fails the list's checksum, a
+     * result that looks wrong (the shrink guard's measure), or a network error.
+     */
+    private fun patched(url: String, raw: File, prev: ListMeta, now: Long): Fetch? {
+        if (now - prev.fullAt > FULL_EVERY_MS) return null
+        val head = raw.inputStream().use { it.readNBytes(4096) }.decodeToString()
+        var path = DiffUpdates.diffPath(head) ?: return null
+        if ((DiffUpdates.dueAt(path) ?: return null) > now) return Fetch.NotModified(patched = true)
+        var cur: ByteArray? = null
+        for (n in 0 until MAX_PATCHES) {
+            val body = patchBody(DiffUpdates.patchUrl(url, path) ?: return null) ?: return null
+            if (body.isEmpty()) break
+            val (sha, rcs) = DiffUpdates.split(body)
+            val next = DiffUpdates.applyRcs(cur ?: raw.readBytes(), rcs) ?: return null
+            val ok = if (sha != null) DiffUpdates.sha1(next) == sha else DiffUpdates.checksumHolds(next) == true
+            if (!ok) return null
+            cur = next
+            val nextPath = DiffUpdates.diffPath(next.copyOfRange(0, minOf(next.size, 4096)).decodeToString()) ?: break
+            if (nextPath == path) break
+            path = nextPath
+            if ((DiffUpdates.dueAt(path) ?: break) > now) break
+        }
+        val result = cur ?: return Fetch.NotModified(patched = true)
+        val scanner = ListScanner()
+        scanner.feed(result, result.size)
+        val scan = scanner.finish()
+        if (!scanner.looksLikeFilterList()) return null
+        val before = scanOf(raw, prev.scan).lines
+        if (before > 1000 && scan.lines * 2 < before) return null
+        val tmp = File(raw.path + ".part-" + android.os.Process.myPid() + "-" + downloads.incrementAndGet() + "-" + System.nanoTime())
+        return try {
+            tmp.writeBytes(result)
+            java.nio.file.Files.move(tmp.toPath(), raw.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+            // The list's validators describe the old copy: the next full download is a full one.
+            Fetch.Updated(null, null, scan.size, scan.copy(mtime = raw.lastModified()), patched = true)
+        } catch (_: Exception) {
+            tmp.delete()
+            null
+        }
+    }
+
+    /** A patch's bytes; empty when it is not out yet (204, 404 or an empty answer); null on any other answer or error. */
+    private fun patchBody(url: String): ByteArray? {
+        val conn = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return null
+        return try {
+            conn.connectTimeout = 15_000
+            conn.readTimeout = 30_000
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", "Aduster/1.0 (Android)")
+            when (conn.responseCode) {
+                HttpURLConnection.HTTP_OK -> conn.inputStream.use { s ->
+                    val b = s.readNBytes(MAX_PATCH_BYTES + 1)
+                    if (b.size > MAX_PATCH_BYTES) null else b
+                }
+                HttpURLConnection.HTTP_NO_CONTENT, HttpURLConnection.HTTP_NOT_FOUND -> ByteArray(0)
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** A patch larger than this is not a patch: the full list instead. */
+    private const val MAX_PATCH_BYTES = 4 * 1024 * 1024
 }
 
 /**
