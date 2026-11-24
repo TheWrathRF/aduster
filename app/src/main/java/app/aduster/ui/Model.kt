@@ -239,8 +239,8 @@ data class SiteReason(val kind: String, val remainingS: Long?, val detail: Strin
 
 /** "Check a site", browser part: null = the proxy is not running. */
 data class SiteCheck(val decrypted: Boolean, val filteringActive: Boolean, val reasons: List<SiteReason>) {
-    /** True when the engine passed the site through automatically (a bot-check or pass-through bypass). */
-    val bypassed: Boolean get() = reasons.any { it.kind == "bot_check" || it.kind == "passed_through" }
+    /** True when the site is passed through for now: a bot-check or pass-through bypass, or the user's 15-minute pause. */
+    val bypassed: Boolean get() = reasons.any { it.kind == "bot_check" || it.kind == "passed_through" || it.kind == "paused_by_you" }
 }
 
 fun parseSiteCheck(json: String): SiteCheck? =

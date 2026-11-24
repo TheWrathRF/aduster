@@ -184,7 +184,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * [fetch]: the change may need lists that are not on disk yet; one job then fetches them and
      * compiles (a compile job beside it would only build the engines twice).
      */
-    fun update(fetch: Boolean = false, transform: (Settings) -> Settings) {
+    fun update(fetch: Boolean = false, transform: (Settings) -> Settings): kotlinx.coroutines.Job =
         viewModelScope.launch(Dispatchers.IO) {
             // "Before" is what the transform really saw (the StateFlow can lag or still hold
             // the placeholder at start-up).
@@ -203,7 +203,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 FilterJobs.schedule(ctx, after)
             }
         }
-    }
 
     /** Saves a change, or says it could not be saved (a full disk) and returns null. */
     private suspend fun save(transform: (Settings) -> Settings): Settings? =
@@ -278,7 +277,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * Changes the user's rules. The DNS part is loaded by :core at once; when the part for
      * the browsers' page filter changed, a compile job rebuilds it.
      */
-    private fun setUserRules(saved: String? = null, transform: (String) -> String) {
+    private fun setUserRules(saved: String? = null, transform: (String) -> String): kotlinx.coroutines.Job =
         viewModelScope.launch(Dispatchers.IO) {
             var before = Settings()
             val after = save { cur -> before = cur; cur.copy(userRules = transform(cur.userRules)) } ?: return@launch
@@ -286,7 +285,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             AdusterVpnService.notifySettingsChanged(ctx)
             if (after.httpsFiltering && UserRules.webPart(before.userRules) != UserRules.webPart(after.userRules)) FilterJobs.compile(ctx)
         }
-    }
 
     /** The rules before and after the last rule added from the Log, for its Undo. */
     @Volatile
@@ -325,6 +323,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** "Filter again": ends a bot-check bypass. */
     suspend fun unbypass(host: String): Boolean = withContext(Dispatchers.IO) { client.call(false) { it.unbypass(host) } }
+
+    /** Share to Aduster: [host] is not filtered for [minutes]; false when page filtering is not running. */
+    suspend fun pauseSite(host: String, minutes: Int): Boolean = withContext(Dispatchers.IO) { client.call(false) { it.pauseSite(host, minutes) } }
 
     /** Tells :core to read the settings again (e.g. the certificate was just installed). */
     fun notifyCore() = AdusterVpnService.notifySettingsChanged(ctx)

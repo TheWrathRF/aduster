@@ -55,6 +55,7 @@ object NativeCore {
     @JvmStatic external fun nativeTrimMemory()
     /** Ends the bot-check bypass of [host] ("Filter again"); true if it was bypassed. */
     @JvmStatic external fun nativeUnbypass(host: String): Boolean
+    @JvmStatic external fun nativePauseSite(host: String, minutes: Int): Boolean
     @JvmStatic external fun nativeGenerateCa(): String
     @JvmStatic external fun nativeProxyStart(configJson: String): Int
     @JvmStatic external fun nativeProxyStop()

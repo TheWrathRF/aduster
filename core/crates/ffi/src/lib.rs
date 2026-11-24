@@ -87,6 +87,7 @@ natives! {
     "nativeResetStats" => native_reset_stats() -> ();
     "nativeTrimMemory" => native_trim_memory() -> ();
     "nativeUnbypass" => native_unbypass(JString) -> jboolean;
+    "nativePauseSite" => native_pause_site(JString, jint) -> jboolean;
     "nativePersist" => native_persist() -> ();
     "nativeGenerateCa" => native_generate_ca() -> jni::sys::jstring;
     "nativeProxyAvailable" => native_proxy_available() -> jboolean;
@@ -149,7 +150,7 @@ fn natives_match_kotlin() {
     let mut registered: Vec<(String, String)> = natives().into_iter().map(|(n, s, _)| (n.to_string(), s)).collect();
     declared.sort();
     registered.sort();
-    assert_eq!(declared.len(), 30);
+    assert_eq!(declared.len(), 31);
     assert_eq!(registered, declared);
 }
 
@@ -577,10 +578,18 @@ extern "system" fn native_trim_memory(_env: JNIEnv, _: JClass) {
     })
 }
 
-/// "Filter again" (Diagnostics): ends the bot-check bypass of `host`. True if it was bypassed.
+/// "Filter again" (Diagnostics): ends the bot-check bypass of `host`, or the user's pause of it.
+/// True if it was bypassed.
 extern "system" fn native_unbypass(mut env: JNIEnv, _: JClass, host: JString) -> jboolean {
     let h = jstr(&mut env, &host);
     guard("unbypass", JNI_FALSE, || if proxy::unbypass(&h) { JNI_TRUE } else { JNI_FALSE })
+}
+
+/// Share to Aduster: `host` is not filtered for `minutes`. False when page filtering is not running.
+extern "system" fn native_pause_site(mut env: JNIEnv, _: JClass, host: JString, minutes: jint) -> jboolean {
+    let h = jstr(&mut env, &host);
+    let m = u32::try_from(minutes).unwrap_or(0);
+    guard("pause site", JNI_FALSE, || if proxy::pause_site(&h, m) { JNI_TRUE } else { JNI_FALSE })
 }
 
 extern "system" fn native_persist(_env: JNIEnv, _: JClass) {

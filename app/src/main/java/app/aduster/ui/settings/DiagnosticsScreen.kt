@@ -197,9 +197,11 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                         "bot_check" -> "Bot check, until $until"
                         "media" -> "Video or audio, until $until"
                         "opened_anyway" -> "Opened anyway, until $until"
+                        "paused_by_you" -> "Paused by you, until $until"
                         else -> "Until $until"
                     }
-                    val bot = o["reason"]?.jsonPrimitive?.content == "bot_check"
+                    // Both can be ended here: a bot-check bypass and the user's own pause.
+                    val bot = o["reason"]?.jsonPrimitive?.content in setOf("bot_check", "paused_by_you")
                     row {
                         ListRow(host, why, onClick = if (bot) ({
                             scope.launch {

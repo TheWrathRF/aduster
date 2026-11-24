@@ -19,4 +19,6 @@ interface ICore {
     String saveReport();
     /** "Filter again": ends the bot-check bypass of a host (Diagnostics "bypassed_hosts"). */
     boolean unbypass(String host);
+    /** Share to Aduster: a site is not filtered for some minutes; false when page filtering is not running. */
+    boolean pauseSite(String host, int minutes);
 }

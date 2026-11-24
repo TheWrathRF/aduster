@@ -43,6 +43,21 @@
             </intent-filter>
         </activity>
 
+        <!-- Share › Aduster from a browser: a sheet over the page for its site (a 15-minute
+             pause, Allow on this site, Never decrypt). -->
+        <activity
+            android:name=".ui.share.ShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Aduster.Share">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
         <!-- List updates and engine compiles (main process, JobScheduler). -->
         <service
             android:name=".filters.FilterJobService"

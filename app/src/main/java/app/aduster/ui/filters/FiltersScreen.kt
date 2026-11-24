@@ -187,6 +187,7 @@ internal fun browserLines(
             "never_decrypt" -> (if (userExcluded) "Pages: skipped (your list)" else "Pages: skipped (sensitive site)") to false
             "user_allowed" -> "Pages: allowed by your rules" to false
             "bot_check" -> "Pages: skipped until ${until(r.remainingS)} for a bot check" to true
+            "paused_by_you" -> "Pages: not filtered until ${until(r.remainingS)}, as you asked" to false
             "media" -> "Pages: skipped until ${until(r.remainingS)} (video or audio)" to false
             "opened_anyway" -> "Pages: opened anyway, until ${until(r.remainingS)}" to false
             "network_block" -> "Pages: filtered (network blocks this site by name)" to false

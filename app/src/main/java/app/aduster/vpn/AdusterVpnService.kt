@@ -314,6 +314,7 @@ class AdusterVpnService : VpnService() {
         override fun resetStats() = NativeCore.nativeResetStats()
         override fun saveReport(): String? = Reports.save(this@AdusterVpnService)
         override fun unbypass(host: String): Boolean = NativeCore.nativeUnbypass(host)
+        override fun pauseSite(host: String, minutes: Int): Boolean = NativeCore.nativePauseSite(host, minutes)
     }
 
     /** Adds one raw JSON field to an object string (the engine returns "{}" before it starts). */

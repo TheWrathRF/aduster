@@ -75,7 +75,13 @@ pub fn filtered_uids() -> Vec<i32> {
 /// Filtering was switched back on (pause ended).
 pub fn refilter() {}
 
-/// Ends the bot-check bypass of `host`. True if it was bypassed.
+/// Leaves `host` unfiltered for `minutes` (Share to Aduster). False when the proxy is not running.
+pub fn pause_site(host: &str, minutes: u32) -> bool {
+    let _ = (host, minutes);
+    false
+}
+
+/// Ends the bot-check bypass of `host`, or the user's pause of it. True if it was bypassed.
 pub fn unbypass(host: &str) -> bool {
     let _ = host;
     false
