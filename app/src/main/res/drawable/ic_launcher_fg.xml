@@ -7,24 +7,34 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <group>
-        <clip-path android:pathData="M0,0h108v54h-108z" />
+    <!-- The glyph (x 21.5-74.5, y 28-84.5) centred on the icon at 90 %: drawn as it is it sat
+         6 units left of centre, and centred at full size its stem left round masks. -->
+    <group
+        android:pivotX="48"
+        android:pivotY="56.25"
+        android:scaleX="0.9"
+        android:scaleY="0.9"
+        android:translateX="6"
+        android:translateY="-2.25">
+        <group>
+            <clip-path android:pathData="M0,0h108v54h-108z" />
+            <path
+                android:fillColor="#FFF2F2F2"
+                android:fillType="evenOdd"
+                android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+        </group>
+        <group>
+            <clip-path android:pathData="M0,62h108v46h-108z" />
+            <path
+                android:fillColor="#FFF2F2F2"
+                android:fillType="evenOdd"
+                android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+        </group>
         <path
             android:fillColor="#FFF2F2F2"
-            android:fillType="evenOdd"
-            android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
-    </group>
-    <group>
-        <clip-path android:pathData="M0,62h108v46h-108z" />
+            android:pathData="M65.5,32.5a4.5,4.5 0,0 1,9 0v47.5a4.5,4.5 0,0 1,-9 0z" />
         <path
-            android:fillColor="#FFF2F2F2"
-            android:fillType="evenOdd"
-            android:pathData="M48,31.5a26.5,26.5 0,1 1,0 53a26.5,26.5 0,1 1,0 -53zM48,40.5a17.5,17.5 0,1 0,0 35a17.5,17.5 0,1 0,0 -35z" />
+            android:fillColor="#FFC2C6D6"
+            android:pathData="M35.5,55.5h11a2.5,2.5 0,0 1,0 5h-11a2.5,2.5 0,0 1,0 -5z" />
     </group>
-    <path
-        android:fillColor="#FFF2F2F2"
-        android:pathData="M65.5,32.5a4.5,4.5 0,0 1,9 0v47.5a4.5,4.5 0,0 1,-9 0z" />
-    <path
-        android:fillColor="#FFC2C6D6"
-        android:pathData="M35.5,55.5h11a2.5,2.5 0,0 1,0 5h-11a2.5,2.5 0,0 1,0 -5z" />
 </vector>
