@@ -15,7 +15,7 @@ Android 13 or later, on a 64-bit ARM phone.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/media/page-dark.png">
-    <img src=".github/media/page-light.png" alt="The same recipe page in a browser twice. Left, with DNS filtering only: a consent window covers the page and an empty ad strip sits at the bottom. Right, with Aduster's page filtering: the recipe, its photo and its title, with nothing in the way." width="600">
+    <img src=".github/media/page-light.png" alt="The same recipe page in a browser twice. Left, with DNS filtering only: a consent window covers the page and an empty ad strip, outlined in red, sits at the bottom. Right, with Aduster's page filtering: the recipe, its photo and its title, with nothing in the way." width="600">
   </picture>
 </p>
 
