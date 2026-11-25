@@ -29,8 +29,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -49,6 +51,7 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -92,6 +95,7 @@ import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.common.groupItems
 import app.aduster.ui.counted
+import app.aduster.ui.filters.activeRuleCount
 import app.aduster.ui.fmt
 import app.aduster.ui.hm
 import app.aduster.ui.percent
@@ -130,7 +134,10 @@ fun HomeScreen(
     // By row: each rises the first time it shows (rows further down compose only when scrolled to).
 
     // Until the core answers, the state comes from what the user last chose and the
-    // buttons wait: no false "Off" and no tap on a "Turn on" that is not real.
+    // buttons wait: no false "Off" and no tap on a "Turn on" that is not real. Before even
+    // that is read (the first frames of a cold start), nothing is drawn.
+    val settingsRead by vm.settingsRead.collectAsStateWithLifecycle()
+    if (known == null && !settingsRead) return
     val stats = known ?: Stats.EMPTY.copy(running = s.enabled)
     val unknown = known == null
     val running = stats.running
@@ -168,6 +175,25 @@ fun HomeScreen(
     // Avoid showing Private DNS twice when the Setup row already surfaces it.
     val warnings = if (unknown) emptyList() else listOfNotNull(stopped?.let { Warning(it, Fix.DIAGNOSTICS) }) +
         homeWarnings(stats, s.httpsFiltering).filterNot { setupRow?.fix == SetupFix.PRIVATE_DNS && it.text.startsWith("Private DNS") }
+
+    @Composable
+    fun SetupRowCard(setupRow: SetupRow) {
+        Group(Modifier.padding(top = 12.dp)) {
+            row {
+                ListRow(
+                    title = setupRow.title,
+                    detail = setupRow.detail,
+                    onClick = {
+                        when (setupRow.fix) {
+                            SetupFix.PRIVATE_DNS -> openPrivateDnsSettings(ctx)
+                            SetupFix.HTTPS -> open(Sub.HTTPS)
+                        }
+                    },
+                    leading = { RowIcon(if (setupRow.warn) AdIcons.Warn else AdIcons.Filters, tint = if (setupRow.warn) p.warn else p.accent) },
+                ) { Chevron() }
+            }
+        }
+    }
 
     LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(top = 16.dp, bottom = 28.dp)) {
         item(key = "status") {
@@ -239,14 +265,18 @@ fun HomeScreen(
             }
         }
 
+        // A warning (strict Private DNS goes around the filter) stays in view under the status card:
+        // after the numbers it was below the fold while the card said Protected.
+        if (setupRow != null && setupRow.warn) item(key = "setup-row") { SetupRowCard(setupRow) }
+
         item(key = "numbers") {
             // Today's blocked count, its breakdown, and the 30-day chart above the fold.
             Card(Modifier.padding(top = 12.dp)) {
-                Column(Modifier.clearAndSetSemantics { contentDescription = "Blocked today: ${fmt(stats.blocked)}" }) {
+                val trend = remember(stats.history, stats.day, stats.blocked) {
+                    weekTrend(app.aduster.ui.historySlots(stats.history, DayStat(stats.day, stats.queries, stats.blocked), 14))
+                }
+                Column(Modifier.clearAndSetSemantics { contentDescription = listOfNotNull("Blocked today: ${fmt(stats.blocked)}", trend).joinToString(", ") }) {
                     RollingNumber(fmt(stats.blocked), Type.display, p.text, value = stats.blocked, animate = !unknown)
-                    val trend = remember(stats.history, stats.day, stats.blocked) {
-                        weekTrend(app.aduster.ui.historySlots(stats.history, DayStat(stats.day, stats.queries, stats.blocked), 14))
-                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Blocked today", style = Type.small, color = p.muted)
                         if (trend != null) {
@@ -275,25 +305,8 @@ fun HomeScreen(
             }
         }
 
-        if (setupRow != null) {
-            item(key = "setup-row") {
-                Group(Modifier.padding(top = 12.dp)) {
-                    row {
-                        ListRow(
-                            title = setupRow.title,
-                            detail = setupRow.detail,
-                            onClick = {
-                                when (setupRow.fix) {
-                                    SetupFix.PRIVATE_DNS -> openPrivateDnsSettings(ctx)
-                                    SetupFix.HTTPS -> open(Sub.HTTPS)
-                                }
-                            },
-                            leading = { RowIcon(if (setupRow.warn) AdIcons.Warn else AdIcons.Filters, tint = if (setupRow.warn) p.warn else p.accent) },
-                        ) { Chevron() }
-                    }
-                }
-            }
-        }
+        // A setup step that is not urgent (page filtering never set up) comes after the numbers.
+        if (setupRow != null && !setupRow.warn) item(key = "setup-row") { SetupRowCard(setupRow) }
 
         if (stats.topBlocked.isNotEmpty()) {
             item(key = "top-label") { SectionHeading("Top blocked today") }
@@ -323,7 +336,7 @@ fun HomeScreen(
                 // The resolver is chosen in Settings; the rules come from the lists on Filters (the
                 // count adds page rules while they are in use).
                 row { ListRow("DNS server", onClick = openSettings) { ValueText(Upstreams.label(s.upstream, s.customUpstream)) } }
-                val rules = meta.compiledRules + if (s.httpsFiltering && HttpsConfig.available) meta.webRules else 0
+                val rules = activeRuleCount(meta, HttpsConfig.available, s.httpsFiltering, caInstalled != false)
                 row { ListRow("Rules", rulesDetail(rulesAge(meta)), onClick = openFilters) { ValueText(fmt(rules)) } }
             }
         }
@@ -425,7 +438,7 @@ private fun OffButton(modifier: Modifier = Modifier, onClick: () -> Unit) {
 private fun PauseSheet(onDismiss: () -> Unit, onSelect: (Int) -> Unit) {
     val p = LocalPalette.current
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = p.surface, dragHandle = null) {
-        Column(Modifier.padding(top = 20.dp, bottom = 16.dp).navigationBarsPadding()) {
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(top = 20.dp, bottom = 16.dp).navigationBarsPadding()) {
             Text(
                 "Pause protection",
                 style = Type.dialogTitle,
@@ -521,8 +534,10 @@ private fun WeekChart(stats: Stats) {
     val view = LocalView.current
     val now = System.currentTimeMillis()
     val today = if (stats.day > 0) stats.day else Math.floorDiv(now + TimeZone.getDefault().getOffset(now), 86_400_000L)
+    // No day recorded yet (protection never ran): seven empty tracks, "no data yet", not a Today of
+    // 0; [today] only names the weekdays under them.
     val days = remember(stats.history, stats.day, stats.queries, stats.blocked) {
-        app.aduster.ui.historySlots(stats.history, DayStat(today, stats.queries, stats.blocked), WEEK)
+        app.aduster.ui.historySlots(stats.history, DayStat(stats.day, stats.queries, stats.blocked), WEEK)
     }
     var selected by remember { mutableStateOf<Int?>(null) }
     var grown by rememberSaveable { mutableStateOf(false) }
@@ -535,9 +550,20 @@ private fun WeekChart(stats: Stats) {
     }
     val max = days.maxOf { it?.blocked ?: 0L }.coerceAtLeast(1L)
     val shown = selected ?: days.lastIndex
-    val narrow = androidx.compose.ui.platform.LocalDensity.current.fontScale > 1.3f
+    // One letter per day where "Today" does not fit its bar: a large font, or a narrow phone
+    // (360 dp at 130 % cut it to "Toda").
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val measurer = androidx.compose.ui.text.rememberTextMeasurer()
+    val todayPx = remember(density.fontScale) { measurer.measure("Today", Type.small).size.width }
+    var rowPx by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    val columnPx = if (rowPx == 0) Int.MAX_VALUE else (rowPx - with(density) { 60.dp.roundToPx() }) / 7
+    val narrow = density.fontScale > 1.3f || todayPx > columnPx
     Row(
-        Modifier.fillMaxWidth().semantics { contentDescription = weekDescription(days) },
+        // One summary for TalkBack: the bars on their own read as bare day letters, too small to touch.
+        Modifier
+            .fillMaxWidth()
+            .onSizeChanged { rowPx = it.width }
+            .clearAndSetSemantics { contentDescription = weekDescription(days) },
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         days.forEachIndexed { i, d ->
@@ -551,15 +577,24 @@ private fun WeekChart(stats: Stats) {
                     },
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                // Centred over its bar. A count wider than its bar (a large font) may reach past
-                // it; then today's, at the right edge, grows to the left instead.
+                // Centred over its bar. Only a count wider than its bar (a large font, a big
+                // number) reaches past it: then the first bar's grows to the right and today's,
+                // at the right edge, to the left, so neither leaves the card. (Moved by the font
+                // size alone, a short count sat at the bar's edge.)
+                val count = if (i == shown && d != null) fmt(d.blocked) else ""
+                val wide = count.isNotEmpty() && measurer.measure(count, Type.number).size.width > columnPx
+                val align = when {
+                    wide && isToday -> Alignment.End
+                    wide && i == 0 -> Alignment.Start
+                    else -> Alignment.CenterHorizontally
+                }
                 Text(
-                    if (i == shown && d != null) fmt(d.blocked) else "",
+                    count,
                     style = Type.number,
                     color = if (isToday) p.blocked else p.text,
                     maxLines = 1,
                     softWrap = false,
-                    modifier = Modifier.fillMaxWidth().wrapContentWidth(if (isToday && narrow) Alignment.End else Alignment.CenterHorizontally, unbounded = true),
+                    modifier = Modifier.fillMaxWidth().wrapContentWidth(align, unbounded = true),
                 )
                 Spacer(Modifier.height(4.dp))
                 Canvas(Modifier.fillMaxWidth().height(WeekChartHeight)) {
@@ -609,18 +644,19 @@ internal fun weekDescription(days: List<DayStat?>): String {
 
 /**
  * This week against the one before, for the badge beside "Blocked today" ("+18% vs last week"):
- * [days] are the last 14 days, oldest first. Null until the earlier week has something blocked.
+ * [days] are the last 14 days, oldest first. Null until the earlier week is a whole week (every
+ * day recorded) with something blocked: a few hours of it would compare with nothing.
  */
 internal fun weekTrend(days: List<DayStat?>): String? {
     if (days.size < 2 * WEEK) return null
     val before = days.take(WEEK).filterNotNull()
     val now = days.takeLast(WEEK).filterNotNull()
     val was = before.sumOf { it.blocked }
-    if (before.isEmpty() || was == 0L || now.isEmpty()) return null
+    if (before.size < WEEK || was == 0L || now.isEmpty()) return null
     val change = Math.round((now.sumOf { it.blocked } - was) * 100.0 / was)
     return when {
-        change > 0 -> "+$change% vs last week"
-        change < 0 -> "−${-change}% vs last week"
+        change > 0 -> "+${fmt(change)}% vs last week"
+        change < 0 -> "−${fmt(-change)}% vs last week"
         else -> "Same as last week"
     }
 }

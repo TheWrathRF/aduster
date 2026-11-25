@@ -25,6 +25,8 @@ import app.aduster.settings.SettingsStore
 import app.aduster.vpn.AdusterVpnService
 import app.aduster.vpn.ProcessExits
 import app.aduster.vpn.Reports
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -45,6 +47,7 @@ import app.aduster.settings.coreKey
 import app.aduster.settings.trySave
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -113,6 +116,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _log = MutableStateFlow<List<LogItem>>(emptyList())
     val log: StateFlow<List<LogItem>> = _log
+    private val _logRead = MutableStateFlow(false)
+
+    /** The log was read from the core at least once (until then an empty log means "not yet"). */
+    val logRead: StateFlow<Boolean> = _logRead
     private var logSeq = 0L
     /** The core connection and its process start the log was last read from (restart marker). */
     private var logCore: app.aduster.ICore? = null
@@ -184,12 +191,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * [fetch]: the change may need lists that are not on disk yet; one job then fetches them and
      * compiles (a compile job beside it would only build the engines twice).
      */
-    fun update(fetch: Boolean = false, transform: (Settings) -> Settings): kotlinx.coroutines.Job =
-        viewModelScope.launch(Dispatchers.IO) {
+    fun update(fetch: Boolean = false, transform: (Settings) -> Settings): Deferred<Boolean> =
+        saving {
             // "Before" is what the transform really saw (the StateFlow can lag or still hold
             // the placeholder at start-up).
             var before = Settings()
-            val after = save { cur -> before = cur; transform(cur) } ?: return@launch
+            val after = save { cur -> before = cur; transform(cur) } ?: return@saving false
             // :core is told only when something it reads changed: the theme or the log size
             // would otherwise re-initialise its engine.
             if (before.coreKey() != after.coreKey()) AdusterVpnService.notifySettingsChanged(ctx)
@@ -202,7 +209,26 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             ) {
                 FilterJobs.schedule(ctx, after)
             }
+            true
         }
+
+    /**
+     * Runs a settings change in the view model's scope (the screen may close meanwhile). Done
+     * when the change ran to its end: true, or false when it could not be saved, so a caller
+     * says "saved" only when it was.
+     */
+    private fun saving(block: suspend () -> Boolean): Deferred<Boolean> {
+        val done = CompletableDeferred<Boolean>()
+        viewModelScope.launch(Dispatchers.IO) {
+            var ok = false
+            try {
+                ok = block()
+            } finally {
+                done.complete(ok)
+            }
+        }
+        return done
+    }
 
     /** Saves a change, or says it could not be saved (a full disk) and returns null. */
     private suspend fun save(transform: (Settings) -> Settings): Settings? =
@@ -277,26 +303,40 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * Changes the user's rules. The DNS part is loaded by :core at once; when the part for
      * the browsers' page filter changed, a compile job rebuilds it.
      */
-    private fun setUserRules(saved: String? = null, transform: (String) -> String): kotlinx.coroutines.Job =
-        viewModelScope.launch(Dispatchers.IO) {
+    private fun setUserRules(saved: String? = null, transform: (String) -> String): Deferred<Boolean> =
+        saving {
             var before = Settings()
-            val after = save { cur -> before = cur; cur.copy(userRules = transform(cur.userRules)) } ?: return@launch
+            val after = save { cur -> before = cur; cur.copy(userRules = transform(cur.userRules)) } ?: return@saving false
             if (saved != null) withContext(Dispatchers.Main) { android.widget.Toast.makeText(ctx, saved, android.widget.Toast.LENGTH_SHORT).show() }
             AdusterVpnService.notifySettingsChanged(ctx)
             if (after.httpsFiltering && UserRules.webPart(before.userRules) != UserRules.webPart(after.userRules)) FilterJobs.compile(ctx)
+            true
         }
 
     /** The rules before and after the last rule added from the Log, for its Undo. */
     @Volatile
     private var lastAdded: Pair<String, String>? = null
 
-    fun addUserRule(rule: String) = setUserRules { before -> UserRules.withRule(before, rule).also { lastAdded = before to it } }
+    /** The save of the last rule added, which its Undo waits for. */
+    @Volatile
+    private var lastAdd: Deferred<Boolean>? = null
 
-    /** Takes back the last rule added from the Log, unless the rules changed again since. */
+    /** Adds [rule]; true once saved. */
+    fun addUserRule(rule: String): Deferred<Boolean> =
+        setUserRules { before -> UserRules.withRule(before, rule).also { lastAdded = before to it } }.also { lastAdd = it }
+
+    /**
+     * Takes back the last rule added from the Log, unless the rules changed again since. It waits
+     * for that rule's save: an Undo tapped while the disk was busy found nothing to take back.
+     */
     fun undoAddedRule() {
-        val (before, after) = lastAdded ?: return
-        lastAdded = null
-        setUserRules { cur -> if (cur == after) before else cur }
+        val add = lastAdd
+        viewModelScope.launch(Dispatchers.IO) {
+            add?.await()
+            val (before, after) = lastAdded ?: return@launch
+            lastAdded = null
+            setUserRules { cur -> if (cur == after) before else cur }
+        }
     }
 
     /** Saves the user's rules; the browser part is recompiled into the page filter right away. */
@@ -317,6 +357,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun deleteReports(): Int = withContext(Dispatchers.IO) { Reports.deleteAll(ctx) }
 
     fun checkDomain(name: String): DomainCheck? = parseDomainCheck(client.call("{}") { it.checkDomain(name) })
+
+    /**
+     * Waits up to [ms] for the binding to the protection process. A window opened from another app
+     * (Share to Aduster) binds in its own onStart, so its first question can come before the answer.
+     */
+    suspend fun awaitCore(ms: Long = 3_000): Boolean = withTimeoutOrNull(ms) { client.core.first { it != null } } != null
 
     /** "Check a site", browser part; null when page filtering is not running. */
     fun checkSite(host: String): SiteCheck? = parseSiteCheck(client.call("{}") { it.explainHost(host) })
@@ -398,6 +444,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 resolveLabels(fresh.map { it.uid })
                 _log.value = (fresh.asReversed() + _log.value).take(cap)
             } finally {
+                if (client.core.value != null) _logRead.value = true
                 logPoll.unlock()
             }
         }

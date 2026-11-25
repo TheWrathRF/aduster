@@ -31,6 +31,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -42,6 +43,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -94,6 +96,7 @@ import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
 import app.aduster.ui.theme.blockedTint
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -148,7 +151,10 @@ fun LogScreen(vm: MainViewModel) {
     // The ledger is rebuilt at every poll over up to 10,000 entries: off the main thread. Null
     // until the first one is ready (no "Nothing logged yet" flash).
     var rows by remember { mutableStateOf<List<LogLine>?>(null) }
-    LaunchedEffect(entries, query, kind, inBrowsers, pages, app, labels, browsers) {
+    val logRead by vm.logRead.collectAsStateWithLifecycle()
+    LaunchedEffect(entries, query, kind, inBrowsers, pages, app, labels, browsers, logRead) {
+        // Not read from the core yet: an empty log is not "Nothing logged yet".
+        if (entries.isEmpty() && !logRead) return@LaunchedEffect
         rows = withContext(Dispatchers.Default) {
             ledgerOf(entries.filter { logMatches(it, kind, inBrowsers, pages, app, query, browsers) { uid -> appName(labels, uid) } })
         }
@@ -162,8 +168,10 @@ fun LogScreen(vm: MainViewModel) {
     val scope = rememberCoroutineScope()
     if (clearDialog) ClearLogDialog(vm.viewModelScope, { vm.clearLog() }) { clearDialog = false }
     val undoBar = remember { androidx.compose.material3.SnackbarHostState() }
-    var pinnedTop by remember { mutableStateOf(true) }
-    var seenSeq by remember { mutableLongStateOf(0L) }
+    // Saved with the list's place: coming back to the tab (or turning the phone) found it pinned
+    // again and jumped to the top.
+    var pinnedTop by rememberSaveable { mutableStateOf(listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset < 24) }
+    var seenSeq by rememberSaveable { mutableLongStateOf(0L) }
     val topSeq = topSeqOf(lines)
     LaunchedEffect(listState) {
         snapshotFlow { Triple(listState.firstVisibleItemIndex, listState.firstVisibleItemScrollOffset, listState.isScrollInProgress) }
@@ -187,7 +195,7 @@ fun LogScreen(vm: MainViewModel) {
         lastFilters = key
     }
     val fresh = if (pinnedTop) 0 else freshRows(lines, seenSeq)
-    val shownCount = lines.count { it is LogLine.Query || it is LogLine.Offline }
+    val shownCount = remember(lines) { lines.count { it is LogLine.Query || it is LogLine.Offline } }
 
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
@@ -274,13 +282,15 @@ fun LogScreen(vm: MainViewModel) {
 
     if (appDialog) {
         // Apps seen in the log, busiest first.
-        val apps = entries.filterNot { it.action.marker }.groupingBy { it.uid }.eachCount().entries.sortedByDescending { it.value }.map { it.key }
+        // Counted once per log, not once per app row on every redraw (up to 10,000 entries each).
+        val counts = remember(entries) { entries.filterNot { it.action.marker }.groupingBy { it.uid }.eachCount() }
+        val apps = counts.entries.sortedByDescending { it.value }.map { it.key }
         ChoiceDialog(
             "Show one app",
             apps,
             app ?: Int.MIN_VALUE,
             label = { appName(labels, it) },
-            detail = { uid -> counted(entries.count { it.uid == uid }, "entry", "entries") },
+            detail = { uid -> counted(counts[uid] ?: 0, "entry", "entries") },
             onDismiss = { appDialog = false },
         ) {
             appDialog = false
@@ -292,9 +302,10 @@ fun LogScreen(vm: MainViewModel) {
         Details(
             r, appName(labels, r.e.uid), vm,
             onOnlyApp = { app = r.e.uid; selected = null },
-            onChanged = { text, undo ->
-                // The actions act at once; the bar says what changed and takes it back.
+            onChanged = { text, saved, undo ->
+                // The actions act at once; the bar says what changed, once saved, and takes it back.
                 scope.launch {
+                    if (!saved.await()) return@launch
                     undoBar.currentSnackbarData?.dismiss()
                     val r2 = undoBar.showSnackbar(text, actionLabel = "Undo", duration = androidx.compose.material3.SnackbarDuration.Long)
                     if (r2 == androidx.compose.material3.SnackbarResult.ActionPerformed) undo()
@@ -432,15 +443,21 @@ internal fun ledgerOf(shown: List<LogItem>): List<LogLine> {
     // The latest row of a name and app, for the connections that go with it.
     val latest = HashMap<String, Group>()
     var offline: ArrayList<LogItem>? = null
+    // The app's own restart marker has no number of the core's (it is negative): it sorts with
+    // the newest entry older than it, just above it.
+    var olderSeq = Long.MIN_VALUE
+    val markerSeq = java.util.IdentityHashMap<LogItem, Long>()
     for (i in shown.indices.reversed()) {
         val e = shown[i]
         if (e.action.marker) {
+            if (e.seq < 0) markerSeq[e] = olderSeq
             open.clear()
             latest.clear()
             offline = null
             units += e
             continue
         }
+        olderSeq = e.seq
         if (e.offline) {
             val stretch = offline ?: ArrayList<LogItem>().also { offline = it; units.add(it) }
             stretch += e
@@ -480,7 +497,10 @@ internal fun ledgerOf(shown: List<LogItem>): List<LogLine> {
             is LogItem -> LogLine.Marker(u)
             else -> (u as ArrayList<LogItem>).let { LogLine.Offline(it.last(), it.first(), it.size) }
         }
-    }.sortedByDescending { newestSeq(it) }
+    }.sortedWith(
+        compareByDescending<LogLine> { l -> if (l is LogLine.Marker) markerSeq[l.e] ?: l.e.seq else newestSeq(l) }
+            .thenByDescending { it is LogLine.Marker },
+    )
 
     val out = ArrayList<LogLine>(lines.size + 8)
     val keys = HashSet<Any>()
@@ -684,15 +704,15 @@ internal fun proxySiteOf(r: LogLine.Query): String? =
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onChanged: (String, () -> Unit) -> Unit, onDismiss: () -> Unit) {
+private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp: () -> Unit, onChanged: (String, Deferred<Boolean>, () -> Unit) -> Unit, onDismiss: () -> Unit) {
     val p = LocalPalette.current
     val ctx = LocalContext.current
     val view = LocalView.current
     val e = r.e
     fun rule(text: String, said: String) {
         Haptics.confirm(view)
-        vm.addUserRule(text)
-        onChanged(said) { vm.undoAddedRule() }
+        val saved = vm.addUserRule(text)
+        onChanged(said, saved) { vm.undoAddedRule() }
         onDismiss()
     }
     val s by vm.settings.collectAsStateWithLifecycle()
@@ -702,7 +722,7 @@ private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp:
         if (proxySite != null) siteCheck = withContext(Dispatchers.IO) { vm.checkSite(proxySite) }
     }
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = p.surface, dragHandle = null) {
-        Column(Modifier.padding(horizontal = Gutter).padding(top = 24.dp, bottom = 16.dp).navigationBarsPadding()) {
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = Gutter).padding(top = 24.dp, bottom = 16.dp).navigationBarsPadding()) {
             Text(e.action.label, style = Type.heading, color = if (e.action.blocked) p.blocked else p.muted)
             Spacer(Modifier.height(8.dp))
             Text(e.name, style = Type.title.copy(fontSize = Type.title.fontSize * 0.8f), color = p.text)
@@ -751,23 +771,27 @@ private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp:
             Spacer(Modifier.height(4.dp))
             if (e.uid >= 0) TextAction("Show only $app", color = p.muted, onClick = onOnlyApp)
             // Leave the app out of protection altogether (Settings › Excluded apps).
-            val packages = remember(e.uid) { if (e.uid >= Process.FIRST_APPLICATION_UID) vm.packagesOf(e.uid) else emptySet() }
+            // A binder call: asked off the main thread, never while drawing.
+            val packages by produceState(emptySet<String>(), e.uid) {
+                value = if (e.uid >= Process.FIRST_APPLICATION_UID) withContext(Dispatchers.IO) { vm.packagesOf(e.uid) } else emptySet()
+            }
             val added = packages - s.excludedApps
             if (added.isNotEmpty()) {
                 TextAction("Exclude $app", color = p.muted) {
                     Haptics.confirm(view)
-                    vm.update { it.copy(excludedApps = it.excludedApps + added) }
-                    onChanged("$app excluded from protection") { vm.update { it.copy(excludedApps = it.excludedApps - added) } }
+                    val saved = vm.update { it.copy(excludedApps = it.excludedApps + added) }
+                    onChanged("$app excluded from protection", saved) { vm.update { it.copy(excludedApps = it.excludedApps - added) } }
                     onDismiss()
                 }
             }
             // What the page filter saw: its site can be left undecrypted (Page filtering › Never decrypted).
-            val site = if (e.qtype == 0) page ?: e.name else null
+            // The row's site as the page filter saw it, also when its lookup and connection are one row.
+            val site = proxySite
             if (site != null && !vm.userExcludes(site, s)) {
                 TextAction("Never decrypt $site", color = p.muted) {
                     Haptics.confirm(view)
-                    vm.update { it.copy(httpsExclusions = (it.httpsExclusions.trim() + "\n" + site).trim()) }
-                    onChanged("$site is no longer decrypted") {
+                    val saved = vm.update { it.copy(httpsExclusions = (it.httpsExclusions.trim() + "\n" + site).trim()) }
+                    onChanged("$site is no longer decrypted", saved) {
                         vm.update { cur -> cur.copy(httpsExclusions = cur.httpsExclusions.lines().filterNot { it.trim() == site }.joinToString("\n").trim()) }
                     }
                     onDismiss()

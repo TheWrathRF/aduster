@@ -281,7 +281,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                 row {
                     ListRow(
                         "Share report",
-                        "It names some of the sites you visited",
+                        "Saved to Downloads too; it names some of the sites you visited",
                         onClick = {
                             scope.launch {
                                 val share = withContext(Dispatchers.IO) { vm.saveReport()?.let { app.aduster.vpn.Reports.shareIntent(ctx, it) } }

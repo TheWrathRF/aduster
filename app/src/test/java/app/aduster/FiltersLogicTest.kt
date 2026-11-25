@@ -21,10 +21,12 @@ import app.aduster.ui.common.progressFraction
 import app.aduster.ui.common.progressLabel
 import app.aduster.ui.filters.RULE_SYNTAX_HELP
 import app.aduster.ui.filters.SiteFixAction
+import app.aduster.ui.filters.activeRuleCount
 import app.aduster.ui.filters.allowSiteRule
 import app.aduster.ui.filters.browserLines
 import app.aduster.ui.filters.failedListNames
 import app.aduster.ui.filters.filtersSummaryText
+import app.aduster.ui.filters.fixSiteWhy
 import app.aduster.ui.filters.listDetail
 import app.aduster.ui.filters.rulesEditorPlaceholder
 import app.aduster.ui.filters.showPageRulesSummary
@@ -251,6 +253,24 @@ class FiltersLogicTest {
     }
 
     @Test
+    fun homeCountsPageRulesOnlyWhenTheyAreInUse() {
+        val meta = FilterMeta(compiledRules = 1200, webRules = 500)
+        assertEquals(1700, activeRuleCount(meta, available = true, httpsFiltering = true, caTrusted = true))
+        // Like Filters' header: no certificate, page filtering off, or a page engine that failed to build.
+        assertEquals(1200, activeRuleCount(meta, available = true, httpsFiltering = true, caTrusted = false))
+        assertEquals(1200, activeRuleCount(meta, available = true, httpsFiltering = false, caTrusted = true))
+        assertEquals(1200, activeRuleCount(meta.copy(webError = "compile failed"), available = true, httpsFiltering = true, caTrusted = true))
+    }
+
+    @Test
+    fun fixASiteNamesTheBlockingListAsTheAppDoes() {
+        val s = Settings()
+        assertEquals("||ads.example^ from My rules", fixSiteWhy("||ads.example^", "user", s))
+        assertEquals("||bank.example^ from AdGuard HTTPS exclusions (banks)", fixSiteWhy("||bank.example^", "adguard-https-banks", s))
+        assertEquals("", fixSiteWhy(null, null, s))
+    }
+
+    @Test
     fun pageRulesCountShownOnlyWithTrustedCertificate() {
         assertTrue(showPageRulesSummary(available = true, httpsFiltering = true, caTrusted = true))
         assertFalse(showPageRulesSummary(available = true, httpsFiltering = true, caTrusted = false))
@@ -295,6 +315,8 @@ class FiltersLogicTest {
         assertEquals(listOf(SiteFixAction.FILTER_AGAIN, SiteFixAction.ALLOW, SiteFixAction.NEVER_DECRYPT), siteFixActions("shop.example", sOn, passedThrough, pagesAvailable = true, userExcluded = false))
         assertEquals(listOf(SiteFixAction.NEVER_DECRYPT), siteFixActions("shop.example", sOn, alreadyAllowed, pagesAvailable = true, userExcluded = false))
         assertEquals(listOf(SiteFixAction.NEVER_DECRYPT), siteFixActions("shop.example", sOn.copy(userRules = "@@||shop.example^"), normal, pagesAvailable = true, userExcluded = false))
+        // A name under an allowed site is allowed already (the rule covers it), also without page filtering.
+        assertEquals(emptyList<SiteFixAction>(), siteFixActions("www.shop.example", sOff.copy(userRules = "@@||shop.example^"), null, pagesAvailable = true, userExcluded = false))
         assertEquals(listOf(SiteFixAction.ALLOW), siteFixActions("shop.example", sOn, sensitive, pagesAvailable = true, userExcluded = false))
         assertEquals(listOf(SiteFixAction.ALLOW), siteFixActions("shop.example", sOn, normal, pagesAvailable = true, userExcluded = true))
         assertEquals(listOf(SiteFixAction.ALLOW), siteFixActions("shop.example", sOff, null, pagesAvailable = true, userExcluded = false))

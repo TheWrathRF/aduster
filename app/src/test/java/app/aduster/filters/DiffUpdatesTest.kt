@@ -66,4 +66,14 @@ class DiffUpdatesTest {
         // No checksum line: nothing to check against.
         assertNull(DiffUpdates.checksumHolds("! Title: x\r\n||a^\r\n".toByteArray()))
     }
+
+    @Test
+    fun oversizedNamesAndResultsAreRefused() {
+        // Fifteen digits of hours overflow a millisecond clock: not a name we can schedule.
+        assertNull(DiffUpdates.dueAt("../patches/20/20-999999999999999-1.patch"))
+        // A result over the size limit is refused, not built.
+        val old = "a\nb\n".toByteArray()
+        assertNull(DiffUpdates.applyRcs(old, "a2 1\n${"x".repeat(100)}\n".toByteArray(), maxBytes = 64))
+        assertEquals("a\nb\nc\n", DiffUpdates.applyRcs(old, "a2 1\nc\n".toByteArray(), maxBytes = 64)?.decodeToString())
+    }
 }

@@ -219,8 +219,9 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
         }
 
         // After page filtering is switched on its lists download and the page rules are built
-        // (30-40 s on a phone): the same strip as on Filters, only while that work runs.
-        val work = progress?.takeIf { it.withPages }
+        // (30-40 s on a phone): the same strip as on Filters, only while that work runs, and while
+        // it waits for a network (that wait is not marked as page work, so it went unsaid here).
+        val work = progress?.takeIf { it.withPages || (s.httpsFiltering && it.phase == app.aduster.filters.UpdatePhase.WAITING_NETWORK) }
         app.aduster.ui.common.ProgressStrip(
             phase = work?.phase,
             done = work?.done ?: 0,
@@ -230,8 +231,9 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
         )
 
         SectionHeading("Browsers")
-        val browserRows = remember(browsers, stats?.filteredBrowsers, stats?.untrustedBrowsers) {
-            browserFilterRows(browsers, stats?.filteredBrowsers.orEmpty(), stats?.untrustedBrowsers.orEmpty())
+        val pagesOn = s.httpsFiltering && installed == true
+        val browserRows = remember(browsers, stats?.filteredBrowsers, stats?.untrustedBrowsers, pagesOn, s.excludedApps) {
+            browserFilterRows(browsers, stats?.filteredBrowsers.orEmpty(), stats?.untrustedBrowsers.orEmpty(), pagesOn, s.excludedApps)
         }
         if (browserRows.isEmpty()) {
             Note("No browsers found on this phone.")
@@ -396,16 +398,20 @@ internal fun isChromiumBrowser(pkg: String): Boolean {
 internal data class BrowserFilterRow(val browser: Browser, val pageFiltered: Boolean, val status: String)
 
 /**
- * Installed browsers with their filtering status: Chromium browsers (and any browser the proxy
- * confirmed filtering) get page filtering; Firefox, other browsers, and any browser that refused
- * the certificate get DNS only.
+ * Installed browsers with what they get now: with page filtering on ([pagesOn]: switched on and
+ * the certificate installed), Chromium browsers (and any browser the proxy confirmed filtering)
+ * get page filtering; Firefox, other browsers, any browser that refused the certificate, and
+ * every browser while page filtering is off get DNS only; an excluded app gets neither.
  */
 internal fun browserFilterRows(
     browsers: List<Browser>,
     filteredBrowsers: List<String> = emptyList(),
     untrustedBrowsers: List<String> = emptyList(),
+    pagesOn: Boolean = true,
+    excludedApps: Set<String> = emptySet(),
 ): List<BrowserFilterRow> = browsers.map { b ->
-    val filtered = when {
+    if (b.pkg in excludedApps) return@map BrowserFilterRow(b, false, "Excluded")
+    val filtered = pagesOn && when {
         b.name in untrustedBrowsers -> false
         b.name in filteredBrowsers -> true
         else -> isChromiumBrowser(b.pkg)

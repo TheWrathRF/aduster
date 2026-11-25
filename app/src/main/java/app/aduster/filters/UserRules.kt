@@ -122,7 +122,7 @@ object UserRules {
      */
     fun siteHost(input: String): String? {
         var s = input.trim().lowercase()
-        s = s.substringAfter("://", s).substringBefore('/').substringBefore('?').substringBefore('#').substringBefore(':')
+        s = s.substringAfter("://", s).substringBefore('/').substringBefore('?').substringBefore('#').substringAfterLast('@').substringBefore(':')
         s = s.removePrefix("*.").trim('.')
         return s.takeIf { it.contains('.') && Regex("""^[a-z0-9_.-]+$""").matches(it) && !it.contains("..") }
     }

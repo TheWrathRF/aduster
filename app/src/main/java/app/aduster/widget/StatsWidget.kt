@@ -41,9 +41,17 @@ class StatsWidget : AppWidgetProvider() {
     }
 
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
-        // Called only with widgets on the home screen.
+        // Called only with widgets on the home screen. Drawn off the main thread: it reads the
+        // settings and today's count from disk.
         placed = true
-        update(context)
+        val pending = goAsync()
+        Thread {
+            try {
+                update(context)
+            } finally {
+                pending.finish()
+            }
+        }.start()
     }
 
     override fun onEnabled(context: Context) {
@@ -51,7 +59,9 @@ class StatsWidget : AppWidgetProvider() {
     }
 
     override fun onDisabled(context: Context) {
-        placed = false
+        // Asked again at the next redraw: the receiver is exported, so another app can send this
+        // too, and a plain "none placed" would have frozen a widget still on the home screen.
+        placed = null
     }
 
     companion object {

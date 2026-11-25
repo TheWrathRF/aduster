@@ -87,6 +87,10 @@ class HomeLogicTest {
         assertEquals("+18% vs last week", weekTrend(historySlots(before + week, DayStat(100, 50, 18), slots = 14)))
         assertEquals("−50% vs last week", weekTrend(historySlots(before, DayStat(100, 50, 50), slots = 14)))
         assertEquals("Same as last week", weekTrend(historySlots(before, DayStat(100, 50, 100), slots = 14)))
+        // Installed late on the last day of the earlier week: one evening is not a week to compare with
+        // (it read "+69900% vs last week").
+        val evening = listOf(DayStat(93, 10, 5)) + (94L..99L).map { DayStat(it, 900, 500) }
+        assertNull(weekTrend(historySlots(evening, DayStat(100, 900, 500), slots = 14)))
     }
 
     @Test
@@ -228,6 +232,14 @@ class HomeLogicTest {
             rows.map { it.browser.name to it.status },
         )
         assertEquals(listOf(true, false, false, true), rows.map { it.pageFiltered })
+        // Page filtering off (or no certificate yet): every browser gets DNS only right now; an
+        // excluded browser gets neither.
+        val off = browserFilterRows(installed, pagesOn = false, excludedApps = setOf("org.mozilla.firefox"))
+        assertEquals(listOf("DNS only", "Excluded", "DNS only", "DNS only"), off.map { it.status })
+        assertEquals(listOf(false, false, false, false), off.map { it.pageFiltered })
+        val excluded = browserFilterRows(installed, excludedApps = setOf("com.android.chrome"))
+        assertEquals("Chrome" to "Excluded", excluded.first().let { it.browser.name to it.status })
+        assertFalse(excluded.first().pageFiltered)
     }
 
     @Test

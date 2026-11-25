@@ -41,7 +41,8 @@ internal object DiffUpdates {
         }
         val valid = m.groupValues[3].toLong()
         if (valid <= 0) return null
-        return (m.groupValues[2].toLong() + valid) * unit
+        // Fifteen digits of hours do not fit a millisecond clock: no such patch.
+        return runCatching { Math.multiplyExact(Math.addExact(m.groupValues[2].toLong(), valid), unit) }.getOrNull()
     }
 
     /** The patch's address, relative to the list's; null unless on the list's own server. */
@@ -51,8 +52,8 @@ internal object DiffUpdates {
         u.takeIf { it.scheme == base.scheme && it.host == base.host && it.port == base.port }?.toString()
     }.getOrNull()
 
-    /** [old] with the RCS [patch] applied, or null if the patch is not a clean one for it. */
-    fun applyRcs(old: ByteArray, patch: ByteArray): ByteArray? {
+    /** [old] with the RCS [patch] applied, or null if the patch is not a clean one for it or the result passes [maxBytes]. */
+    fun applyRcs(old: ByteArray, patch: ByteArray, maxBytes: Long = Long.MAX_VALUE): ByteArray? {
         val lines = splitLines(old)
         val p = splitLines(patch)
         if (p.isEmpty()) return null
@@ -64,6 +65,7 @@ internal object DiffUpdates {
             val n = cmd.groupValues[2].toInt()
             val count = cmd.groupValues[3].toInt()
             i++
+            if (out.size() > maxBytes) return null
             if (cmd.groupValues[1] == "d") {
                 if (n < 1 || count < 1 || n - 1 < next || n - 1 + count > lines.size) return null
                 for (k in next until n - 1) out.write(lines[k])
@@ -76,7 +78,7 @@ internal object DiffUpdates {
             }
         }
         for (k in next until lines.size) out.write(lines[k])
-        return out.toByteArray()
+        return if (out.size() > maxBytes) null else out.toByteArray()
     }
 
     /**

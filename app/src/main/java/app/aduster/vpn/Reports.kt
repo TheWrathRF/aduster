@@ -38,7 +38,7 @@ object Reports {
             values.clear()
             values.put(MediaStore.Downloads.IS_PENDING, 0)
             resolver.update(uri, values, null, null)
-            prune(ctx)
+            prune(ctx, name)
             name
         } catch (_: Exception) {
             // No half-written pending entry left behind.
@@ -83,8 +83,11 @@ object Reports {
         }.getOrDefault(0)
 
     /** Of the saved reports' [names], those beyond the newest [keep] (the name holds the time). */
-    internal fun beyondNewest(names: List<String>, keep: Int = KEEP): List<String> =
-        names.filter { REPORT.matches(it) }.sortedDescending().drop(keep)
+    internal fun beyondNewest(names: List<String>, keep: Int = KEEP, justSaved: String? = null): List<String> {
+        // The report just saved always stays, also when a clock set back gave it the oldest name.
+        val kept = if (justSaved != null && justSaved in names) 1 else 0
+        return names.filter { REPORT.matches(it) && it != justSaved }.sortedDescending().drop((keep - kept).coerceAtLeast(0))
+    }
 
     /** A report's name, also as the system renames a second one of the same second ("… (1).json"). */
     private val REPORT = Regex("""^Aduster_report_\d{8}-\d{6}( \(\d+\))?\.json$""")
@@ -133,10 +136,10 @@ object Reports {
     }
 
     /** Deletes this install's reports beyond the newest [KEEP]. */
-    private fun prune(ctx: Context) {
+    private fun prune(ctx: Context, justSaved: String? = null) {
         val resolver = ctx.contentResolver
         val found = saved(ctx)
-        for (name in beyondNewest(found.keys.toList())) {
+        for (name in beyondNewest(found.keys.toList(), justSaved = justSaved)) {
             val id = found[name] ?: continue
             runCatching { resolver.delete(android.content.ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, id), null, null) }
         }

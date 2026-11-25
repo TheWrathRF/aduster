@@ -16,7 +16,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -29,6 +29,9 @@ const UID_WAIT: Duration = Duration::from_millis(500);
 /// How long a local answer (a block, the cache) waits for its app's UID: the lookup needs the
 /// app's socket, which the app closes once answered. Only while the log names apps.
 const LOCAL_UID_WAIT: Duration = Duration::from_millis(5);
+/// At most this many app lookups queued or running at once; beyond, a query's app is not named
+/// (a burst would otherwise queue one binder call per query, each run even after its wait ended).
+const MAX_UID_LOOKUPS: usize = 32;
 /// At most this many distinct names asked upstream at once; beyond, SERVFAIL at once (a
 /// burst of unique names would hold a socket each, from the budget every browser connection shares).
 const MAX_INFLIGHT: usize = 512;
@@ -43,7 +46,14 @@ impl Uid {
     async fn resolve(self, wait: Duration) -> i32 {
         match self {
             Uid::Known(u) => u,
-            Uid::Pending(h) => tokio::time::timeout(wait, h).await.ok().and_then(Result::ok).unwrap_or(-1),
+            Uid::Pending(mut h) => match tokio::time::timeout(wait, &mut h).await {
+                Ok(r) => r.unwrap_or(-1),
+                Err(_) => {
+                    // Not started yet: it never will be (its answer would come too late anyway).
+                    h.abort();
+                    -1
+                }
+            },
         }
     }
 }
@@ -78,6 +88,27 @@ struct Ctx<W> {
     tun: W,
     inflight: RefCell<HashMap<Key, Vec<Pending>>>,
     out: RefCell<Vec<u8>>,
+    /// App lookups queued or running ([`MAX_UID_LOOKUPS`]).
+    uid_lookups: Arc<AtomicUsize>,
+}
+
+/// One app lookup's place among [`MAX_UID_LOOKUPS`], given back when the lookup ends or is
+/// dropped unstarted.
+struct LookupSlot(Arc<AtomicUsize>);
+
+impl LookupSlot {
+    /// A place, or none while [`MAX_UID_LOOKUPS`] are taken.
+    fn take(n: &Arc<AtomicUsize>) -> Option<Self> {
+        let before = n.fetch_add(1, Ordering::Relaxed);
+        let slot = LookupSlot(n.clone());
+        (before < MAX_UID_LOOKUPS).then_some(slot)
+    }
+}
+
+impl Drop for LookupSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(unix))]
@@ -189,7 +220,8 @@ mod fd {
 /// The loop: answers packets until `stop` is notified or the reader ends. Must run inside a
 /// `LocalSet` (forwards are local tasks).
 pub(crate) async fn serve<R: TunRead, W: TunWrite + 'static>(shared: Arc<Shared>, mut rx: R, tx: W, stop: Arc<Notify>) -> io::Result<()> {
-    let ctx = Rc::new(Ctx { shared, tun: tx, inflight: RefCell::new(HashMap::new()), out: RefCell::new(Vec::with_capacity(9000)) });
+    let ctx =
+        Rc::new(Ctx { shared, tun: tx, inflight: RefCell::new(HashMap::new()), out: RefCell::new(Vec::with_capacity(9000)), uid_lookups: Arc::default() });
     let mut buf = vec![0u8; 65536];
     let mut on_packet = |p: &[u8]| handle_packet(&ctx, p);
     loop {
@@ -305,11 +337,16 @@ fn handle_query<W: TunWrite + 'static>(ctx: &Rc<Ctx<W>>, u: packet::Udp) {
     let cfg = shared.config.load();
     let logging = cfg.log_capacity > 0;
     // The app's UID is asked on the blocking pool, alongside everything else.
-    let uid = if logging && cfg.resolve_uids && shared.uid_lookup.get().is_some() {
-        let (s, src, dst) = (shared.clone(), u.src, u.dst);
-        Uid::Pending(tokio::task::spawn_blocking(move || s.lookup_uid(17, src, dst)))
-    } else {
-        Uid::Known(-1)
+    let wanted = logging && cfg.resolve_uids && shared.uid_lookup.get().is_some();
+    let uid = match wanted.then(|| LookupSlot::take(&ctx.uid_lookups)).flatten() {
+        Some(slot) => {
+            let (s, src, dst) = (shared.clone(), u.src, u.dst);
+            Uid::Pending(tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                s.lookup_uid(17, src, dst)
+            }))
+        }
+        None => Uid::Known(-1),
     };
 
     let filters = shared.filters.load();
@@ -752,6 +789,39 @@ mod tests {
         // 5 ms of waiting, plus the timer's resolution on a desktop OS (up to ~16 ms on Windows).
         assert!(s.local_latency.percentile(0.99) < 40_000, "the answer waited: {} µs", s.local_latency.percentile(0.99));
         assert!(s.apps.contains_key(&10_123), "the app was not named");
+    }
+
+    /// A burst of lookups while Android is slow to name their apps: the app lookups queued at once
+    /// stay bounded (each was queued, and ran later, with no limit) and every answer still goes out.
+    #[tokio::test]
+    async fn app_lookups_stay_bounded_in_a_burst() {
+        let (up, _) = fake_resolver(0).await;
+        let shared = Shared::new(Config { resolve_uids: true, ..Config::default() });
+        let (bytes, _) = matcher::compile(&[Source { name: "test", text: "||ads.test^\n", user: false, allow: false }]);
+        shared.set_filters(Filters { lists: Table::from_bytes(bytes).unwrap(), user: Table::empty() });
+        shared.set_network(vec![up], true, false, 1);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let _ = shared.uid_lookup.set(Box::new(move |_, _, _| {
+            c.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            10_123
+        }));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let out = VecWriter::default();
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(serve(shared.clone(), ChanReader(rx), out.clone(), Arc::new(Notify::new())));
+        local
+            .run_until(async {
+                for id in 0..200u16 {
+                    tx.send(query_packet(id, "ads.test", 53)).unwrap();
+                }
+                wait_for(&out, 200).await;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            })
+            .await;
+        let n = calls.load(Ordering::SeqCst);
+        assert!(n <= MAX_UID_LOOKUPS + 8, "{n} app lookups for one burst");
     }
 
     /// Writes like [`VecWriter`] and notes that an answer went out.

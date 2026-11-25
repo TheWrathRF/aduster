@@ -216,6 +216,12 @@ class UiLogicTest {
         )
         assertEquals(listOf("day", "x.test A x1", "marker", "day", "x.test A x1"), show(split))
         assertEquals(split.size, split.map { it.key }.toSet().size)
+        // The app's own "Protection restarted" marker (a negative number, between two core
+        // lifetimes) stays between them, not under every older row.
+        val restarted = app.aduster.ui.log.ledgerOf(
+            listOf(e(5_000, 2_000, "new.test", 1, 10, QueryAction.UPSTREAM), e(-123_456, 1_500, "", 0, -1, QueryAction.RESTARTED), e(30, 1_000, "old.test", 1, 10, QueryAction.UPSTREAM)),
+        )
+        assertEquals(listOf("day", "new.test A x1", "marker", "day", "old.test A x1"), show(restarted))
         // An AAAA left out by IPv4-only answers is not hidden under its A row; a failed lookup is not an allowed one.
         assertEquals(3, app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.NO_IPV6), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM))).size)
         assertEquals(3, app.aduster.ui.log.ledgerOf(listOf(e(8, 1_100, "x.test", 28, 10, QueryAction.FAILED), e(7, 1_000, "x.test", 1, 10, QueryAction.UPSTREAM))).size)

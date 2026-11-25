@@ -79,4 +79,47 @@ class DiffUpdateFlowTest {
             tmp.deleteRecursively()
         }
     }
+
+    /**
+     * More patches due than one check applies (hourly patches, a daily check): the list is
+     * brought fully up to date by a full download, not left a few patches behind for good.
+     */
+    @Test
+    fun aListFarBehindIsDownloadedInFull() {
+        fun version(k: Int) = withSum(
+            "[Adblock Plus 2.0]\r\n! Checksum: SUM\r\n! Diff-Path: ../patches/p$k-s-1-1.patch\r\n! Title: T\r\n" +
+                (0 until k).joinToString("") { "||r$it.example^\r\n" },
+        )
+        val bodies = ConcurrentHashMap<String, String>()
+        bodies["/f/list.txt"] = version(0)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            val b = bodies[ex.requestURI.path]?.toByteArray()
+            if (b == null) ex.sendResponseHeaders(404, -1) else {
+                ex.sendResponseHeaders(200, if (b.isEmpty()) -1 else b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            }
+            ex.close()
+        }
+        server.start()
+        val tmp = Files.createTempDirectory("aduster-diff").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("l", "L", "http://127.0.0.1:${server.address.port}/f/list.txt", true, Group.WEB, true, "")
+            val now = 1_800_000_000_000L
+            FilterUpdater.checkAll(store, listOf(l), FilterUpdater.Check.ALL, now)
+            // Twelve versions out since: each patch turns version k into k + 1.
+            for (k in 0 until 12) {
+                val next = version(k + 1).lines()
+                bodies["/patches/p$k-s-1-1.patch"] = "d2 2\na3 2\n${next[1]}\r\n${next[2]}\r\na${4 + k} 1\n||r$k.example^\r\n"
+            }
+            bodies["/patches/p12-s-1-1.patch"] = ""
+            bodies["/f/list.txt"] = version(12)
+            FilterUpdater.checkAll(store, listOf(l), FilterUpdater.Check.ALL, now + 60_000)
+            assertEquals(version(12), File(store.raw("l").path).readText())
+        } finally {
+            server.stop(0)
+            tmp.deleteRecursively()
+        }
+    }
 }

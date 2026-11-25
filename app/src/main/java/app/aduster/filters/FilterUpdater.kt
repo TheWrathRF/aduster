@@ -965,7 +965,7 @@ object FilterUpdater {
             val body = patchBody(DiffUpdates.patchUrl(url, path) ?: return null) ?: return null
             if (body.isEmpty()) break
             val (sha, rcs) = DiffUpdates.split(body)
-            val next = DiffUpdates.applyRcs(cur ?: raw.readBytes(), rcs) ?: return null
+            val next = DiffUpdates.applyRcs(cur ?: raw.readBytes(), rcs, MAX_BYTES) ?: return null
             val ok = if (sha != null) DiffUpdates.sha1(next) == sha else DiffUpdates.checksumHolds(next) == true
             if (!ok) return null
             cur = next
@@ -973,6 +973,9 @@ object FilterUpdater {
             if (nextPath == path) break
             path = nextPath
             if ((DiffUpdates.dueAt(path) ?: break) > now) break
+            // More due than one check applies (hourly patches, a daily check): left a few behind
+            // at every check, the list would never catch up. The full list instead.
+            if (n == MAX_PATCHES - 1) return null
         }
         val result = cur ?: return Fetch.NotModified(patched = true)
         val scanner = ListScanner()

@@ -16,19 +16,25 @@
         android:layout_weight="1"
         android:orientation="vertical">
 
+        <!-- Shrinks to fit beside the button ("Paused", a five-digit count at the 2 x 1 size). -->
         <TextView
             android:id="@+id/widget_count"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:autoSizeMaxTextSize="30sp"
+            android:autoSizeMinTextSize="14sp"
+            android:autoSizeStepGranularity="1sp"
+            android:autoSizeTextType="uniform"
             android:fontFamily="@font/google_sans_medium"
             android:fontFeatureSettings="tnum"
+            android:gravity="start|center_vertical"
             android:maxLines="1"
             android:text="0"
             android:textColor="#FFEDEDEF"
             android:textSize="30sp" />
 
         <LinearLayout
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center_vertical"
             android:orientation="horizontal">
@@ -43,9 +49,15 @@
 
             <TextView
                 android:id="@+id/widget_caption"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
+                android:layout_width="0dp"
+                android:layout_height="18dp"
+                android:layout_weight="1"
+                android:autoSizeMaxTextSize="12sp"
+                android:autoSizeMinTextSize="9sp"
+                android:autoSizeStepGranularity="0.5sp"
+                android:autoSizeTextType="uniform"
                 android:fontFamily="@font/google_sans_regular"
+                android:gravity="start|center_vertical"
                 android:maxLines="1"
                 android:text="Blocked today"
                 android:textColor="#FF8E8E96"
@@ -53,13 +65,14 @@
         </LinearLayout>
     </LinearLayout>
 
-    <ImageView
+    <!-- A button for TalkBack ("Pause protection, button"), 48 dp to touch. -->
+    <ImageButton
         android:id="@+id/widget_button"
-        android:layout_width="44dp"
-        android:layout_height="44dp"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:layout_marginStart="8dp"
         android:background="@drawable/widget_button_bg"
         android:contentDescription="Pause protection"
-        android:padding="11dp"
+        android:padding="12dp"
         android:src="@drawable/ic_stat_pause" />
 </LinearLayout>

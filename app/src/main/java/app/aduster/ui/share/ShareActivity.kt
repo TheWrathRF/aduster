@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -28,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.aduster.filters.UserRules
@@ -47,6 +50,7 @@ import app.aduster.ui.theme.Type
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.IDN
 
 /** What the share sheet offers for a site, in order. */
 internal enum class ShareAction(val label: String) {
@@ -59,10 +63,19 @@ internal enum class ShareAction(val label: String) {
 /** How long "Don't filter for 15 minutes" lasts. */
 internal const val SHARE_PAUSE_MINUTES = 15
 
-/** The site of the first web address in what was shared ("Title\nhttps://…"), or null. */
+/**
+ * The site of the first web address in what was shared ("Title\nhttps://…"), in its DNS form
+ * (`münchen.de` gives `xn--mnchen-3ya.de`), or null. A user name before the host, an address
+ * literal or a name longer than DNS allows never gives a wrong site.
+ */
 internal fun sharedHost(text: String?): String? {
-    val url = Regex("""https?://\S+""", RegexOption.IGNORE_CASE).find(text ?: return null)?.value ?: return null
-    return UserRules.siteHost(url)
+    val url = Regex("""https?://[^\s<>"'()\[\]{}]+""", RegexOption.IGNORE_CASE).find(text ?: return null)?.value ?: return null
+    val name = url.substringAfter("://").substringBefore('/').substringBefore('?').substringBefore('#')
+        .substringAfterLast('@').substringBefore(':').trimEnd('.', ',', ';', '!')
+    val ascii = runCatching { IDN.toASCII(name) }.getOrNull() ?: return null
+    val host = UserRules.siteHost(ascii) ?: return null
+    if (host.length > 253 || host.split('.').all { label -> label.all(Char::isDigit) }) return null
+    return host
 }
 
 /**
@@ -70,7 +83,9 @@ internal fun sharedHost(text: String?): String? {
  * actions "Fix a site" offers (Filter again, Allow on this site, Never decrypt).
  */
 internal fun shareActions(host: String, settings: Settings, site: SiteCheck?, pagesAvailable: Boolean, userExcluded: Boolean): List<ShareAction> = buildList {
-    if (pagesAvailable && settings.httpsFiltering && site != null && site.decrypted && site.filteringActive) add(ShareAction.PAUSE)
+    // A site the user allowed is not filtered in pages: nothing to pause.
+    val filtered = site != null && site.decrypted && site.filteringActive && site.reasons.none { it.kind == "user_allowed" }
+    if (pagesAvailable && settings.httpsFiltering && filtered) add(ShareAction.PAUSE)
     siteFixActions(host, settings, site, pagesAvailable, userExcluded).forEach {
         add(
             when (it) {
@@ -82,6 +97,10 @@ internal fun shareActions(host: String, settings: Settings, site: SiteCheck?, pa
     }
 }
 
+/** What the sheet says when it has nothing to offer. */
+internal fun nothingToChange(settings: Settings, pagesAvailable: Boolean): String =
+    if (pagesAvailable && settings.httpsFiltering) "Nothing to change: this site is allowed and never decrypted" else "Nothing to change: this site is allowed"
+
 /**
  * Share › Aduster from a browser: a sheet over the page with what can be done for its site. The
  * actions are the app's own (a timed pause the engine ends by itself, the user's rules, the
@@ -92,7 +111,9 @@ class ShareActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val host = sharedHost(intent?.takeIf { it.action == Intent.ACTION_SEND }?.getStringExtra(Intent.EXTRA_TEXT))
+        // Shared text is a CharSequence (styled from some apps); an odd extra must not crash the sheet.
+        val shared = runCatching { intent?.takeIf { it.action == Intent.ACTION_SEND }?.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() }.getOrNull()
+        val host = sharedHost(shared)
         if (host == null) {
             Toast.makeText(this, "No web address in what was shared", Toast.LENGTH_SHORT).show()
             finish()
@@ -108,6 +129,18 @@ class ShareActivity : ComponentActivity() {
             }
         }
     }
+
+    // Like the main window: bound while visible, so the sheet can ask the protection process
+    // about the site and pause it (unbound, every answer was "page filtering is not running").
+    override fun onStart() {
+        super.onStart()
+        vm.client.bind()
+    }
+
+    override fun onStop() {
+        vm.client.unbind()
+        super.onStop()
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -120,13 +153,18 @@ private fun ShareSheet(vm: MainViewModel, host: String, settings: Settings, onDo
     // The actions depend on the stored settings, not the placeholder shown before they are read.
     val read by vm.settingsRead.collectAsStateWithLifecycle()
     LaunchedEffect(host) {
-        site = withContext(Dispatchers.IO) { vm.checkSite(host) }
+        site = withContext(Dispatchers.IO) {
+            vm.awaitCore()
+            vm.checkSite(host)
+        }
         checked = true
     }
     val userExcluded = vm.userExcludes(host, settings)
+    // One action at a time: a second tap while the first saves would act (and say so) twice.
+    var busy by remember { mutableStateOf(false) }
     ModalBottomSheet(onDismissRequest = { onDone(null) }, containerColor = p.surface, dragHandle = null) {
-        Column(Modifier.padding(top = 20.dp, bottom = 16.dp).navigationBarsPadding()) {
-            Text(host, style = Type.dialogTitle, color = p.text, modifier = Modifier.padding(horizontal = Gutter + 4.dp, vertical = 4.dp))
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(top = 20.dp, bottom = 16.dp).navigationBarsPadding()) {
+            Text(host, style = Type.dialogTitle, color = p.text, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = Gutter + 4.dp, vertical = 4.dp))
             if (!checked || !read) return@Column
             browserLines(site, settings, HttpsConfig.available, userExcluded).forEach { (line, warn) ->
                 Text(line, style = Type.small, color = if (warn) p.warn else p.muted, modifier = Modifier.padding(horizontal = Gutter + 4.dp))
@@ -134,13 +172,14 @@ private fun ShareSheet(vm: MainViewModel, host: String, settings: Settings, onDo
             Spacer(Modifier.height(8.dp))
             val actions = shareActions(host, settings, site, HttpsConfig.available, userExcluded)
             if (actions.isEmpty()) {
-                Text("Nothing to change: this site is allowed and never decrypted", style = Type.body, color = p.muted, modifier = Modifier.padding(horizontal = Gutter + 4.dp, vertical = 14.dp))
+                Text(nothingToChange(settings, HttpsConfig.available), style = Type.body, color = p.muted, modifier = Modifier.padding(horizontal = Gutter + 4.dp, vertical = 14.dp))
             }
             actions.forEach { action ->
                 Row(
                     Modifier
                         .fillMaxWidth()
-                        .clickable(role = Role.Button) {
+                        .clickable(enabled = !busy, role = Role.Button) {
+                            busy = true
                             when (action) {
                                 ShareAction.PAUSE -> scope.launch {
                                     val ok = vm.pauseSite(host, SHARE_PAUSE_MINUTES)
@@ -151,13 +190,14 @@ private fun ShareSheet(vm: MainViewModel, host: String, settings: Settings, onDo
                                     onDone(if (ok) "$host is filtered again" else "$host was not bypassed any more")
                                 }
                                 // Saved before the sheet closes: closing ends the view model's work.
+                                // Not saved (a full disk): the app already said so, nothing more.
                                 ShareAction.ALLOW -> scope.launch {
-                                    vm.addUserRule(allowSiteRule(host)).join()
-                                    onDone("$host allowed. Filters › Custom lists it")
+                                    val ok = vm.addUserRule(allowSiteRule(host)).await()
+                                    onDone(if (ok) "$host allowed. Filters › Custom lists it" else null)
                                 }
                                 ShareAction.NEVER_DECRYPT -> scope.launch {
-                                    vm.update { it.copy(httpsExclusions = withNeverDecrypt(it.httpsExclusions, host)) }.join()
-                                    onDone("$host is no longer decrypted")
+                                    val ok = vm.update { it.copy(httpsExclusions = withNeverDecrypt(it.httpsExclusions, host)) }.await()
+                                    onDone(if (ok) "$host is no longer decrypted" else null)
                                 }
                             }
                         }

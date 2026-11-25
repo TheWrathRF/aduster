@@ -13,6 +13,9 @@ class ReportsTest {
         // A copy the system renamed counts as a report; anything else in Downloads is never touched.
         val other = listOf("Aduster_report_20261101-120000 (1).json", "aduster-settings.json", "Aduster_report_notes.txt")
         assertEquals(listOf("Aduster_report_20261101-120000 (1).json"), Reports.beyondNewest(other + names.drop(2), keep = 10))
+        // After the clock went back, the report just saved has the oldest name: it stays, the oldest other goes.
+        val early = "Aduster_report_20261001-120000.json"
+        assertEquals(listOf(names[2]), Reports.beyondNewest(names.drop(2) + early, keep = 10, justSaved = early))
     }
 
     /** Share report sends the file just saved: by its name, or the system's renamed copy of it. */

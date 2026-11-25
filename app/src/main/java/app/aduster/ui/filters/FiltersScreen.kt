@@ -88,9 +88,11 @@ import app.aduster.ui.common.ValueText
 import app.aduster.ui.counted
 import app.aduster.ui.fmt
 import app.aduster.ui.hm
+import app.aduster.ui.log.listLabel
 import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -120,6 +122,14 @@ internal fun updateButtonEnabled(progress: FilterJobs.Progress?): Boolean = prog
 /** Page rules appear in the header summary only when page filtering can actually run. */
 internal fun showPageRulesSummary(available: Boolean, httpsFiltering: Boolean, caTrusted: Boolean): Boolean =
     available && httpsFiltering && caTrusted
+
+/** The rules in use, as Home counts them: page rules only where Filters' header shows them. */
+internal fun activeRuleCount(meta: FilterMeta, available: Boolean, httpsFiltering: Boolean, caTrusted: Boolean): Int =
+    meta.compiledRules + if (showPageRulesSummary(available, httpsFiltering, caTrusted) && meta.webError == null) meta.webRules else 0
+
+/** Fix a site's reason line: the rule and the list it is from, by the list's name. */
+internal fun fixSiteWhy(rule: String?, list: String?, s: Settings): String =
+    listOfNotNull(rule, list?.let { "from ${listLabel(it, s)}" }).joinToString(" ")
 
 /** Plain summary text for the Filters header, matching what [SummaryLine] displays. */
 internal fun filtersSummaryText(meta: FilterMeta, inUse: List<String>, pageRules: Boolean, now: Long = System.currentTimeMillis()): String {
@@ -161,7 +171,8 @@ internal fun siteFixActions(
     userExcluded: Boolean,
 ): List<SiteFixAction> = buildList {
     if (site?.bypassed == true) add(SiteFixAction.FILTER_AGAIN)
-    val alreadyAllowed = host in UserRules.sites(settings.userRules).allowed ||
+    // `@@||shop.example^` allows `www.shop.example` too.
+    val alreadyAllowed = UserRules.sites(settings.userRules).allowed.any { host == it || host.endsWith(".$it") } ||
         site?.reasons?.any { it.kind == "user_allowed" } == true
     if (!alreadyAllowed) add(SiteFixAction.ALLOW)
     val alreadyExcluded = userExcluded || site?.reasons?.any { it.kind == "never_decrypt" } == true
@@ -245,10 +256,14 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
             return@LaunchedEffect
         }
         delay(250)
+        // The name and its answers change together: while the answers were asked, the new name
+        // stood beside the old name's verdict and buttons.
         val d = UserRules.siteHost(domain)
+        val v = if (d != null) withContext(Dispatchers.IO) { vm.checkDomain(d) } else null
+        val c = if (d != null) withContext(Dispatchers.IO) { vm.checkSite(d) } else null
         checkedHost = d
-        verdict = if (d != null) withContext(Dispatchers.IO) { vm.checkDomain(d) } else null
-        site = if (d != null) withContext(Dispatchers.IO) { vm.checkSite(d) } else null
+        verdict = v
+        site = c
     }
 
     val all = FilterCatalog.all(s)
@@ -267,8 +282,10 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
     val failedNames = remember(meta, s, pagesActive) { failedListNames(meta, s, pagesActive) }
     val updateEnabled = updateButtonEnabled(progress)
 
-    fun showUndo(text: String, undo: () -> Unit) {
+    /** Says [text] with an Undo once [saved] says the change is on disk (a full disk says so itself). */
+    fun showUndo(text: String, saved: Deferred<Boolean>, undo: () -> Unit) {
         scope.launch {
+            if (!saved.await()) return@launch
             undoBar.currentSnackbarData?.dismiss()
             val r = undoBar.showSnackbar(text, actionLabel = "Undo", duration = SnackbarDuration.Long)
             if (r == SnackbarResult.ActionPerformed) undo()
@@ -358,18 +375,18 @@ fun FiltersScreen(vm: MainViewModel, open: (Sub) -> Unit) {
                                 userExcluded = checkedHost?.let { vm.userExcludes(it, s) } ?: false,
                                 onAllow = { h ->
                                     Haptics.confirm(view)
-                                    vm.addUserRule(allowSiteRule(h))
+                                    val saved = vm.addUserRule(allowSiteRule(h))
                                     recheck++
-                                    showUndo("$h allowed") {
+                                    showUndo("$h allowed", saved) {
                                         vm.undoAddedRule()
                                         recheck++
                                     }
                                 },
                                 onNeverDecrypt = { h ->
                                     Haptics.confirm(view)
-                                    vm.update { it.copy(httpsExclusions = withNeverDecrypt(it.httpsExclusions, h)) }
+                                    val saved = vm.update { it.copy(httpsExclusions = withNeverDecrypt(it.httpsExclusions, h)) }
                                     recheck++
-                                    showUndo("$h is no longer decrypted") {
+                                    showUndo("$h is no longer decrypted", saved) {
                                         vm.update { cur -> cur.copy(httpsExclusions = withoutNeverDecrypt(cur.httpsExclusions, h)) }
                                         recheck++
                                     }
@@ -523,7 +540,7 @@ private fun FixSiteSection(
                         style = Type.bodyStrong,
                         color = if (v.blocked) p.blocked else p.text,
                     )
-                    val why = listOfNotNull(v.rule, v.list?.let { "from $it" }).joinToString(" ")
+                    val why = fixSiteWhy(v.rule, v.list, settings)
                     Text(why.ifEmpty { "No rule matches this name" }, style = Type.mono, color = p.muted)
                     if (!v.running) Text("Protection is off; checked against the saved lists", style = Type.small, color = p.warn)
                     Spacer(Modifier.height(8.dp))
