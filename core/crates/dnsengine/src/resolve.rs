@@ -283,7 +283,7 @@ async fn shared_exchange(shared: &Arc<Shared>, key: &Key, waited: &(dyn Fn() -> 
 /// One upstream query; the answer goes into the shared cache.
 async fn exchange(shared: &Arc<Shared>, key: &Key, waited: impl Fn() -> bool) -> io::Result<Vec<u8>> {
     let q = dns::build_query(upstream::rand_u16(), &key.name, key.qtype);
-    let asked_on = shared.net_generation.load(std::sync::atomic::Ordering::Acquire);
+    let asked_on = shared.answer_generation.load(std::sync::atomic::Ordering::Acquire);
     let r = shared.upstream_exchange(&q, waited).await?;
     // The server could not answer now: a failure, so an expired answer is used instead (passed
     // on, a SERVFAIL would read as "no address" though a recent answer is at hand).

@@ -39,15 +39,19 @@ class NetworkMonitor(context: Context) : ConnectivityManager.NetworkCallback() {
      * looper, and until then lookups failed and a network loss was recorded at every start).
      */
     fun start() {
-        cm.activeNetwork?.let { n ->
-            val caps = cm.getNetworkCapabilities(n)
-            if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
-                cm.getLinkProperties(n)?.let { lp ->
-                    synchronized(this) {
-                        current = n
-                        apply(lp)
-                    }
-                }
+        val n = cm.activeNetwork
+        val caps = n?.let { cm.getNetworkCapabilities(it) }
+        val lp = n?.takeIf {
+            caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }?.let { cm.getLinkProperties(it) }
+        synchronized(this) {
+            if (lp != null) {
+                current = n
+                apply(lp)
+            } else {
+                // No usable network now: the engine must not keep the one from an earlier run
+                // of this process (encrypted lookups would dial instead of failing at once).
+                push("", handle = 0)
             }
         }
         val request = NetworkRequest.Builder()

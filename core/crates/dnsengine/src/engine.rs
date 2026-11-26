@@ -436,7 +436,7 @@ fn cname_blocked<S: AsRef<str>>(shared: &Shared, cfg: &crate::Config, cnames: &[
 async fn forward<W: TunWrite>(ctx: Rc<Ctx<W>>, key: Key, raw: Vec<u8>) {
     let shared = ctx.shared.clone();
     let t_fwd = Instant::now();
-    let asked_on = shared.net_generation.load(std::sync::atomic::Ordering::Acquire);
+    let asked_on = shared.answer_generation.load(std::sync::atomic::Ordering::Acquire);
     // One upstream query per name for both paths: a lookup the HTTPS filter has in flight for
     // this name is joined, and one made here is joined by it.
     let result = match crate::resolve::coalesce(&shared, &key) {

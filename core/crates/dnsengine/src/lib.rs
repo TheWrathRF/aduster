@@ -162,6 +162,11 @@ pub struct Shared {
     /// Bumped whenever the underlying network itself changes (Wi-Fi <-> mobile, another Wi-Fi);
     /// connections from an older generation are not reused.
     pub net_generation: AtomicU64,
+    /// Bumped with `net_generation` and when the search domains change: which resolver owns a
+    /// name may have changed, so an answer asked before is not kept ([`Shared::keep_answer`]).
+    /// Apart from `net_generation`, which the rebinding guard and the proxy's connections
+    /// follow: new domains on the same network change neither.
+    pub answer_generation: AtomicU64,
     /// Carries `net_generation`: long-lived connections (proxy upstreams, tunnels) watch it and
     /// close as soon as the network they were made on is gone.
     pub net_watch: tokio::sync::watch::Sender<u64>,
@@ -187,7 +192,8 @@ pub struct Shared {
     /// In-flight lookups of the proxy path, so parallel connections to one new name share a
     /// single upstream query.
     pub(crate) lookups: Mutex<std::collections::HashMap<cache::Key, Waiters>>,
-    /// The minute each (host, action) of the proxy was last logged (see [`Shared::record`]).
+    /// The minute each (host, action, app, page) of the proxy was last logged (see
+    /// [`Shared::record`]).
     log_seen: Mutex<LruCache<LogSeenKey, u64>>,
     /// The current pause's "Resumed" marker is in the log (put there by the first record after
     /// a timed pause ran out, or by the config that ended it).
@@ -245,6 +251,7 @@ impl Shared {
             has_v4: AtomicBool::new(true),
             has_v6: AtomicBool::new(true),
             net_generation: AtomicU64::new(0),
+            answer_generation: AtomicU64::new(0),
             net_watch: tokio::sync::watch::Sender::new(0),
             rules_watch: tokio::sync::watch::Sender::new(0),
             network: AtomicU64::new(0),
@@ -350,6 +357,9 @@ impl Shared {
         *self.net_label.lock() = label.to_string();
         let domains: Vec<String> =
             domains.into_iter().map(|d| d.trim().trim_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.') && !public_suffix(d)).collect();
+        let mut domains = domains;
+        domains.sort();
+        domains.dedup();
         let new = Arc::new(domains);
         let old = self.search_domains.swap(new.clone());
         if *old != *new {
@@ -357,11 +367,12 @@ impl Shared {
             // [`Shared::keep_answer`]). The new network's resolvers come a moment later
             // ([`Shared::set_network`]), and an old network's answer landing in between would
             // otherwise be cached for the new one.
-            self.net_generation.fetch_add(1, Ordering::AcqRel);
+            self.answer_generation.fetch_add(1, Ordering::AcqRel);
         }
-        let gone: Vec<&String> = old.iter().filter(|d| !new.contains(d)).collect();
-        if !gone.is_empty() {
-            self.cache.lock().evict_names(|n| gone.iter().any(|d| under_domain(n, d)));
+        // Names under a domain that came or went change owner: asked again.
+        let changed: Vec<&String> = old.iter().filter(|d| !new.contains(d)).chain(new.iter().filter(|d| !old.contains(d))).collect();
+        if !changed.is_empty() {
+            self.cache.lock().evict_names(|n| changed.iter().any(|d| under_domain(n, d)));
         }
     }
 
@@ -395,7 +406,7 @@ impl Shared {
     /// own names, or a public one for a name the new network calls its own, must not be served
     /// on the new network.
     pub(crate) fn keep_answer(&self, asked_on: u64, key: &cache::Key, resp: &[u8], info: &dns::ResponseInfo) {
-        if self.net_generation.load(Ordering::Acquire) != asked_on {
+        if self.answer_generation.load(Ordering::Acquire) != asked_on {
             return;
         }
         self.note_answer(&key.name, info);
@@ -441,6 +452,7 @@ impl Shared {
         let new_net = self.network.swap(handle, Ordering::AcqRel) != handle;
         if new_net {
             let g = self.net_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            self.answer_generation.fetch_add(1, Ordering::AcqRel);
             self.net_watch.send_replace(g);
         }
         let changed = servers_changed || families_changed;
@@ -462,7 +474,7 @@ impl Shared {
             }
             drop(c);
             // Encrypted resolver connections were bound to the old network.
-            self.upstream.load().reset_connections();
+            self.upstream.load().reset_connections(handle != 0);
         }
         if self.offline() {
             // Lost: one event for the whole stretch, whatever fails meanwhile.
@@ -731,7 +743,7 @@ impl Shared {
             s.add_from(name, uid, action, (!proxy_record).then_some(latency_us), waited);
             self.persist_due()
         };
-        // The proxy's records are logged once per host, kind and minute (otherwise one browser alone
+        // The proxy's records are logged once per host, kind, app, page and minute (otherwise one browser alone
         // pushes every other app's lines out of the log within minutes); the counts above stay
         // exact.
         if proxy_record {
@@ -1455,7 +1467,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The proxy's records are logged once per host, kind and minute; counted every time.
+    /// The proxy's records are logged once per host, kind, app, page and minute; counted every time.
     #[test]
     fn proxy_records_are_logged_once_a_minute() {
         let s = Shared::new(Config::default());
@@ -1591,7 +1603,7 @@ mod tests {
         let s = Shared::new(cfg);
         s.set_network_info("Wi-Fi", vec!["hotspot.example".into()]);
         s.set_network(vec!["192.0.2.53:53".parse().unwrap()], true, false, 7);
-        let asked_on = s.net_generation.load(Ordering::Acquire);
+        let asked_on = s.answer_generation.load(Ordering::Acquire);
         // The phone moves to mobile data: the app sends the network's facts in two steps.
         s.set_network_info("Mobile data", vec![]);
         // The old network's (forged) public answer for a name under its own domain lands now.
@@ -1655,5 +1667,50 @@ mod tests {
         s.record_request("ads.test", 11, rule(), "shop.test", "/b");
         let log: Vec<serde_json::Value> = serde_json::from_str(&s.log_json(0, 100)).unwrap();
         assert_eq!(log.len(), 3, "{log:?}");
+    }
+    /// New search domains on the same network do not reset what the network generation guards:
+    /// the rebinding guard's public answers stay, `net_watch` stays in step with
+    /// `net_generation`, and the same domains in another order change nothing. An answer asked
+    /// before the change is still not kept.
+    #[test]
+    fn new_search_domains_on_the_same_network_keep_the_rebinding_guard() {
+        let s = Shared::new(Config::default());
+        s.set_network_info("Wi-Fi", vec!["a.example".into(), "b.example".into()]);
+        s.set_network(vec!["192.0.2.53:53".parse().unwrap()], true, false, 7);
+        let raw = dns::build_query(1, "attacker.test", 1);
+        let q = dns::parse_query(&raw).unwrap();
+        let mut resp = dns::blocked_response(&raw, &q, dns::BlockMode::NullIp, 300);
+        let l = resp.len();
+        let at = if q.edns { l - 11 - 4 } else { l - 4 };
+        resp[at..at + 4].copy_from_slice(&[203, 0, 113, 66]);
+        let info = dns::inspect(&resp).unwrap();
+        s.note_answer("attacker.test", &info);
+        let asked_on = s.answer_generation.load(Ordering::Acquire);
+        s.set_network_info("Wi-Fi", vec!["b.example".into(), "a.example".into()]);
+        assert_eq!(s.answer_generation.load(Ordering::Acquire), asked_on, "a reorder changed the domains");
+        s.set_network_info("Wi-Fi", vec!["corp.example".into()]);
+        assert!(s.saw_public_recently("attacker.test"), "the rebinding guard forgot a public answer");
+        assert_eq!(*s.net_watch.borrow(), s.net_generation.load(Ordering::Acquire));
+        let key = cache::Key { name: "attacker.test".into(), qtype: 1, qclass: 1, do_bit: false };
+        s.keep_answer(asked_on, &key, &resp, &info);
+        assert!(matches!(s.cache.lock().get(&key, 9, false, clock::boot_ms()), cache::Lookup::Miss), "an answer asked before the change was kept");
+    }
+
+    /// A search domain added on the same network takes its names out of the cache: they were
+    /// answered as public names before and are the network's own now.
+    #[test]
+    fn an_added_search_domain_evicts_its_names() {
+        let s = Shared::new(Config::default());
+        s.set_network(vec!["192.0.2.53:53".parse().unwrap()], true, false, 7);
+        let raw = dns::build_query(1, "www.corp.example", 1);
+        let q = dns::parse_query(&raw).unwrap();
+        let mut resp = dns::blocked_response(&raw, &q, dns::BlockMode::NullIp, 300);
+        let l = resp.len();
+        let at = if q.edns { l - 11 - 4 } else { l - 4 };
+        resp[at..at + 4].copy_from_slice(&[203, 0, 113, 66]);
+        let key = cache::Key { name: "www.corp.example".into(), qtype: 1, qclass: 1, do_bit: false };
+        assert!(s.cache.lock().insert(key.clone(), &resp, &dns::inspect(&resp).unwrap()));
+        s.set_network_info("Wi-Fi", vec!["corp.example".into()]);
+        assert_eq!(s.cache.lock().len(), 0);
     }
 }

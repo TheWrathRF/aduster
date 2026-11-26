@@ -215,7 +215,9 @@ object FilterJobs {
     /**
      * Rebuilds whatever engine the current settings and files call for (signatures decide, so
      * an unchanged engine is not rebuilt), then tells :core which ones to load. [force]:
-     * rebuild the page engine even if its inputs did not change (it failed to load).
+     * rebuild both engines even if their inputs did not change (one failed to load; asked at
+     * most once per app version, so the page engine's rebuild after a DNS table failure is a
+     * rare cost).
      */
     fun compile(ctx: Context, force: Boolean = false) {
         if (running(ctx, ID_COMPILE)) {
@@ -227,9 +229,12 @@ object FilterJobs {
             return
         }
         if (active[ID_COMPILE] == null) publish(ID_COMPILE, Progress(UpdatePhase.APPLYING_DNS))
-        scheduler(ctx).schedule(
+        val js = scheduler(ctx)
+        // A pending forced rebuild (asked once per app version) is not replaced by an unforced one.
+        val forced = force || js.getPendingJob(ID_COMPILE)?.extras?.getBoolean(EXTRA_FORCE) == true
+        js.schedule(
             builder(ctx, ID_COMPILE).setExpedited(true)
-                .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, force) })
+                .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forced) })
                 .build(),
         )
     }

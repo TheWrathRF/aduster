@@ -86,6 +86,17 @@ internal fun tunnelStep(changed: Boolean, built: Boolean): TunnelStep = when {
     else -> TunnelStep.STOP
 }
 
+/**
+ * The tunnel a settings change calls for: [wanted] is its signature, [running] the running
+ * tunnel's, [build] makes the new one (and records its signature as running).
+ */
+internal fun <T : Any> planTunnel(wanted: String, running: () -> String?, build: () -> T?): Pair<TunnelStep, T?> {
+    // Asked before the build, which records the new tunnel as running.
+    val changed = wanted != running()
+    val tun = if (changed) build() else null
+    return tunnelStep(changed, built = tun != null) to tun
+}
+
 /** A DNS table load's answer: `{"ok":true,...}`; anything else (an unreadable table) failed. */
 internal fun dnsTableLoaded(result: String): Boolean =
     runCatching { Json.parseToJsonElement(result).jsonObject["ok"]?.jsonPrimitive?.content == "true" }.getOrDefault(false)
@@ -910,8 +921,8 @@ class AdusterVpnService : VpnService() {
     private suspend fun reconfigure() {
         checkLockdown()
         proxyPort = startProxy(settings)
-        val tun = if (signature(settings) == tunSignature) null else buildTun(settings)
-        when (tunnelStep(changed = signature(settings) != tunSignature, built = tun != null)) {
+        val (step, tun) = planTunnel(signature(settings), { tunSignature }) { buildTun(settings) }
+        when (step) {
             TunnelStep.KEEP -> {}
             TunnelStep.STOP -> stopProtection(userInitiated = false, reason = "the tunnel could not be set up")
             // nativeStart stops (and joins) the old engine first, then starts the new one on the

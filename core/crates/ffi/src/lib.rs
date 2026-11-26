@@ -399,9 +399,11 @@ fn compile(sources: &str, out: &str) -> String {
     let tmp = format!("{out}.tmp");
     let written = (|| {
         use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, out)
     })();
     if let Err(e) = written {
