@@ -913,7 +913,10 @@ impl Dot {
         if now_ms().saturating_sub(self.last_used.load(Ordering::Relaxed)) < IDLE_CLOSE.as_millis() as u64 {
             return false;
         }
-        if let Some(c) = self.conn.lock().await.take() {
+        // Taken out first: the resolver's lock is not held while the polite close waits (a
+        // guard in the `if let` itself lives to the block's end).
+        let taken = self.conn.lock().await.take();
+        if let Some(c) = taken {
             // A polite close first (bounded: a stuck write holds the writer), then
             // the reader stops and waiters fail.
             let _ = tokio::time::timeout(Duration::from_secs(1), async { c.writer.lock().await.shutdown().await }).await;
