@@ -249,6 +249,10 @@ fn write_tun<W: TunWrite>(ctx: &Ctx<W>, bytes: &[u8]) {
 /// reads big datagrams).
 fn reply<W: TunWrite>(ctx: &Ctx<W>, client: SocketAddr, resolver: SocketAddr, payload: &[u8], raw: &[u8], q: &dns::Query) {
     let limit = if q.edns { MAX_PAYLOAD } else { 512 };
+    // An answer made for an EDNS client (the cache's, or a shared upstream answer) carries an
+    // OPT record that a client without EDNS must not get.
+    let plain = if q.edns { None } else { dns::without_opt(payload) };
+    let payload = plain.as_deref().unwrap_or(payload);
     let truncated;
     let payload = if payload.len() > limit {
         ctx.shared.counters.truncated.fetch_add(1, Ordering::Relaxed);
@@ -1099,6 +1103,26 @@ mod tests {
         let info = dns::inspect(&r).unwrap();
         let key = Key { name: name.into(), qtype: dns::TYPE_A, qclass: dns::CLASS_IN, do_bit: false };
         assert!(shared.cache.lock().insert(key, &r, &info));
+    }
+
+    /// A client that asked without EDNS gets no OPT record back (RFC 6891), also when the
+    /// answer comes from the cache, where an EDNS client's answer with one was stored.
+    #[tokio::test]
+    async fn a_client_without_edns_gets_no_opt_record() {
+        let (up, _) = fake_resolver(0).await;
+        let shared = shared_with(up);
+        cache_answer(&shared, "plain.test", 300);
+        let mut q = dns::build_query(9, "plain.test", dns::TYPE_A);
+        assert!(dns::parse_query(&q).unwrap().edns);
+        q.truncate(q.len() - 11);
+        q[10..12].copy_from_slice(&[0, 0]);
+        assert!(!dns::parse_query(&q).unwrap().edns);
+        let mut pkt = Vec::new();
+        packet::build_udp(CLIENT.parse().unwrap(), RESOLVER.parse().unwrap(), &q, &mut pkt);
+        let got = run_loop(shared.clone(), vec![pkt], 1).await;
+        let a = &got[0];
+        assert_eq!(dns::inspect(a).unwrap().addrs, vec!["9.9.9.9".parse::<IpAddr>().unwrap()], "from the cache");
+        assert_eq!(u16::from_be_bytes([a[10], a[11]]), 0, "an additional record (OPT) in the answer");
     }
 
     /// After a move to another network, an app's first lookup of a name cached on the old one is

@@ -188,7 +188,7 @@ pub struct Shared {
     /// single upstream query.
     pub(crate) lookups: Mutex<std::collections::HashMap<cache::Key, Waiters>>,
     /// The minute each (host, action) of the proxy was last logged (see [`Shared::record`]).
-    log_seen: Mutex<LruCache<(Box<str>, u8), u64>>,
+    log_seen: Mutex<LruCache<LogSeenKey, u64>>,
     /// The current pause's "Resumed" marker is in the log (put there by the first record after
     /// a timed pause ran out, or by the config that ended it).
     resume_logged: AtomicBool,
@@ -198,6 +198,10 @@ pub struct Shared {
     /// Highest stats snapshot number taken; ahead of `stats_writing` while an async write is queued.
     stats_seq: AtomicU64,
 }
+
+/// What the proxy's log de-duplication tells apart: host, action, app and page (a second page's
+/// block of the same host gets its own row, the one the user allows it from).
+type LogSeenKey = (Box<str>, u8, i32, Option<Box<str>>);
 
 /// One stretch without a usable network, recorded as a single event.
 struct Episode {
@@ -348,6 +352,13 @@ impl Shared {
             domains.into_iter().map(|d| d.trim().trim_matches('.').to_ascii_lowercase()).filter(|d| d.contains('.') && !public_suffix(d)).collect();
         let new = Arc::new(domains);
         let old = self.search_domains.swap(new.clone());
+        if *old != *new {
+            // Which resolver owns a name changed: an answer asked before is not kept (see
+            // [`Shared::keep_answer`]). The new network's resolvers come a moment later
+            // ([`Shared::set_network`]), and an old network's answer landing in between would
+            // otherwise be cached for the new one.
+            self.net_generation.fetch_add(1, Ordering::AcqRel);
+        }
         let gone: Vec<&String> = old.iter().filter(|d| !new.contains(d)).collect();
         if !gone.is_empty() {
             self.cache.lock().evict_names(|n| gone.iter().any(|d| under_domain(n, d)));
@@ -510,6 +521,11 @@ impl Shared {
         let up = self.upstream.load_full();
         if matches!(*up, upstream::Upstream::System) {
             return self.system_exchange(q).await;
+        }
+        // No network at all: a dial could only time out (5 s per lookup, and a failed dial
+        // recorded against the resolver).
+        if self.network.load(Ordering::Relaxed) == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::NetworkDown, "no network"));
         }
         if !self.system_servers.load().is_empty()
             && let Some(p) = dns::parse_query(q)
@@ -721,7 +737,7 @@ impl Shared {
         if proxy_record {
             let minute = now_ms() / 60_000;
             let mut seen = self.log_seen.lock();
-            let k = (Box::<str>::from(name), action as u8);
+            let k = (Box::<str>::from(name), action as u8, uid, page.map(Box::<str>::from));
             if seen.get(&k) == Some(&minute) {
                 drop(seen);
                 if persist {
@@ -801,6 +817,13 @@ impl Shared {
     pub fn screen_off(&self) {
         self.persist_stats();
         self.upstream.load().close_idle();
+    }
+
+    /// Memory pressure: freed memory goes back to the system, nothing else. Android calls this
+    /// while the user browses too, so the screen-off work (a stats write, closing encrypted
+    /// connections) stays on screen-off.
+    pub fn trim_memory(&self) {
+        release_free_memory();
     }
 
     /// The stats file's path and contents, if there is anything new to write (or `force`), with
@@ -1558,5 +1581,79 @@ mod tests {
         assert!(bad.exists(), ".bad file must stay");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// An old network's answer for one of its own names that lands between the network's new
+    /// facts (search domains swapped, their names evicted) and its new resolvers is not kept:
+    /// with an encrypted resolver it would be served fresh on the next network.
+    #[test]
+    fn an_old_network_answer_landing_during_the_move_is_not_kept() {
+        let cfg = Config { upstream: upstream::UpstreamConfig::Doh { url: "https://dns.example/dns-query".into(), bootstrap: vec![] }, ..Config::default() };
+        let s = Shared::new(cfg);
+        s.set_network_info("Wi-Fi", vec!["hotspot.example".into()]);
+        s.set_network(vec!["192.0.2.53:53".parse().unwrap()], true, false, 7);
+        let asked_on = s.net_generation.load(Ordering::Acquire);
+        // The phone moves to mobile data: the app sends the network's facts in two steps.
+        s.set_network_info("Mobile data", vec![]);
+        // The old network's (forged) public answer for a name under its own domain lands now.
+        let raw = dns::build_query(1, "www.hotspot.example", 1);
+        let q = dns::parse_query(&raw).unwrap();
+        let mut resp = dns::blocked_response(&raw, &q, dns::BlockMode::NullIp, 300);
+        let l = resp.len();
+        let at = if q.edns { l - 11 - 4 } else { l - 4 };
+        resp[at..at + 4].copy_from_slice(&[203, 0, 113, 66]);
+        let info = dns::inspect(&resp).unwrap();
+        let key = cache::Key { name: "www.hotspot.example".into(), qtype: 1, qclass: 1, do_bit: false };
+        s.keep_answer(asked_on, &key, &resp, &info);
+        s.set_network(vec!["198.51.100.53:53".parse().unwrap()], true, false, 8);
+        let got = s.cache.lock().get(&key, 9, false, clock::boot_ms());
+        assert!(matches!(got, cache::Lookup::Miss), "the old network's answer is still served on the new one");
+    }
+
+    /// Without any network an encrypted lookup fails at once instead of dialling the resolver
+    /// (a dial that can only time out, 5 s per lookup).
+    #[tokio::test]
+    async fn an_encrypted_lookup_without_a_network_fails_at_once() {
+        let doh = upstream::UpstreamConfig::Doh { url: "https://dns.test/dns-query".into(), bootstrap: vec!["192.0.2.1".parse().unwrap()] };
+        let s = Shared::new(Config { upstream: doh, ..Config::default() });
+        let t0 = std::time::Instant::now();
+        assert!(s.upstream_exchange(&dns::build_query(1, "a.test", dns::TYPE_A), || true).await.is_err());
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500), "took {:?}", t0.elapsed());
+        assert_eq!(s.upstream.load().dial_failed_at(), 0, "dialled without a network");
+    }
+
+    /// Memory pressure frees memory only: an encrypted connection idle a moment stays open
+    /// (every trim callback used to close it, and stats were written, while the user browsed).
+    /// The screen going off still closes it.
+    #[tokio::test]
+    async fn trimming_memory_keeps_encrypted_connections() {
+        let (doh, _) = upstream::testing::doh_answering(Some([1, 2, 3, 4])).await;
+        let s = Shared::new(Config::default());
+        s.upstream.store(Arc::new(doh));
+        s.set_network(vec!["127.0.0.1:53".parse().unwrap()], true, false, 1);
+        let q = dns::build_query(1, "a.test", dns::TYPE_A);
+        s.upstream_exchange(&q, || true).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        s.trim_memory();
+        s.upstream_exchange(&q, || true).await.unwrap();
+        assert_eq!(s.upstream.load().dials(), 1, "trimming memory closed the connection");
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        s.screen_off();
+        s.upstream_exchange(&q, || true).await.unwrap();
+        assert_eq!(s.upstream.load().dials(), 2, "the screen going off keeps closing it");
+    }
+
+    /// A second page's block of a host already logged this minute gets its own Log row (the
+    /// row the user allows the host from for that page); the same page's repeats do not.
+    #[test]
+    fn proxy_records_of_another_page_or_app_are_logged() {
+        let s = Shared::new(Config::default());
+        let rule = || ("||ads.test^".to_string(), "List".to_string());
+        for _ in 0..5 {
+            s.record_request("ads.test", 10, rule(), "news.test", "/a");
+        }
+        s.record_request("ads.test", 10, rule(), "shop.test", "/b");
+        s.record_request("ads.test", 11, rule(), "shop.test", "/b");
+        let log: Vec<serde_json::Value> = serde_json::from_str(&s.log_json(0, 100)).unwrap();
+        assert_eq!(log.len(), 3, "{log:?}");
     }
 }

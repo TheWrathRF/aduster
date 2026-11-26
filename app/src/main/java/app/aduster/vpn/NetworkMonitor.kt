@@ -22,7 +22,9 @@ import java.net.InetAddress
  */
 class NetworkMonitor(context: Context) : ConnectivityManager.NetworkCallback() {
     private val cm = context.getSystemService(ConnectivityManager::class.java)
+    @Volatile
     private var lastDns: String? = null
+    @Volatile
     private var current: Network? = null
 
     /** Private DNS in strict mode sends queries around the tunnel; the UI warns about it. */
@@ -30,7 +32,24 @@ class NetworkMonitor(context: Context) : ConnectivityManager.NetworkCallback() {
     var privateDnsStrict = false
         private set
 
+    /**
+     * Tells the engine about the network the phone uses now, then follows it. Called before the
+     * tunnel exists, so the system's default network is the physical one: the engine knows its
+     * resolvers before its first lookup (the callback's first answer arrives later on the main
+     * looper, and until then lookups failed and a network loss was recorded at every start).
+     */
     fun start() {
+        cm.activeNetwork?.let { n ->
+            val caps = cm.getNetworkCapabilities(n)
+            if (caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) {
+                cm.getLinkProperties(n)?.let { lp ->
+                    synchronized(this) {
+                        current = n
+                        apply(lp)
+                    }
+                }
+            }
+        }
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -45,16 +64,17 @@ class NetworkMonitor(context: Context) : ConnectivityManager.NetworkCallback() {
         }
     }
 
-    override fun onAvailable(network: Network) {
+    override fun onAvailable(network: Network) = synchronized(this) {
         current = network
         cm.getLinkProperties(network)?.let { apply(it) }
+        Unit
     }
 
-    override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+    override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = synchronized(this) {
         if (network == current) apply(lp)
     }
 
-    override fun onLost(network: Network) {
+    override fun onLost(network: Network) = synchronized(this) {
         if (network == current) {
             current = null
             push("", handle = 0)

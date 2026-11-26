@@ -14,6 +14,8 @@ mod table;
 
 pub use compile::{CompileStats, Source, compile, validate};
 pub use table::{Table, TableError};
+/// The compiled table's format: the app stores it with the table and rebuilds on a change.
+pub const TABLE_VERSION: u32 = table::VERSION;
 
 /// Rule classes in increasing precedence. The highest class matching a name decides:
 /// user rules beat everything, `$important` beats plain, allow beats block at the same level.

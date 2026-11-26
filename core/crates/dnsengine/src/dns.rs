@@ -368,6 +368,48 @@ pub fn inspect(b: &[u8]) -> Option<ResponseInfo> {
     Some(info)
 }
 
+/// `b` without its OPT record, for a client that asked without EDNS (RFC 6891: a responder
+/// includes OPT only when the request had one). Only an OPT record that ends the message is
+/// cut (where every resolver puts it): nothing after it can point into it. None when there is
+/// none to cut.
+pub fn without_opt(b: &[u8]) -> Option<Vec<u8>> {
+    if b.len() < 12 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([b[4], b[5]]) as usize;
+    let records = [6, 8, 10].iter().map(|&i| u16::from_be_bytes([b[i], b[i + 1]]) as usize).sum::<usize>();
+    let ar = u16::from_be_bytes([b[10], b[11]]);
+    if ar == 0 {
+        return None;
+    }
+    let mut off = 12;
+    for _ in 0..qd {
+        off = skip_name(b, off)? + 4;
+    }
+    let mut last = None;
+    for _ in 0..records {
+        let start = off;
+        let o = skip_name(b, off)?;
+        if o + 10 > b.len() {
+            return None;
+        }
+        let t = u16::from_be_bytes([b[o], b[o + 1]]);
+        off = o + 10 + u16::from_be_bytes([b[o + 8], b[o + 9]]) as usize;
+        if off > b.len() {
+            return None;
+        }
+        last = Some((start, t));
+    }
+    match last {
+        Some((start, TYPE_OPT)) if off == b.len() => {
+            let mut out = b[..start].to_vec();
+            out[10..12].copy_from_slice(&(ar - 1).to_be_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 pub fn set_id(b: &mut [u8], id: u16) {
     if b.len() >= 2 {
         b[0..2].copy_from_slice(&id.to_be_bytes());

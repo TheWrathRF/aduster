@@ -44,6 +44,11 @@ object FilterUpdater {
      * update rebuilds the engine even when no list changed.
      */
     private const val WEB_FORMAT = 11
+    /**
+     * The DNS table's format (the matcher's `TABLE_VERSION`): stored with the table's signature,
+     * so an app update that changes it rebuilds the table instead of loading one it cannot read.
+     */
+    private const val DNS_FORMAT = 1
 
     /**
      * [dnsCompiled]/[webCompiled]: which engines were rebuilt (and need reloading). [checked]:
@@ -803,7 +808,7 @@ object FilterUpdater {
         val allow = FilterCatalog.deviceListAllows(settings, device)
         lists.forEach { sources += Source(it.id, store.raw(it.id), allow = allow && it.id == FilterCatalog.XIAOMI_LIST) }
 
-        val signature = sources.joinToString("|") { "${it.name}:${it.file.length()}:${it.file.lastModified()}${if (it.allow) ":allow" else ""}" }
+        val signature = sources.joinToString("|") { "${it.name}:${it.file.length()}:${it.file.lastModified()}${if (it.allow) ":allow" else ""}" } + "|format=$DNS_FORMAT"
         val meta = store.readMeta()
         if (!force && store.dnsTable.exists() && meta.compiledSignature == signature) return false
 

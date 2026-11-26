@@ -214,22 +214,22 @@ object FilterJobs {
 
     /**
      * Rebuilds whatever engine the current settings and files call for (signatures decide, so
-     * an unchanged engine is not rebuilt), then tells :core which ones to load. [forceWeb]:
+     * an unchanged engine is not rebuilt), then tells :core which ones to load. [force]:
      * rebuild the page engine even if its inputs did not change (it failed to load).
      */
-    fun compile(ctx: Context, forceWeb: Boolean = false) {
+    fun compile(ctx: Context, force: Boolean = false) {
         if (running(ctx, ID_COMPILE)) {
-            rerun.merge(ID_COMPILE, forceWeb) { a, b -> a || b }
+            rerun.merge(ID_COMPILE, force) { a, b -> a || b }
             return
         }
         if (runningElsewhere(ctx, ID_COMPILE)) {
-            askAgain(ctx, ID_COMPILE, forceWeb)
+            askAgain(ctx, ID_COMPILE, force)
             return
         }
         if (active[ID_COMPILE] == null) publish(ID_COMPILE, Progress(UpdatePhase.APPLYING_DNS))
         scheduler(ctx).schedule(
             builder(ctx, ID_COMPILE).setExpedited(true)
-                .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forceWeb) })
+                .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, force) })
                 .build(),
         )
     }
@@ -299,14 +299,14 @@ object FilterJobs {
     }
 
     /** Rebuilds the engines whose inputs changed and tells :core which ones to load. */
-    private suspend fun compileNow(ctx: Context, id: Int, readSettings: suspend () -> Settings, forceWeb: Boolean) {
+    private suspend fun compileNow(ctx: Context, id: Int, readSettings: suspend () -> Settings, force: Boolean) {
         val web = FilterUpdater.webWanted(ctx, readSettings())
         publish(id, Progress(UpdatePhase.APPLYING_DNS, withPages = web))
-        val dns = FilterUpdater.compile(ctx, readSettings)
+        val dns = FilterUpdater.compile(ctx, readSettings, force)
         if (dns) AdusterVpnService.notifyFiltersChanged(ctx, dns = true, web = false)
         if (FilterUpdater.webWanted(ctx, readSettings())) {
             publish(id, Progress(UpdatePhase.BUILDING_PAGES, withPages = true))
-            val webBuilt = FilterUpdater.compileWeb(ctx, readSettings, forceWeb)
+            val webBuilt = FilterUpdater.compileWeb(ctx, readSettings, force)
             if (webBuilt) AdusterVpnService.notifyFiltersChanged(ctx, dns = false, web = true)
         }
         FilterUpdater.noteAppVersion(ctx)
@@ -333,7 +333,7 @@ object FilterJobs {
                             // change needed (a profile, a list already on disk beside it): that
                             // is done now (once, not at every retry), the download when a
                             // network comes.
-                            if (!force && waitingSince(ctx) == 0L) compileNow(ctx, id, readSettings, forceWeb = false)
+                            if (!force && waitingSince(ctx) == 0L) compileNow(ctx, id, readSettings, force = false)
                             // "Update now" without a network: the screen says so while it retries,
                             // for at most 30 minutes (backoff 30 s, 1, 2, 4, 8, 16 min); then the
                             // periodic update or the next app open catches up.

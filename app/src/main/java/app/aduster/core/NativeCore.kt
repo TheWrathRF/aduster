@@ -51,8 +51,10 @@ object NativeCore {
     @JvmStatic external fun nativeClearLog()
     @JvmStatic external fun nativeResetStats()
     @JvmStatic external fun nativePersist()
-    /** Screen off / memory pressure: frees heap, writes stats, closes idle encrypted DNS connections. */
+    /** Memory pressure: frees heap, nothing else (Android calls it while the user browses too). */
     @JvmStatic external fun nativeTrimMemory()
+    /** Screen off: writes stats, closes idle encrypted DNS connections, frees heap. */
+    @JvmStatic external fun nativeScreenOff()
     /** Ends the bot-check bypass of [host] ("Filter again"); true if it was bypassed. */
     @JvmStatic external fun nativeUnbypass(host: String): Boolean
     @JvmStatic external fun nativePauseSite(host: String, minutes: Int): Boolean

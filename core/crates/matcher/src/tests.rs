@@ -133,6 +133,15 @@ fn badfilter_disables_rule_across_lists() {
     assert!(f.check("keep.ua").blocked());
 }
 
+/// `$BADFILTER` in capitals disables its rule as `$badfilter` does (modifiers are read without
+/// regard to case; the first pass looked for the lowercase word only).
+#[test]
+fn badfilter_in_capitals_disables_its_rule() {
+    let f = filters(&[("a", "||caps.ua^\n||keep.ua^"), ("b", "||caps.ua^$BADFILTER")], "");
+    assert!(!f.check("caps.ua").blocked());
+    assert!(f.check("keep.ua").blocked());
+}
+
 /// Every form a `$badfilter` matches by its key still meets its rule: a plain domain against
 /// `||d^`, modifiers in another order, an allow rule, and a regex written with capitals (the key
 /// is lowercased, the rule's regex keeps its case).

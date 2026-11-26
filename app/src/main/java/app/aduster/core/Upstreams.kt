@@ -28,9 +28,9 @@ object Upstreams {
         Preset("cloudflare-doh", "Cloudflare", "DNS-over-HTTPS, 1.1.1.1", doh("https://cloudflare-dns.com/dns-query", "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111")),
         Preset("quad9-doh", "Quad9", "DNS-over-HTTPS, 9.9.9.9, malware filtering", doh("https://dns.quad9.net/dns-query", "9.9.9.9", "149.112.112.112", "2620:fe::fe")),
         Preset("google-doh", "Google", "DNS-over-HTTPS, 8.8.8.8", doh("https://dns.google/dns-query", "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888")),
-        Preset("adguard-doh", "AdGuard (unfiltered)", "DNS-over-HTTPS, 94.140.14.140", doh("https://unfiltered.adguard-dns.com/dns-query", "94.140.14.140", "94.140.14.141")),
-        Preset("cloudflare-dot", "Cloudflare", "DNS-over-TLS, 1.1.1.1", dot("one.one.one.one", "1.1.1.1", "1.0.0.1")),
-        Preset("quad9-dot", "Quad9", "DNS-over-TLS, 9.9.9.9, malware filtering", dot("dns.quad9.net", "9.9.9.9", "149.112.112.112")),
+        Preset("adguard-doh", "AdGuard (unfiltered)", "DNS-over-HTTPS, 94.140.14.140", doh("https://unfiltered.adguard-dns.com/dns-query", "94.140.14.140", "94.140.14.141", "2a10:50c0::1:ff", "2a10:50c0::2:ff")),
+        Preset("cloudflare-dot", "Cloudflare", "DNS-over-TLS, 1.1.1.1", dot("one.one.one.one", "1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "2606:4700:4700::1001")),
+        Preset("quad9-dot", "Quad9", "DNS-over-TLS, 9.9.9.9, malware filtering", dot("dns.quad9.net", "9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9")),
         Preset("custom", "Custom", "https://… for DoH, tls://host for DoT", null),
     )
 

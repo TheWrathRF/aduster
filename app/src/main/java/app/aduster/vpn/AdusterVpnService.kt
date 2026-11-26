@@ -40,8 +40,11 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.TimeZone
 import kotlinx.serialization.json.putJsonArray
@@ -67,6 +70,25 @@ internal fun pauseAtStart(pausedUntil: Long, over: Boolean): PauseAtStart = when
     pausedUntil != Long.MAX_VALUE && over -> PauseAtStart.ENDED
     else -> PauseAtStart.STILL_PAUSED
 }
+
+/** What a settings change does to a running tunnel, once the proxy has been set up for it. */
+internal enum class TunnelStep { KEEP, REPLACE, STOP }
+
+/**
+ * [changed]: the tunnel's routes, exclusions or proxy differ from the running one; [built]: a
+ * new tunnel could be made. One that cannot be made while the proxy it named has already
+ * changed must stop protection: the old tunnel would keep sending browsers to a stopped proxy
+ * (every page failing under "Protected").
+ */
+internal fun tunnelStep(changed: Boolean, built: Boolean): TunnelStep = when {
+    !changed -> TunnelStep.KEEP
+    built -> TunnelStep.REPLACE
+    else -> TunnelStep.STOP
+}
+
+/** A DNS table load's answer: `{"ok":true,...}`; anything else (an unreadable table) failed. */
+internal fun dnsTableLoaded(result: String): Boolean =
+    runCatching { Json.parseToJsonElement(result).jsonObject["ok"]?.jsonPrimitive?.content == "true" }.getOrDefault(false)
 
 /**
  * Runs in the :core process. Owns the TUN device and the Rust engine; everything that changes
@@ -248,7 +270,7 @@ class AdusterVpnService : VpnService() {
                     }
                 }
                 // Browsing leaves freed buffers resident; give them back while the phone idles.
-                Intent.ACTION_SCREEN_OFF -> chores.launch { NativeCore.nativeTrimMemory() }
+                Intent.ACTION_SCREEN_OFF -> chores.launch { NativeCore.nativeScreenOff() }
                 Intent.ACTION_TIMEZONE_CHANGED -> scope.launch { if (engineReady) initEngine() }
                 // The widget refreshes only when someone can actually see it. The trust-store
                 // broadcast is the main signal; a rare, cheap alias check here is the safety net.
@@ -534,6 +556,7 @@ class AdusterVpnService : VpnService() {
         if (dns) {
             val r = NativeCore.nativeLoadFilters(store.dnsTable.path, settings.userRules)
             Log.i(TAG, "filters loaded: $r")
+            if (!dnsTableLoaded(r)) askRebuild("dns_rebuild_for", "DNS table not loaded")
         }
         if (web && proxyPort > 0 && store.webTable.exists()) {
             Log.i(TAG, "web engine: " + NativeCore.nativeReloadWeb(store.webTable.path, store.resourcePaths(this)))
@@ -548,12 +571,22 @@ class AdusterVpnService : VpnService() {
      */
     private fun checkWebEngine() {
         if (proxyPort <= 0 || !FilterStore(this).webTable.exists() || NativeCore.nativeWebLoaded()) return
+        askRebuild("web_rebuild_for", "page engine not loaded")
+    }
+
+    /**
+     * Asks the main process for a forced rebuild of the filter engines, at most once per app
+     * version under [key] (a compiler that keeps producing an unloadable file must not loop).
+     * A DNS table that did not load leaves every lookup unfiltered under "Protected" until the
+     * next list update.
+     */
+    private fun askRebuild(key: String, why: String) {
         val version = runCatching { packageManager.getPackageInfo(packageName, 0).lastUpdateTime }.getOrDefault(0L)
         val prefs = getSharedPreferences("core_state", MODE_PRIVATE)
-        if (prefs.getLong("web_rebuild_for", -1) == version) return
-        prefs.edit().putLong("web_rebuild_for", version).apply()
-        Log.w(TAG, "page engine not loaded; asking for a rebuild")
-        app.aduster.filters.FilterJobs.compile(this, forceWeb = true)
+        if (prefs.getLong(key, -1) == version) return
+        prefs.edit().putLong(key, version).apply()
+        Log.w(TAG, "$why; asking for a rebuild")
+        app.aduster.filters.FilterJobs.compile(this, force = true)
     }
 
     /** Warns (once per state change) when lockdown mode would cut everything but DNS. */
@@ -705,13 +738,15 @@ class AdusterVpnService : VpnService() {
             Notifications.showStopped(this, reason, retry = false)
             return
         }
+        // The network first: the engine's first lookups go to its resolvers (they failed with "no
+        // upstream DNS servers" and recorded a network loss that never happened).
+        monitor = NetworkMonitor(this).also { it.start() }
         proxyPort = startProxy(settings)
         val tun = buildTun(settings)
         if (tun == null || !startEngine(tun)) {
             stopProtection(userInitiated = false, reason = "the tunnel could not be set up")
             return
         }
-        monitor = NetworkMonitor(this).also { it.start() }
         running = true
         noteUnrecordedStop()
         Timeline.add(this, Timeline.STARTED, from)
@@ -875,12 +910,15 @@ class AdusterVpnService : VpnService() {
     private suspend fun reconfigure() {
         checkLockdown()
         proxyPort = startProxy(settings)
-        if (signature(settings) == tunSignature) return
-        val tun = buildTun(settings) ?: return
-        // nativeStart stops (and joins) the old engine first, then starts the new one on the
-        // new descriptor: DNS pauses for that moment only. If the new one does not start, no
-        // engine runs: protection stops instead of showing Protected with no DNS.
-        if (!startEngine(tun)) stopProtection(userInitiated = false, reason = "the DNS engine could not be restarted")
+        val tun = if (signature(settings) == tunSignature) null else buildTun(settings)
+        when (tunnelStep(changed = signature(settings) != tunSignature, built = tun != null)) {
+            TunnelStep.KEEP -> {}
+            TunnelStep.STOP -> stopProtection(userInitiated = false, reason = "the tunnel could not be set up")
+            // nativeStart stops (and joins) the old engine first, then starts the new one on the
+            // new descriptor: DNS pauses for that moment only. If the new one does not start, no
+            // engine runs: protection stops instead of showing Protected with no DNS.
+            TunnelStep.REPLACE -> if (!startEngine(tun!!)) stopProtection(userInitiated = false, reason = "the DNS engine could not be restarted")
+        }
     }
 
     private fun signature(s: Settings) = "${s.blockDnsBypass}|${s.excludedApps.sorted()}|$proxyPort"

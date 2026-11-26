@@ -43,7 +43,8 @@ pub fn compile(sources: &[Source]) -> (Vec<u8>, CompileStats) {
     let mut bad_suffixes: HashSet<String> = HashSet::new();
     for s in sources {
         for line in s.text.lines() {
-            if line.contains("badfilter")
+            // Modifiers are read without regard to case (`$BADFILTER` too).
+            if line.as_bytes().windows(9).any(|w| w.eq_ignore_ascii_case(b"badfilter"))
                 && let Line::BadFilter(key) = parse_line(line)
             {
                 // The key is the rule it disables, written without `$badfilter`; one that is no

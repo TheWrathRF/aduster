@@ -86,6 +86,7 @@ natives! {
     "nativeClearLog" => native_clear_log() -> ();
     "nativeResetStats" => native_reset_stats() -> ();
     "nativeTrimMemory" => native_trim_memory() -> ();
+    "nativeScreenOff" => native_screen_off() -> ();
     "nativeUnbypass" => native_unbypass(JString) -> jboolean;
     "nativePauseSite" => native_pause_site(JString, jint) -> jboolean;
     "nativePersist" => native_persist() -> ();
@@ -150,7 +151,7 @@ fn natives_match_kotlin() {
     let mut registered: Vec<(String, String)> = natives().into_iter().map(|(n, s, _)| (n.to_string(), s)).collect();
     declared.sort();
     registered.sort();
-    assert_eq!(declared.len(), 31);
+    assert_eq!(declared.len(), 32);
     assert_eq!(registered, declared);
 }
 
@@ -393,8 +394,18 @@ fn compile(sources: &str, out: &str) -> String {
     }
     let srcs: Vec<Source> = texts.iter().map(|(n, t, a)| Source { name: n, text: t, user: false, allow: *a }).collect();
     let (bytes, stats) = matcher::compile(&srcs);
+    // On disk before the rename: a power loss right after it must not leave an empty table
+    // that loads as no rules at all.
     let tmp = format!("{out}.tmp");
-    if let Err(e) = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, out)) {
+    let written = (|| {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, out)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
         return serde_json::json!({"ok": false, "error": e.to_string()}).to_string();
     }
     serde_json::json!({
@@ -428,6 +439,36 @@ fn unreadable_list_fails_the_compile() {
     let r: serde_json::Value = serde_json::from_str(&compile(&spec("good.txt"), out.to_str().unwrap())).unwrap();
     assert_eq!(r["ok"], true, "{r}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A table that cannot be put in place (here: a directory stands at its path) fails the
+/// compile and leaves no temporary file behind (a 10 MB `dns.admx.tmp` stayed until the next
+/// compile).
+#[cfg(test)]
+#[test]
+fn a_failed_table_write_leaves_no_temporary_file() {
+    let dir = std::env::temp_dir().join(format!("aduster-compile-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("dns.admx")).unwrap();
+    std::fs::write(dir.join("dns.admx").join("keep"), b"x").unwrap();
+    let list = dir.join("list.txt");
+    std::fs::write(&list, "||ads.test^\n").unwrap();
+    let out = dir.join("dns.admx");
+    let spec = serde_json::json!([{"name": "a", "path": list}]).to_string();
+    let r: serde_json::Value = serde_json::from_str(&compile(&spec, out.to_str().unwrap())).unwrap();
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(!dir.join("dns.admx.tmp").exists(), "the temporary table was left behind");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The app's `DNS_FORMAT` (stored with the compiled table, so an app update that changes the
+/// table's format rebuilds it) is the table format this library reads.
+#[cfg(test)]
+#[test]
+fn the_app_knows_the_dns_table_format() {
+    let kt = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../app/src/main/java/app/aduster/filters/FilterUpdater.kt")).unwrap();
+    let declared = kt.lines().find_map(|l| l.trim().strip_prefix("private const val DNS_FORMAT = ")).map(|v| v.trim().parse::<u32>().unwrap());
+    assert_eq!(declared, Some(matcher::TABLE_VERSION));
 }
 
 /// Loads a compiled list table (memory-mapped) plus the user's rules and swaps them in.
@@ -567,10 +608,19 @@ extern "system" fn native_reset_stats(_env: JNIEnv, _: JClass) {
     })
 }
 
-/// Returns freed heap memory to the kernel (screen off, memory pressure); at the same moment
-/// unsaved stats are written and idle encrypted resolver connections closed.
+/// Memory pressure: returns freed heap memory to the kernel, nothing else (Android calls it
+/// while the user browses too).
 extern "system" fn native_trim_memory(_env: JNIEnv, _: JClass) {
-    guard("trim", (), || {
+    guard("trim", (), || match shared() {
+        Some(s) => s.trim_memory(),
+        None => dnsengine::release_free_memory(),
+    })
+}
+
+/// The screen went off: unsaved stats are written, idle encrypted resolver connections closed
+/// and freed memory returned to the kernel.
+extern "system" fn native_screen_off(_env: JNIEnv, _: JClass) {
+    guard("screen off", (), || {
         if let Some(s) = shared() {
             s.screen_off();
         }

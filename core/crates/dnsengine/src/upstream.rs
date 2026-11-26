@@ -78,13 +78,16 @@ impl Upstream {
     /// Forgets open encrypted connections (after a network change) and a dial that failed on
     /// the old network; the next query re-dials.
     pub fn reset_connections(&self) {
-        let (stale, dial_failed) = match self {
+        let (stale, dial_failed, network) = match self {
             Upstream::System => return,
-            Upstream::Doh(d) => (&d.stale, &d.dial_failed),
-            Upstream::Dot(d) => (&d.stale, &d.dial_failed),
+            Upstream::Doh(d) => (&d.stale, &d.dial_failed, &d.network),
+            Upstream::Dot(d) => (&d.stale, &d.dial_failed, &d.network),
         };
         stale.store(true, Ordering::Release);
         dial_failed.store(0, Ordering::Relaxed);
+        // A dial still running was made on the old network: it is given up (see
+        // [`dial_on_this_network`]).
+        network.send_modify(|g| *g += 1);
     }
 
     pub async fn exchange(&self, system: &[SocketAddr], q: &[u8]) -> io::Result<Vec<u8>> {
@@ -133,6 +136,50 @@ pub(crate) const DIAL_FAILED_RECENTLY: &str = "encrypted resolver unreachable a 
 fn dial_failed_recently(failed_at: &AtomicU64) -> bool {
     let at = failed_at.load(Ordering::Relaxed);
     at != 0 && now_ms().saturating_sub(at) < DIAL_FAILED_MS
+}
+
+/// Runs `dial` on the current network: when the network changes meanwhile ([`Upstream::
+/// reset_connections`]), the dial is given up and made again on the new one. Its result belongs
+/// to the old network: a failure there must not refuse lookups on the new one for
+/// [`DIAL_FAILED_MS`], and a connection made there is bound to it. Returns the result and the
+/// network it belongs to. A network that keeps changing gets three dials.
+async fn dial_on_this_network<T, F: std::future::Future<Output = io::Result<T>>>(
+    network: &tokio::sync::watch::Sender<u64>,
+    mut dial: impl FnMut() -> F,
+) -> (u64, io::Result<T>) {
+    let mut rx = network.subscribe();
+    let mut last = io::Error::new(ErrorKind::NotConnected, "the network changed while connecting");
+    for _ in 0..3 {
+        let on = *rx.borrow_and_update();
+        tokio::select! {
+            r = dial() => {
+                if !rx.has_changed().unwrap_or(false) {
+                    return (on, r);
+                }
+                if let Err(e) = r {
+                    last = e;
+                }
+            }
+            Ok(()) = rx.changed() => {}
+        }
+    }
+    (*rx.borrow(), Err(last))
+}
+
+/// Counts a query in flight on an encrypted resolver while it lives (see `close_idle`).
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn new(n: &'a std::sync::atomic::AtomicUsize) -> Self {
+        n.fetch_add(1, Ordering::AcqRel);
+        InFlight(n)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Query IDs from the system CSPRNG: together with the random source port they are what keeps
@@ -420,7 +467,12 @@ async fn tls_connect(host: &str, port: u16, bootstrap: &[IpAddr], connector: &Tl
     // lookup and the certificate check take the bare address.
     let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     let addrs: Vec<SocketAddr> = if bootstrap.is_empty() {
-        tokio::net::lookup_host((host, port)).await?.collect()
+        // The system's own lookup (a custom server without bootstrap addresses) is bounded like
+        // the dial: every lookup of the phone waits behind it.
+        tokio::time::timeout(TLS_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "resolver name lookup timeout"))??
+            .collect()
     } else {
         bootstrap.iter().map(|ip| SocketAddr::new(*ip, port)).collect()
     };
@@ -469,6 +521,10 @@ pub struct Doh {
     dial_failed: AtomicU64,
     /// The number of the connection in `sender` (changed only with `sender` locked).
     dials: AtomicU64,
+    /// Bumped on every network change (see [`dial_on_this_network`]).
+    network: tokio::sync::watch::Sender<u64>,
+    /// Queries waiting for an answer now.
+    in_flight: std::sync::atomic::AtomicUsize,
 }
 
 /// The idle watcher of one encrypted upstream. It is a task of the runtime that opened the
@@ -506,6 +562,8 @@ impl Doh {
             stale: AtomicBool::new(false),
             dial_failed: AtomicU64::new(0),
             dials: AtomicU64::new(0),
+            network: tokio::sync::watch::Sender::new(0),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -513,7 +571,7 @@ impl Doh {
     async fn sender(self: &Arc<Self>) -> io::Result<(u64, SendRequest<Full<Bytes>>)> {
         let mut g = self.sender.lock().await;
         if self.stale.swap(false, Ordering::AcqRel) {
-            *g = None;
+            self.drop_conn(&mut g);
         }
         if let Some(s) = g.as_ref()
             && !s.is_closed()
@@ -523,15 +581,21 @@ impl Doh {
         if dial_failed_recently(&self.dial_failed) {
             return Err(io::Error::new(ErrorKind::NotConnected, DIAL_FAILED_RECENTLY));
         }
-        let dialed = async {
+        let (on, dialed) = dial_on_this_network(&self.network, || async {
             let tls = tls_connect(&self.host, self.port, &self.bootstrap, &self.connector).await?;
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await.map_err(|e| io::Error::other(e.to_string()))
-        }
+        })
         .await;
+        // The dial was made on the network it belongs to: a change before it began is covered.
+        if *self.network.borrow() == on {
+            self.stale.store(false, Ordering::Release);
+        }
         let (s, conn) = match dialed {
             Ok(v) => v,
             Err(e) => {
-                self.dial_failed.store(now_ms().max(1), Ordering::Relaxed);
+                if *self.network.borrow() == on {
+                    self.dial_failed.store(now_ms().max(1), Ordering::Relaxed);
+                }
                 return Err(e);
             }
         };
@@ -552,19 +616,25 @@ impl Doh {
     async fn forget(&self, n: u64) {
         let mut g = self.sender.lock().await;
         if self.dials.load(Ordering::Relaxed) == n {
-            *g = None;
+            self.drop_conn(&mut g);
+        }
+    }
+
+    /// Closes the connection in `g` (called with `sender` locked): its task is stopped too, so
+    /// the socket goes at once instead of when the server gives up on it.
+    fn drop_conn(&self, g: &mut Option<SendRequest<Full<Bytes>>>) {
+        *g = None;
+        if let Some(t) = self.conn_task.lock().take() {
+            t.abort();
         }
     }
 
     fn close_idle(&self) {
-        if now_ms().saturating_sub(self.last_used.load(Ordering::Relaxed)) < CLOSE_ON_SCREEN_OFF_MS {
+        if now_ms().saturating_sub(self.last_used.load(Ordering::Relaxed)) < CLOSE_ON_SCREEN_OFF_MS || self.in_flight.load(Ordering::Acquire) > 0 {
             return;
         }
         if let Ok(mut g) = self.sender.try_lock() {
-            *g = None;
-            if let Some(t) = self.conn_task.lock().take() {
-                t.abort();
-            }
+            self.drop_conn(&mut g);
         }
     }
 
@@ -575,7 +645,7 @@ impl Doh {
             loop {
                 tokio::time::sleep(IDLE_CLOSE).await;
                 if now_ms().saturating_sub(me.last_used.load(Ordering::Relaxed)) >= IDLE_CLOSE.as_millis() as u64 {
-                    *me.sender.lock().await = None;
+                    me.drop_conn(&mut *me.sender.lock().await);
                     return;
                 }
             }
@@ -584,6 +654,7 @@ impl Doh {
 
     async fn exchange(self: &Arc<Self>, q: &[u8]) -> io::Result<Vec<u8>> {
         touch(&self.last_used, &self.stale);
+        let _in_flight = InFlight::new(&self.in_flight);
         let orig = dns::id_of(q);
         let mut msg = q.to_vec();
         dns::set_id(&mut msg, 0); // RFC 8484: ID 0 keeps HTTP caches effective
@@ -632,12 +703,27 @@ struct DotConn {
 }
 
 impl DotConn {
-    /// Marks it dead and stops its reader, which holds the socket open while it runs.
+    /// Marks it dead and stops its reader, which holds the socket open while it runs. Queries
+    /// waiting on it fail at once (and are asked again on a new connection), not after their
+    /// whole timeout.
     fn close(&self) {
         self.dead.store(true, Ordering::Release);
         if let Some(t) = self.reader.lock().take() {
             t.abort();
         }
+        self.pending.lock().clear();
+    }
+}
+
+/// Held by a DoT connection's reader task: however the task ends (the server closed, it was
+/// aborted, or its runtime went away with a rebuilt tunnel, which drops the task without
+/// running it to its end), the connection counts as dead and its waiters fail.
+struct ReaderGone(Arc<DotConn>);
+
+impl Drop for ReaderGone {
+    fn drop(&mut self) {
+        self.0.dead.store(true, Ordering::Release);
+        self.0.pending.lock().clear();
     }
 }
 
@@ -652,6 +738,10 @@ pub struct Dot {
     stale: AtomicBool,
     /// Boot ms of the last failed dial (0: none), see [`DIAL_FAILED_MS`].
     dial_failed: AtomicU64,
+    /// Bumped on every network change (see [`dial_on_this_network`]).
+    network: tokio::sync::watch::Sender<u64>,
+    /// Queries waiting for an answer now.
+    in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl Dot {
@@ -666,11 +756,13 @@ impl Dot {
             watcher: Watcher::default(),
             stale: AtomicBool::new(false),
             dial_failed: AtomicU64::new(0),
+            network: tokio::sync::watch::Sender::new(0),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn close_idle(&self) {
-        if now_ms().saturating_sub(self.last_used.load(Ordering::Relaxed)) < CLOSE_ON_SCREEN_OFF_MS {
+        if now_ms().saturating_sub(self.last_used.load(Ordering::Relaxed)) < CLOSE_ON_SCREEN_OFF_MS || self.in_flight.load(Ordering::Acquire) > 0 {
             return;
         }
         if let Ok(mut g) = self.conn.try_lock()
@@ -697,10 +789,17 @@ impl Dot {
         if dial_failed_recently(&self.dial_failed) {
             return Err(io::Error::new(ErrorKind::NotConnected, DIAL_FAILED_RECENTLY));
         }
-        let tls = match tls_connect(&self.host, self.port, &self.bootstrap, &self.connector).await {
+        let (on, dialed) = dial_on_this_network(&self.network, || tls_connect(&self.host, self.port, &self.bootstrap, &self.connector)).await;
+        // As for DoH: the dial was made on the network it belongs to.
+        if *self.network.borrow() == on {
+            self.stale.store(false, Ordering::Release);
+        }
+        let tls = match dialed {
             Ok(t) => t,
             Err(e) => {
-                self.dial_failed.store(now_ms().max(1), Ordering::Relaxed);
+                if *self.network.borrow() == on {
+                    self.dial_failed.store(now_ms().max(1), Ordering::Relaxed);
+                }
                 return Err(e);
             }
         };
@@ -712,8 +811,9 @@ impl Dot {
             dead: AtomicBool::new(false),
             reader: Mutex::new(None),
         });
-        let rc = c.clone();
+        let gone = ReaderGone(c.clone());
         let task = tokio::spawn(async move {
+            let rc = &gone.0;
             while let Ok(len) = reader.read_u16().await {
                 let mut buf = vec![0u8; len as usize];
                 if reader.read_exact(&mut buf).await.is_err() || buf.len() < 12 {
@@ -723,8 +823,6 @@ impl Dot {
                     let _ = tx.send(buf);
                 }
             }
-            rc.dead.store(true, Ordering::Release);
-            rc.pending.lock().clear();
         });
         *c.reader.lock() = Some(task.abort_handle());
         *g = Some(c.clone());
@@ -739,7 +837,10 @@ impl Dot {
                 tokio::time::sleep(IDLE_CLOSE).await;
                 if now_ms().saturating_sub(me.last_used.load(Ordering::Relaxed)) >= IDLE_CLOSE.as_millis() as u64 {
                     if let Some(c) = me.conn.lock().await.take() {
-                        let _ = c.writer.lock().await.shutdown().await;
+                        // A polite close first (bounded: a stuck write holds the writer), then
+                        // the reader stops and waiters fail.
+                        let _ = tokio::time::timeout(Duration::from_secs(1), async { c.writer.lock().await.shutdown().await }).await;
+                        c.close();
                     }
                     return;
                 }
@@ -749,6 +850,7 @@ impl Dot {
 
     async fn exchange(self: &Arc<Self>, q: &[u8]) -> io::Result<Vec<u8>> {
         touch(&self.last_used, &self.stale);
+        let _in_flight = InFlight::new(&self.in_flight);
         let orig = dns::id_of(q);
         let mut last = io::Error::other("dot failed");
         for _ in 0..2 {
@@ -767,7 +869,12 @@ impl Dot {
             msg.extend_from_slice(&(q.len() as u16).to_be_bytes());
             msg.extend_from_slice(q);
             dns::set_id(&mut msg[2..], id);
-            let sent = c.writer.lock().await.write_all(&msg).await;
+            // Bounded: a connection the server stopped reading would hold the writer, and every
+            // query behind it, until TCP gives up.
+            let sent = match tokio::time::timeout(TLS_TIMEOUT, async { c.writer.lock().await.write_all(&msg).await }).await {
+                Ok(r) => r,
+                Err(_) => Err(io::Error::new(ErrorKind::TimedOut, "dot write timeout")),
+            };
             if let Err(e) = sent {
                 c.dead.store(true, Ordering::Release);
                 c.pending.lock().remove(&id);
@@ -797,6 +904,14 @@ impl Dot {
 
 #[cfg(test)]
 impl Upstream {
+    /// How many connections a DoH resolver has made (0 for the others).
+    pub(crate) fn dials(&self) -> u64 {
+        match self {
+            Upstream::Doh(d) => d.dials.load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
+
     /// When the encrypted resolver's last dial failed (now_ms; 0: none).
     pub(crate) fn dial_failed_at(&self) -> u64 {
         match self {
@@ -1528,5 +1643,202 @@ mod tests {
         });
         let q = dns::build_query(0x1234, "a.test", dns::TYPE_A);
         assert!(tcp_exchange(addr, &q).await.is_err(), "accepted a TCP reply without the QR bit");
+    }
+    /// A DoT server that echoes every query back as its answer after `delay`, counting the
+    /// connections it accepted; a `silent` one reads queries and never answers.
+    async fn dot_server(delay: Duration, silent: bool) -> (u16, TlsConnector, Arc<std::sync::atomic::AtomicUsize>) {
+        let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", b"dot").await;
+        let port = l.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                c.fetch_add(1, Ordering::SeqCst);
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(t) = a.accept(s).await else { return };
+                    let (mut r, w) = tokio::io::split(t);
+                    let w = Arc::new(tokio::sync::Mutex::new(w));
+                    while let Ok(n) = r.read_u16().await {
+                        let mut m = vec![0u8; n as usize];
+                        if r.read_exact(&mut m).await.is_err() {
+                            return;
+                        }
+                        if silent {
+                            continue;
+                        }
+                        let w = w.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            m[2] |= 0x80;
+                            let mut out = n.to_be_bytes().to_vec();
+                            out.extend_from_slice(&m);
+                            let _ = w.lock().await.write_all(&out).await;
+                        });
+                    }
+                });
+            }
+        });
+        (port, connector, conns)
+    }
+
+    /// A DoH server answering every query (an echo with QR set) after `delay`, and the
+    /// connections it accepted.
+    async fn doh_server(delay: Duration) -> (u16, TlsConnector, Arc<std::sync::atomic::AtomicUsize>) {
+        let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", b"h2").await;
+        let port = l.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = conns.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                c.fetch_add(1, Ordering::SeqCst);
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(t) = a.accept(s).await else { return };
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| async move {
+                        let mut r = req.into_body().collect().await?.to_bytes().to_vec();
+                        tokio::time::sleep(delay).await;
+                        r[2] |= 0x80;
+                        Ok::<_, hyper::Error>(
+                            hyper::Response::builder().header("content-type", "application/dns-message").body(Full::new(Bytes::from(r))).unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(t), svc).await;
+                });
+            }
+        });
+        (port, connector, conns)
+    }
+
+    /// A dial still running on the old network when the phone moves is given up: its failure
+    /// does not refuse lookups on the new network for 3 s, and nobody waits for it. The test
+    /// server holds every connection made before `works` is set (the old network's), and
+    /// answers the rest.
+    #[tokio::test]
+    async fn a_dial_on_the_old_network_does_not_hold_the_new_one() {
+        for dot in [false, true] {
+            let alpn: &[u8] = if dot { b"dot" } else { b"h2" };
+            let (l, acceptor, connector) = tls_pair("127.0.0.1:0", "127.0.0.1", alpn).await;
+            let port = l.local_addr().unwrap().port();
+            let works = Arc::new(AtomicBool::new(false));
+            let w = works.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((s, _)) = l.accept().await else { return };
+                    if !w.load(Ordering::SeqCst) {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                            drop(s);
+                        });
+                        continue;
+                    }
+                    let a = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut t) = a.accept(s).await else { return };
+                        if dot {
+                            while let Ok(n) = t.read_u16().await {
+                                let mut m = vec![0u8; n as usize];
+                                if t.read_exact(&mut m).await.is_err() {
+                                    return;
+                                }
+                                m[2] |= 0x80;
+                                let mut out = n.to_be_bytes().to_vec();
+                                out.extend_from_slice(&m);
+                                let _ = t.write_all(&out).await;
+                            }
+                            return;
+                        }
+                        let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                            let mut r = req.into_body().collect().await?.to_bytes().to_vec();
+                            r[2] |= 0x80;
+                            Ok::<_, hyper::Error>(
+                                hyper::Response::builder().header("content-type", "application/dns-message").body(Full::new(Bytes::from(r))).unwrap(),
+                            )
+                        });
+                        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(t), svc).await;
+                    });
+                }
+            });
+            let up = if dot {
+                let mut d = Dot::new("127.0.0.1", port, &[]);
+                d.connector = connector;
+                Arc::new(Upstream::Dot(Arc::new(d)))
+            } else {
+                let mut d = Doh::new(&format!("https://127.0.0.1:{port}/dns-query"), &[]).unwrap();
+                d.connector = connector;
+                Arc::new(Upstream::Doh(Arc::new(d)))
+            };
+            let t0 = std::time::Instant::now();
+            let u = up.clone();
+            let first = tokio::spawn(async move { u.exchange(&[], &dns::build_query(0x7101, "a.test", dns::TYPE_A)).await });
+            // The phone moves; the new network carries traffic a moment later.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            up.reset_connections();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            works.store(true, Ordering::SeqCst);
+            let r = up.exchange(&[], &dns::build_query(0x7102, "b.test", dns::TYPE_A)).await;
+            let took = t0.elapsed();
+            assert!(r.is_ok(), "{}: the new network's lookup failed after {took:?}: {:?}", up.describe(), r.err());
+            assert!(took < Duration::from_millis(2500), "{}: took {took:?}", up.describe());
+            assert!(first.await.unwrap().is_ok(), "{}: the lookup asked during the move", up.describe());
+        }
+    }
+
+    /// Closing a DoT connection fails the queries waiting on it at once (they waited their
+    /// whole 5 s before).
+    #[tokio::test]
+    async fn closing_a_dot_connection_fails_its_waiters_at_once() {
+        let (port, connector, _) = dot_server(Duration::ZERO, true).await;
+        let mut d = Dot::new("127.0.0.1", port, &[]);
+        d.connector = connector;
+        let d = Arc::new(d);
+        let c = d.conn().await.unwrap();
+        let (tx, rx) = oneshot::channel();
+        c.pending.lock().insert(1, tx);
+        c.close();
+        assert!(tokio::time::timeout(Duration::from_millis(500), rx).await.expect("the waiter is still waiting").is_err());
+    }
+
+    /// A DoT connection whose reader died with its runtime (the tunnel was rebuilt) counts as
+    /// dead: the next query dials a new one instead of writing to it.
+    #[test]
+    fn a_dot_reader_gone_with_its_runtime_marks_the_connection_dead() {
+        let main = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (port, connector, _) = main.block_on(dot_server(Duration::ZERO, false));
+        let mut d = Dot::new("127.0.0.1", port, &[]);
+        d.connector = connector;
+        let d = Arc::new(d);
+        let old = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        old.block_on(d.exchange(&dns::build_query(0x7201, "a.test", dns::TYPE_A))).unwrap();
+        drop(old);
+        let c = main.block_on(async { d.conn.lock().await.clone() }).expect("a cached connection");
+        assert!(c.dead.load(Ordering::Acquire), "the connection outlived its reader");
+    }
+
+    /// The screen going off closes connections idle a moment, not one with a query in flight
+    /// (idle was judged by the query's start: a 2 s answer was cut off and asked again).
+    #[tokio::test]
+    async fn screen_off_keeps_a_connection_with_a_query_in_flight() {
+        let slow = Duration::from_millis(2600);
+        let (port, connector, conns) = dot_server(slow, false).await;
+        let mut d = Dot::new("127.0.0.1", port, &[]);
+        d.connector = connector;
+        let dot = Arc::new(Upstream::Dot(Arc::new(d)));
+        let (port, connector, doh_conns) = doh_server(slow).await;
+        let mut d = Doh::new(&format!("https://127.0.0.1:{port}/dns-query"), &[]).unwrap();
+        d.connector = connector;
+        let doh = Arc::new(Upstream::Doh(Arc::new(d)));
+        for (up, conns) in [(dot, conns), (doh, doh_conns)] {
+            let t0 = std::time::Instant::now();
+            let u = up.clone();
+            let q = tokio::spawn(async move { u.exchange(&[], &dns::build_query(0x7301, "slow.test", dns::TYPE_A)).await });
+            tokio::time::sleep(Duration::from_millis(2200)).await;
+            up.close_idle();
+            assert!(q.await.unwrap().is_ok(), "{}", up.describe());
+            assert!(t0.elapsed() < Duration::from_millis(4000), "{}: took {:?}", up.describe(), t0.elapsed());
+            assert_eq!(conns.load(Ordering::SeqCst), 1, "{}: the connection was closed under the query", up.describe());
+        }
     }
 }
