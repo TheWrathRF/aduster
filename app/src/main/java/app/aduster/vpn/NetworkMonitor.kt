@@ -75,12 +75,6 @@ class NetworkMonitor(context: Context) : ConnectivityManager.NetworkCallback() {
 
     companion object {
         fun facts(dnsServers: List<InetAddress>, addrs: List<InetAddress>, nat64: Boolean): Facts {
-            // A link-local resolver goes with its interface's scope id ("fe80::1%12"), after the global
-            // ones: some routers offer only that one, and without it the network would count as offline.
-            val (linkLocal, global) = dnsServers.partition { it is Inet6Address && it.isLinkLocalAddress }
-            val dns = (global.filterNot { it == TUN_V4 || it == TUN_V6 }.mapNotNull { it.hostAddress } +
-                linkLocal.mapNotNull { a -> (a as Inet6Address).scopeId.takeIf { it != 0 }?.let { "${a.hostAddress?.substringBefore('%')}%$it" } })
-                .joinToString(",")
             // IPv6-only mobile data still reaches IPv4 through the platform's 464XLAT (NAT64 prefix).
             val v4 = addrs.any { it is Inet4Address && !it.isLoopbackAddress } || nat64
             // Only a global IPv6 address counts: link-local, ULA (fc00::/7) and site-local (fec0::/10,
@@ -88,7 +82,31 @@ class NetworkMonitor(context: Context) : ConnectivityManager.NetworkCallback() {
             val v6 = addrs.any {
                 it is Inet6Address && !it.isLinkLocalAddress && !it.isSiteLocalAddress && !it.isLoopbackAddress && (it.address[0].toInt() and 0xFE) != 0xFC
             }
+            // A link-local resolver goes with its interface's scope id ("fe80::1%12"), after the global
+            // ones: some routers offer only that one, and without it the network would count as offline.
+            val (linkLocal, global) = dnsServers.partition { it is Inet6Address && it.isLinkLocalAddress }
+            val dns = (byFamily(global.filterNot { it == TUN_V4 || it == TUN_V6 }, v4, v6).mapNotNull { it.hostAddress } +
+                linkLocal.mapNotNull { a -> (a as Inet6Address).scopeId.takeIf { it != 0 }?.let { "${a.hostAddress?.substringBefore('%')}%$it" } })
+                .joinToString(",")
             return Facts(dns, v4, v6)
+        }
+
+        /**
+         * The engine asks the first server, then the next one after a second or a failure: the
+         * family that reaches the internet goes first (IPv6 resolvers listed first on a network
+         * whose IPv6 does not work would cost every lookup two seconds), and on dual stack the
+         * families alternate, the network's first one leading, so the first two cover both.
+         */
+        private fun byFamily(servers: List<InetAddress>, v4: Boolean, v6: Boolean): List<InetAddress> {
+            val (four, six) = servers.partition { it is Inet4Address }
+            return when {
+                v4 && !v6 -> four + six
+                v6 && !v4 -> six + four
+                else -> {
+                    val (a, b) = if (servers.firstOrNull() is Inet4Address) four to six else six to four
+                    (0 until maxOf(a.size, b.size)).flatMap { listOfNotNull(a.getOrNull(it), b.getOrNull(it)) }
+                }
+            }
         }
 
         // Compared as addresses: Android writes IPv6 compressed, other runtimes in full.

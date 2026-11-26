@@ -153,8 +153,8 @@ pub fn rand_u16() -> u16 {
 /// preference learned on one network never carries over to another list.
 static PREFERRED: Mutex<(u64, usize)> = Mutex::new((0, 0));
 
-/// When the first server has not answered yet, the second one is asked too (whichever answers
-/// first wins): a dead first server then costs a second, not the first one's whole budget.
+/// When the servers asked so far have not answered yet, the next one is asked too (whichever
+/// answers first wins): a dead server then costs a second, not its whole budget.
 const SECOND_SERVER_AFTER: Duration = Duration::from_millis(1000);
 
 fn servers_key(servers: &[SocketAddr]) -> u64 {
@@ -181,65 +181,65 @@ pub(crate) async fn system_exchange(servers: &[SocketAddr], q: &[u8]) -> io::Res
     if servers.len() == 1 {
         return udp_exchange(servers[0], q).await;
     }
-    let (a, b) = (start, (start + 1) % servers.len());
-    let first = udp_exchange(servers[a], q);
-    tokio::pin!(first);
-    let mut second: Option<Exchange<'_>> = None;
+    // Every server of the network, the one that answered last first, then in the network's
+    // order; the next one is asked when those asked so far failed (at once) or have not answered
+    // within SECOND_SERVER_AFTER. Two dead resolvers first (IPv6 ones on a network whose IPv6
+    // does not work) then cost two seconds, not every lookup.
+    let mut queue = (0..servers.len()).map(|i| (start + i) % servers.len());
+    let ask = |i: usize| -> (usize, Exchange<'_>) { (i, Box::pin(udp_exchange(servers[i], q))) };
+    let mut asked: Vec<(usize, Exchange<'_>)> = Vec::with_capacity(servers.len());
+    asked.extend(queue.next().map(ask));
     let delay = tokio::time::sleep(SECOND_SERVER_AFTER);
     tokio::pin!(delay);
-    let (mut first_done, mut second_done) = (false, false);
-    // A server's SERVFAIL/REFUSED is kept while the other one may still answer properly, so it
-    // does not win the race at once.
+    // A server's SERVFAIL/REFUSED is kept while another one may still answer properly, so it
+    // does not win the race at once; the first such answer is returned when all fail.
     let mut failed_answer: Option<Vec<u8>> = None;
     loop {
+        let more = queue.len() != 0;
         tokio::select! {
-            r = &mut first, if !first_done => match r {
-                Ok(v) if !server_failed(&v) => {
-                    *PREFERRED.lock() = (key, a);
-                    return Ok(v);
-                }
-                other => {
-                    first_done = true;
-                    let e = match other {
-                        Ok(v) => {
-                            failed_answer = Some(v);
-                            io::Error::other("server failure")
-                        }
-                        Err(e) => e,
-                    };
-                    if second_done {
-                        return failed_answer.map(Ok).unwrap_or(Err(e));
+            (i, r) = next_answer(&mut asked) => {
+                let e = match r {
+                    Ok(v) if !server_failed(&v) => {
+                        *PREFERRED.lock() = (key, i);
+                        return Ok(v);
                     }
-                    // Failed fast (unreachable, refused, SERVFAIL): no need to wait for the delay.
-                    if second.is_none() {
-                        second = Some(Box::pin(udp_exchange(servers[b], q)));
+                    Ok(v) => {
+                        failed_answer.get_or_insert(v);
+                        io::Error::other("server failure")
                     }
+                    Err(e) => e,
+                };
+                // Failed fast (unreachable, refused, SERVFAIL): no need to wait for the delay.
+                match queue.next() {
+                    Some(j) => {
+                        asked.push(ask(j));
+                        delay.as_mut().reset(tokio::time::Instant::now() + SECOND_SERVER_AFTER);
+                    }
+                    None if asked.is_empty() => return failed_answer.map(Ok).unwrap_or(Err(e)),
+                    None => {}
                 }
-            },
-            _ = &mut delay, if second.is_none() && !first_done => {
-                second = Some(Box::pin(udp_exchange(servers[b], q)));
             }
-            r = async { second.as_mut().unwrap().await }, if second.is_some() && !second_done => match r {
-                Ok(v) if !server_failed(&v) => {
-                    *PREFERRED.lock() = (key, b);
-                    return Ok(v);
-                }
-                other => {
-                    second_done = true;
-                    let e = match other {
-                        Ok(v) => {
-                            failed_answer.get_or_insert(v);
-                            io::Error::other("server failure")
-                        }
-                        Err(e) => e,
-                    };
-                    if first_done {
-                        return failed_answer.map(Ok).unwrap_or(Err(e));
-                    }
-                }
-            },
+            _ = &mut delay, if more => {
+                asked.extend(queue.next().map(ask));
+                delay.as_mut().reset(tokio::time::Instant::now() + SECOND_SERVER_AFTER);
+            }
         }
     }
+}
+
+/// The first of `asked` to finish, removed from it, with its server's index. Pending while
+/// `asked` is empty.
+async fn next_answer(asked: &mut Vec<(usize, Exchange<'_>)>) -> (usize, io::Result<Vec<u8>>) {
+    std::future::poll_fn(|cx| {
+        for k in 0..asked.len() {
+            if let std::task::Poll::Ready(r) = asked[k].1.as_mut().poll(cx) {
+                let (i, _) = asked.swap_remove(k);
+                return std::task::Poll::Ready((i, r));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// The handle of the network whose resolvers are in use (0: none known), set with them.
@@ -996,6 +996,69 @@ mod tests {
         let q = dns::build_query(0x5252, "x.test", dns::TYPE_A);
         let r = system_exchange(&[ba, ga], &q).await.unwrap();
         assert_eq!(dns::rcode_of(&r), dns::RCODE_NOERROR);
+    }
+
+    /// A local resolver that answers SERVFAIL (`Some(rcode)`), answers properly (`None`), or
+    /// never answers (`Some(0)`).
+    async fn resolver(answer: Option<u8>) -> SocketAddr {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a = s.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (n, from) = s.recv_from(&mut buf).await.unwrap();
+                let r = match answer {
+                    Some(0) => continue,
+                    Some(rcode) => dns::error_response(&buf[..n], &dns::parse_query(&buf[..n]).unwrap(), rcode),
+                    None => {
+                        let mut r = buf[..n].to_vec();
+                        r[2] |= 0x80;
+                        r
+                    }
+                };
+                s.send_to(&r, from).await.unwrap();
+            }
+        });
+        a
+    }
+
+    /// The network's third resolver answers when the first two fail, at once (no waiting for
+    /// the stagger), and is asked first afterwards.
+    #[tokio::test]
+    async fn third_server_is_asked_when_two_fail() {
+        let servers = [resolver(Some(dns::RCODE_SERVFAIL)).await, resolver(Some(dns::RCODE_REFUSED)).await, resolver(None).await];
+        let q = dns::build_query(0x5353, "third.test", dns::TYPE_A);
+        let t0 = std::time::Instant::now();
+        let r = system_exchange(&servers, &q).await.unwrap();
+        assert_eq!(dns::rcode_of(&r), dns::RCODE_NOERROR, "the third resolver's answer");
+        assert!(t0.elapsed() < SECOND_SERVER_AFTER, "took {:?}", t0.elapsed());
+        assert_eq!(*PREFERRED.lock(), (servers_key(&servers), 2));
+    }
+
+    /// Two resolvers that never answer (an IPv6 pair on a network without IPv6) before a working
+    /// one: the third is asked a second after the second, well inside one server's budget.
+    #[tokio::test]
+    async fn third_server_answers_when_two_are_silent() {
+        let servers = [resolver(Some(0)).await, resolver(Some(0)).await, resolver(None).await];
+        let q = dns::build_query(0x5454, "silent.test", dns::TYPE_A);
+        let t0 = std::time::Instant::now();
+        let r = system_exchange(&servers, &q).await.unwrap();
+        assert_eq!(dns::rcode_of(&r), dns::RCODE_NOERROR);
+        let took = t0.elapsed();
+        assert!(took >= SECOND_SERVER_AFTER * 2 && took < SECOND_SERVER_AFTER * 3, "took {took:?}");
+        // Asked first from now on: the next lookup costs no stagger.
+        let t1 = std::time::Instant::now();
+        system_exchange(&servers, &dns::build_query(0x5455, "silent.test", dns::TYPE_A)).await.unwrap();
+        assert!(t1.elapsed() < SECOND_SERVER_AFTER, "took {:?}", t1.elapsed());
+    }
+
+    /// When every resolver fails, a server's own failure answer is returned (not a timeout).
+    #[tokio::test]
+    async fn every_server_failing_returns_a_failure_answer() {
+        let servers = [resolver(Some(dns::RCODE_SERVFAIL)).await, resolver(Some(dns::RCODE_SERVFAIL)).await, resolver(Some(dns::RCODE_REFUSED)).await];
+        let q = dns::build_query(0x5656, "fail.test", dns::TYPE_A);
+        let r = system_exchange(&servers, &q).await.unwrap();
+        assert!(server_failed(&r));
     }
 
     /// An unreachable encrypted resolver fails all waiting queries within about one dial

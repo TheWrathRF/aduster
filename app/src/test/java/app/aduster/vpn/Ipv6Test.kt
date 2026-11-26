@@ -60,6 +60,29 @@ class Ipv6Test {
         assertEquals("12", scope)
     }
 
+    @Test
+    fun resolversOfTheWorkingFamilyComeFirst() {
+        val servers = listOf(ip("2001:db8::1"), ip("2001:db8::2"), ip("192.168.1.1"), ip("192.168.1.2"))
+        fun order(addrs: List<InetAddress>, nat64: Boolean = false) =
+            NetworkMonitor.facts(servers, addrs, nat64).dns.split(",").map { InetAddress.getByName(it) }
+        // No IPv6 internet (only a unique-local address): the IPv4 resolvers first.
+        assertEquals(
+            listOf(ip("192.168.1.1"), ip("192.168.1.2"), ip("2001:db8::1"), ip("2001:db8::2")),
+            order(listOf(ip("192.168.1.5"), ip("fd12::5"))),
+        )
+        // IPv6 only, no NAT64: the IPv6 resolvers first.
+        assertEquals(
+            listOf(ip("2001:db8::1"), ip("2001:db8::2"), ip("192.168.1.1"), ip("192.168.1.2")),
+            order(listOf(ip("2001:db8::5"))),
+        )
+        // Dual stack: the network's first family first, then the families alternate, so the
+        // first two asked cover both.
+        assertEquals(
+            listOf(ip("2001:db8::1"), ip("192.168.1.1"), ip("2001:db8::2"), ip("192.168.1.2")),
+            order(listOf(ip("192.168.1.5"), ip("2001:db8::5"))),
+        )
+    }
+
     /** Android's own exclusion-list pattern (AOSP ProxyUtils, EXCLLIST_REGEXP): one invalid entry voids the whole proxy. */
     private val excl = """[a-zA-Z0-9*]+(\-[a-zA-Z0-9*]+)*(\.[a-zA-Z0-9*]+(\-[a-zA-Z0-9*]+)*)*"""
     private val exclList = Regex("^$|^$excl(,$excl)*$")
