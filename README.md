@@ -174,6 +174,9 @@ harmless (its private key was inside the app and is gone), but there is no reaso
   truncated, and a client that retries such a lookup over TCP has its connection reset. Ordinary
   lookups are far below the limit.
 - Android runs one VPN app at a time, so Aduster cannot run alongside another VPN.
+- Over plain HTTP (not HTTPS), a public page can still reach a device on your local network,
+  such as your router's admin page, by showing it in a frame. Aduster cannot tell such a frame
+  from a link you clicked, and blocking both would break links to your router from other pages.
 
 ## Build the public part
 
