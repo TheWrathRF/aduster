@@ -858,11 +858,13 @@ impl Shared {
 
     /// [`Shared::diagnostics_json`] for an exported report, which people post or send: the
     /// network's search domains (a school's or company's own domain) only counted, its resolvers
-    /// only by kind (public ones name the provider).
+    /// only by kind (public ones name the provider), and an encrypted DNS server the user typed
+    /// only by its provider's domain (see [`report_server`]).
     pub fn report_json(&self) -> serde_json::Value {
         let mut v: serde_json::Value = serde_json::from_str(&self.diagnostics_json()).unwrap_or_default();
         v["search_domains"] = self.search_domains.load().len().into();
         v["system_servers"] = server_kinds(&self.system_servers.load()).into();
+        v["upstream"] = report_server(&self.upstream.load().describe()).into();
         v
     }
 
@@ -902,6 +904,32 @@ impl Shared {
         })
         .to_string()
     }
+}
+
+/// The app's built-in encrypted DNS servers (`Upstreams.kt`): named in full in a report.
+const BUILTIN_SERVERS: &[&str] = &["cloudflare-dns.com", "dns.quad9.net", "dns.google", "unfiltered.adguard-dns.com", "one.one.one.one"];
+
+/// What a report says of the resolver [`Upstream::describe`](upstream::Upstream::describe)
+/// names ("doh dns.example"): a built-in server as it is; any other host only as its provider's
+/// domain. Private DNS services put the user's profile in the host (`abc123.dns.nextdns.io`:
+/// `*.nextdns.io`), and a server under a dynamic-DNS or hosting name has
+/// the user's own name there (`dns.myname.duckdns.org`: `*.duckdns.org`, the suffix itself
+/// when it is one anyone can register under).
+fn report_server(described: &str) -> String {
+    let Some((kind, host)) = described.split_once(' ') else { return described.to_string() };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if BUILTIN_SERVERS.contains(&host.as_str()) {
+        return format!("{kind} {host}");
+    }
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let suffix = psl::suffix(host.as_bytes()).filter(|s| s.is_known());
+    let shown = match (suffix, psl::domain(host.as_bytes())) {
+        (Some(s), _) if s.typ() == Some(psl::Type::Private) => text(s.as_bytes()),
+        (_, Some(d)) if d.as_bytes() != host.as_bytes() => text(d.as_bytes()),
+        (Some(s), _) => text(s.as_bytes()),
+        _ => "?".into(),
+    };
+    format!("{kind} *.{shown}")
 }
 
 /// "local" or "public" for each resolver: what a report may say about them.
@@ -1132,6 +1160,25 @@ mod tests {
             assert!(!text.contains("198.51.100") && !text.contains("192.168.1.1"), "{text}");
         }
         assert!(events.contains("dns=public,local"), "{events}");
+    }
+
+    /// The exported report names an encrypted DNS server the user typed only by its provider's
+    /// domain: private services put the user's profile in the host. Built-in servers and the
+    /// on-screen diagnostics keep the full name.
+    #[test]
+    fn reports_name_a_typed_dns_server_by_its_provider() {
+        let report = |upstream| Shared::new(Config { upstream, ..Config::default() }).report_json()["upstream"].as_str().unwrap().to_string();
+        let dot = |host: &str| upstream::UpstreamConfig::Dot { host: host.into(), port: 853, bootstrap: vec![] };
+        let doh = |url: &str| upstream::UpstreamConfig::Doh { url: url.into(), bootstrap: vec![] };
+        assert_eq!(report(dot("myphone-abc123.dns.nextdns.io")), "dot *.nextdns.io");
+        assert_eq!(report(dot("abc123.d.adguard-dns.com")), "dot *.adguard-dns.com");
+        assert_eq!(report(dot("dns.myname.duckdns.org")), "dot *.duckdns.org", "a name of one's own under a dynamic-DNS suffix");
+        assert_eq!(report(doh("https://abc123.dns.controld.com/dns-query")), "doh *.controld.com");
+        assert_eq!(report(dot("dns.quad9.net")), "dot dns.quad9.net", "built in");
+        assert_eq!(report(dot("DNS.Quad9.net.")), "dot dns.quad9.net", "built in, however written");
+        assert_eq!(report(doh("https://cloudflare-dns.com/dns-query")), "doh cloudflare-dns.com");
+        let s = Shared::new(Config { upstream: dot("myphone-abc123.dns.nextdns.io"), ..Config::default() });
+        assert!(s.diagnostics_json().contains("myphone-abc123.dns.nextdns.io"), "the screen keeps it");
     }
 
     /// A search domain that is a public suffix is ignored (it would take a
