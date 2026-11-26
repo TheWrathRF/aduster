@@ -116,11 +116,16 @@ object HttpsConfig {
      */
     fun exclusions(ctx: Context, s: Settings): List<String> {
         val builtin = builtin ?: ctx.assets.open("builtin/https-sensitive.txt").bufferedReader().use { it.readLines() }.also { builtin = it }
-        return ((builtin + downloadedLines(ctx) + s.httpsExclusions.lines())
+        // `$` lines are AdGuard's per-app entries (`$app=`), which this list does not apply; the
+        // user's own lines are hosts or pasted URLs, where `$` is just part of the address.
+        return ((builtin + downloadedLines(ctx))
             .filter { !isComment(it) && !it.contains('$') }
-            .mapNotNull { exclusionHost(it) } + GOVERNMENT)
+            .mapNotNull { exclusionHost(it) } + userHosts(s.httpsExclusions) + GOVERNMENT)
             .distinct()
     }
+
+    /** The hosts of the user's own never-decrypt list: what the proxy gets and what the app shows as excluded. */
+    fun userHosts(text: String): List<String> = text.lines().filter { !isComment(it) }.mapNotNull { exclusionHost(it) }
 
     private fun downloadedLines(ctx: Context): List<String> {
         val store = app.aduster.filters.FilterStore(ctx)
@@ -154,8 +159,27 @@ object HttpsConfig {
             else -> s.substringBefore(':')
         }
         s = s.removePrefix("*.").trimStart('.').trimEnd('.').lowercase()
-        return s.takeIf { it.isNotEmpty() && (HOST.matches(it) || it.contains(':')) }
+        return s.takeIf { it.isNotEmpty() && (HOST.matches(it) || isIpv6(it)) }
     }
+
+    /** Whether [s] is an IPv6 address literal (`2001:db8::1`, `::ffff:192.0.2.1`), read without any lookup. */
+    fun isIpv6(s: String): Boolean {
+        val halves = s.split("::")
+        if (s.count { it == ':' } < 2 || halves.size > 2) return false
+        val groups = halves.flatMap { half -> if (half.isEmpty()) emptyList() else half.split(':') }
+        var words = 0
+        for ((i, g) in groups.withIndex()) {
+            words += when {
+                // An IPv4 part only as the last 32 bits, never before `::`.
+                i == groups.lastIndex && '.' in g && s.endsWith(g) -> if (V4.matches(g) && g.split('.').all { it.toInt() <= 255 }) 2 else return false
+                g.length in 1..4 && g.all { it.isDigit() || it in 'a'..'f' } -> 1
+                else -> return false
+            }
+        }
+        return if (halves.size == 2) words < 8 else words == 8
+    }
+
+    private val V4 = Regex("""^[0-9]{1,3}(\.[0-9]{1,3}){3}$""")
 
     /** 1-based numbers of the user's lines that name no host (shown as errors). */
     fun invalidExclusionLines(text: String): List<Int> =

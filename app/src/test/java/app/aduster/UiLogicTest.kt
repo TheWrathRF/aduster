@@ -961,6 +961,27 @@ class UiLogicTest {
         assertEquals("bank.example", h("*.bank.example"))
         assertNull(h("not a host"))
         assertNull(h(""))
+        assertEquals("2001:db8::1", h("https://[2001:DB8::1]/admin"))
+        assertEquals("2001:db8::1", h("2001:db8::1"))
+        assertEquals("::ffff:192.0.2.1", h("::ffff:192.0.2.1"))
+        assertNull("two colons are no IPv6 address", h("bad host::1"))
+        assertNull(h("1::2::3"))
+        assertNull(h("::ffff:999.0.2.1"))
+        assertNull("an IPv4 part only at the end", h("1.2.3.4::"))
+        assertNull(h("fe80:1.2.3.4::"))
+        assertEquals("64:ff9b::192.0.2.1", h("64:ff9b::192.0.2.1"))
+    }
+
+    /**
+     * The user's own never-decrypt lines: a pasted URL keeps its host whatever its query holds
+     * (`$` is not an AdGuard modifier there), and a commented-out line excludes nothing, so the
+     * app never shows as excluded a site the proxy decrypts.
+     */
+    @Test
+    fun userNeverDecryptLines() {
+        val text = "https://pay.example/?amt=\$50\n! https://bank.example\n# old.example\nbad host::1\nshop.example"
+        assertEquals(listOf("pay.example", "shop.example"), app.aduster.https.HttpsConfig.userHosts(text))
+        assertEquals(listOf(4), app.aduster.https.HttpsConfig.invalidExclusionLines(text))
     }
 
     /** A settings file with one bad field keeps every other field; text that is no JSON object gives nothing. */

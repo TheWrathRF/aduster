@@ -381,7 +381,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The user's own never-decrypt entries (the core only knows the merged list). */
     fun userExcludes(host: String, s: Settings): Boolean =
-        s.httpsExclusions.lines().mapNotNull { HttpsConfig.exclusionHost(it) }.any { host == it || host.endsWith(".$it") }
+        HttpsConfig.userHosts(s.httpsExclusions).any { host == it || host.endsWith(".$it") }
 
     fun diagnostics(): JsonObject? = runCatching { Json.parseToJsonElement(client.call("{}") { it.diagnostics() }).jsonObject }.getOrNull()
 
