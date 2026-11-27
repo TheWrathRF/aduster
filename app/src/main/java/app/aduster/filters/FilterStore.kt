@@ -198,24 +198,41 @@ class FilterStore(val dir: File) {
 
     companion object {
         private const val META_TMP = "meta.json.tmp"
+        /** Moves [copyWhole] tries before it gives up (20 ms apart). */
+        private const val MOVE_TRIES = 5
         private val processLock = java.util.concurrent.locks.ReentrantLock()
 
         /**
          * [open]'s bytes as [f]'s new content: through a temporary file of this copy's own (both
          * processes copy the resources after an update, without the store's lock) moved over [f]
-         * at once, so a reader sees the old file or the new one, never a mix.
+         * at once, so a reader sees the old file or the new one, never a mix. [move]: the move
+         * itself (tests make it fail).
          */
-        internal fun copyWhole(open: () -> java.io.InputStream, f: File) {
+        internal fun copyWhole(
+            open: () -> java.io.InputStream,
+            f: File,
+            move: (java.nio.file.Path, java.nio.file.Path) -> Unit = { from, to ->
+                java.nio.file.Files.move(from, to, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+            },
+        ) {
             val tmp = File.createTempFile(f.name + ".", ".part", f.parentFile)
             try {
                 open().use { input -> tmp.outputStream().use { input.copyTo(it) } }
-                try {
-                    java.nio.file.Files.move(tmp.toPath(), f.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
-                } catch (e: java.io.IOException) {
-                    // Another copy of the same bytes is being moved in (a system that refuses to
-                    // replace a file in use): that one stands.
-                    if (!f.exists()) throw e
+                // A system that refuses to replace a file in use (another copy moving the same
+                // bytes in) is asked again a few times; a copy that moved the same bytes in first
+                // stands. Anything else there (the old version's file) is not taken for the new one.
+                var failure: java.io.IOException? = null
+                repeat(MOVE_TRIES) {
+                    try {
+                        move(tmp.toPath(), f.toPath())
+                        return
+                    } catch (e: java.io.IOException) {
+                        failure = e
+                    }
+                    if (f.length() == tmp.length() && runCatching { f.readBytes().contentEquals(tmp.readBytes()) }.getOrDefault(false)) return
+                    Thread.sleep(20)
                 }
+                throw failure!!
             } finally {
                 tmp.delete()
             }

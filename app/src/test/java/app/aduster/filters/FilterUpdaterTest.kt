@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.net.InetSocketAddress
@@ -874,6 +875,92 @@ class FilterUpdaterTest {
             assertEquals(1, r.unreachable)
             assertEquals(true, FilterJobs.retryAfter(r))
             assertEquals(0, r.unchanged)
+        } finally {
+            server.stop(0)
+            tmp.deleteRecursively()
+        }
+    }
+
+    /**
+     * "Update now" retries for 30 minutes on the boot clock: a start from before a reboot, or a
+     * wall-clock time an older version kept, starts the window again instead of retrying forever
+     * or never.
+     */
+    @Test
+    fun updateRetriesLastThirtyMinutesOnTheBootClock() {
+        val now = 10_000_000L
+        assertEquals(now to true, FilterJobs.retryWindow(0, now))
+        assertEquals(now - 60_000 to true, FilterJobs.retryWindow(now - 60_000, now))
+        assertEquals(now - 31 * 60_000 to false, FilterJobs.retryWindow(now - 31 * 60_000, now))
+        assertEquals(now to true, FilterJobs.retryWindow(1_790_000_000_000L, now))
+    }
+
+    /** A part kept on disk without its scan (its download failed) is read for the parts it includes. */
+    @Test
+    fun aPartStoredWithoutItsScanIsReadForItsOwnParts() {
+        val tmp = Files.createTempDirectory("aduster-inc-noscan").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("custom-00000001", "L", "https://lists.example/l.txt", false, Group.CUSTOM, true, "")
+            store.raw(l.id).parentFile!!.mkdirs()
+            store.raw(l.id).writeText("!#include part.txt\n")
+            val dir = store.includes(l.id).also { it.mkdirs() }
+            File(dir, "part.txt").writeText("!#include deep.txt\n||a.test^\n")
+            val meta = FilterMeta(lists = mapOf(l.id to ListMeta(url = l.url, scan = FileScan(1, "", 1, listOf("part.txt")), parts = mapOf("part.txt" to PartMeta()))))
+            assertTrue(FilterUpdater.due(l, meta, store, FilterUpdater.Check.MISSING, System.currentTimeMillis()))
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    /**
+     * The retry after a list's first download, which checks only missing lists, fetches a part
+     * that failed then (here one a part includes): the list file is on disk, but the list is not whole without its part (the
+     * retry found nothing missing and stopped).
+     */
+    @Test
+    fun aRetryOfMissingListsFetchesAPartThatFailed() {
+        var partUp = false
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            try {
+                val (code, b) = when {
+                    ex.requestURI.path == "/part.txt" -> 200 to "!#include deep.txt\n||part.test^\n".toByteArray()
+                    ex.requestURI.path == "/deep.txt" && !partUp -> 500 to "no".toByteArray()
+                    ex.requestURI.path == "/deep.txt" -> 200 to "||deep.test^\n".toByteArray()
+                    else -> 200 to "! Title: l\n!#include part.txt\n!#include https://elsewhere.example/x.txt\n||ads.test^\n".toByteArray()
+                }
+                ex.sendResponseHeaders(code, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            } finally {
+                ex.close()
+            }
+        }
+        server.start()
+        val tmp = Files.createTempDirectory("aduster-inc-retry").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("custom-00000001", "With part", "http://127.0.0.1:${server.address.port}/l.txt", false, Group.CUSTOM, true, "")
+            // The list is in the settings, so the store keeps its files between runs.
+            val settings = app.aduster.settings.Settings(userRules = "", customLists = listOf(app.aduster.settings.CustomList(l.id, l.name, l.url)))
+            fun run() = FilterUpdater.updateStore(
+                store = store,
+                readSettings = { settings },
+                check = FilterUpdater.Check.MISSING,
+                webWanted = { false },
+                compileDns = { true },
+                compileWeb = { false },
+                dnsListsOf = { listOf(l) },
+                webListsOf = { emptyList() },
+            )
+            assertEquals(listOf("With part"), run().failed)
+            partUp = true
+            val again = run()
+            assertEquals("the retry checked the list", 1, again.checked)
+            assertEquals(emptyList<String>(), again.failed)
+            assertTrue(java.io.File(store.includes(l.id), "deep.txt").exists())
+            // Whole now (a part on another host is never fetched, so it is not missing).
+            assertEquals(0, run().checked)
         } finally {
             server.stop(0)
             tmp.deleteRecursively()

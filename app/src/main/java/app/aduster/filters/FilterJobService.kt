@@ -302,14 +302,26 @@ object FilterJobs {
     private fun waitingSince(ctx: Context): Long = ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE).getLong("waiting_since", 0L)
 
     /**
-     * Whether "Update now" goes on retrying: for 30 minutes from its first retry (the start is
-     * kept until a run gets through, or gives up).
+     * The retries' start and whether they go on at [now], from [since], the first retry's time
+     * (0: this is the first), both on the boot clock: for 30 minutes, which a wall clock set back
+     * cannot stretch. A start later than now was kept from before a reboot (or is the wall-clock
+     * time an older version kept): the 30 minutes start again.
+     */
+    internal fun retryWindow(since: Long, now: Long): Pair<Long, Boolean> {
+        val start = if (since in 1..now) since else now
+        return start to (now - start <= GIVE_UP_AFTER_MS)
+    }
+
+    /**
+     * Whether "Update now" goes on retrying (see [retryWindow]; the start is kept until a run
+     * gets through, or gives up).
      */
     private fun keepTrying(ctx: Context): Boolean {
         val prefs = ctx.getSharedPreferences(WAIT_PREFS, Context.MODE_PRIVATE)
-        val now = System.currentTimeMillis()
-        val since = waitingSince(ctx).takeIf { it > 0 } ?: now.also { prefs.edit().putLong("waiting_since", it).apply() }
-        if (now - since <= GIVE_UP_AFTER_MS) return true
+        val since = waitingSince(ctx)
+        val (start, keep) = retryWindow(since, android.os.SystemClock.elapsedRealtime())
+        if (start != since) prefs.edit().putLong("waiting_since", start).apply()
+        if (keep) return true
         prefs.edit().remove("waiting_since").apply()
         return false
     }

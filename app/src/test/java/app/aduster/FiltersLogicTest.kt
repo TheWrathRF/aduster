@@ -379,7 +379,7 @@ class FiltersLogicTest {
         assertEquals("Quad9, DNS-over-HTTPS", Upstreams.label("quad9-doh", ""))
         assertEquals("Network default", Upstreams.label("system", ""))
         assertEquals("https://dns.example/q", Upstreams.label("custom", "https://dns.example/q"))
-        assertEquals("Custom", Upstreams.label("custom", ""))
+        assertEquals("Network default (custom address not valid)", Upstreams.label("custom", ""))
     }
 
     @Test
@@ -426,5 +426,15 @@ class FiltersLogicTest {
         assertTrue(lines.none { it.first.contains(dot) })
         assertTrue(browserLines(null, Settings(httpsFiltering = false), pagesAvailable = true, userExcluded = false).none { it.first.contains(dot) })
         assertTrue(browserLines(null, Settings(httpsFiltering = true), pagesAvailable = false, userExcluded = false).none { it.first.contains(dot) })
+    }
+
+    /** A bypass that ends on another day (a media host's 6 h past midnight) names the day, as Diagnostics does. */
+    @Test
+    fun aSiteBypassEndingTomorrowNamesTheDay() {
+        val zone = java.time.ZoneId.systemDefault()
+        val now = java.time.LocalDate.of(2026, 11, 27).atTime(23, 0).atZone(zone).toInstant().toEpochMilli()
+        val media = SiteCheck(decrypted = false, filteringActive = true, reasons = listOf(SiteReason("media", 6 * 3600L, null)))
+        val lines = browserLines(media, Settings(httpsFiltering = true), pagesAvailable = true, userExcluded = false, now = now)
+        assertTrue(lines.toString(), lines.any { "28 Nov 05:00" in it.first })
     }
 }

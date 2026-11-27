@@ -67,6 +67,8 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
@@ -114,6 +116,8 @@ fun LogScreen(vm: MainViewModel) {
     val s by vm.settings.collectAsStateWithLifecycle()
     val labels by vm.labels.collectAsStateWithLifecycle()
     val browsers by vm.browserUids.collectAsStateWithLifecycle()
+    // A browser installed while the app ran belongs in Browsers and Pages from the next look.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshBrowsers() }
     // Kept across tab switches and recreation.
     var query by rememberSaveable { mutableStateOf("") }
     var kind by rememberSaveable { mutableIntStateOf(0) }

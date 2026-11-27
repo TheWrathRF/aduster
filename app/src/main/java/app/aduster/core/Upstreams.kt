@@ -45,7 +45,8 @@ object Upstreams {
         if (preset.json != null) return preset.json
         val c = custom.trim()
         return when {
-            c.startsWith("https://") -> buildJsonObject { put("type", "doh"); put("url", c) }
+            // One the engine could not parse would fall back to the network's DNS there, unsaid.
+            c.startsWith("https://") -> if (validCustom(c)) buildJsonObject { put("type", "doh"); put("url", c) } else SYSTEM.json!!
             c.startsWith("tls://") -> {
                 val (host, port) = dotHostPort(c) ?: return SYSTEM.json!!
                 buildJsonObject { put("type", "dot"); put("host", host); put("port", port) }
@@ -79,16 +80,25 @@ object Upstreams {
     fun validCustom(url: String): Boolean {
         val c = url.trim()
         return when {
-            c.startsWith("https://") -> runCatching { java.net.URI(c).host }.getOrNull()?.isNotEmpty() == true
+            // As the engine reads it: printable ASCII, a host, a port in range, no fragment (Java's
+            // own parser lets through what the engine refuses).
+            c.startsWith("https://") -> c.all { it.code in 0x21..0x7e } && runCatching {
+                val u = java.net.URI(c)
+                !u.host.isNullOrEmpty() && u.rawFragment == null && (u.port == -1 || u.port in 1..65535)
+            }.getOrDefault(false)
             c.startsWith("tls://") -> dotHostPort(c) != null
             else -> false
         }
     }
 
+    /**
+     * The DNS server's row. A custom address the app cannot use is named as what is used
+     * instead (see [json]), never as if it were in use.
+     */
     fun label(id: String, custom: String): String {
         val p = byId(id)
         return when (p.id) {
-            "custom" -> custom.ifBlank { "Custom" }
+            "custom" -> if (json(id, custom) == SYSTEM.json) "${SYSTEM.label} (custom address not valid)" else custom.trim()
             "system" -> p.label
             else -> "${p.label}, ${p.detail.substringBefore(',')}"
         }

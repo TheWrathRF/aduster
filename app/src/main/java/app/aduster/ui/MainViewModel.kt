@@ -26,9 +26,11 @@ import app.aduster.vpn.AdusterVpnService
 import app.aduster.vpn.ProcessExits
 import app.aduster.vpn.Reports
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -72,6 +74,29 @@ data class LogFilterRequest(val query: String = "", val appUid: Int? = null)
 
 /** Log entries fetched per binder call (forward paging). */
 private const val LOG_PAGE = 1000
+
+/**
+ * Settings changes run here, in a scope of the app's process: a screen saves what it holds when
+ * it closes, and closing the app's last screen ends the view model's own scope, which would
+ * cancel that save half-way.
+ */
+internal object Saves {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Done when [block] ran to its end: its answer, or false when it failed. */
+    fun launch(block: suspend () -> Boolean): Deferred<Boolean> {
+        val done = CompletableDeferred<Boolean>()
+        scope.launch {
+            var ok = false
+            try {
+                ok = block()
+            } finally {
+                done.complete(ok)
+            }
+        }
+        return done
+    }
+}
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModel(app: Application) : AndroidViewModel(app) {
@@ -214,23 +239,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             true
         }
 
-    /**
-     * Runs a settings change in the view model's scope (the screen may close meanwhile). Done
-     * when the change ran to its end: true, or false when it could not be saved, so a caller
-     * says "saved" only when it was.
-     */
-    private fun saving(block: suspend () -> Boolean): Deferred<Boolean> {
-        val done = CompletableDeferred<Boolean>()
-        viewModelScope.launch(Dispatchers.IO) {
-            var ok = false
-            try {
-                ok = block()
-            } finally {
-                done.complete(ok)
-            }
-        }
-        return done
-    }
+    /** Runs a settings change to its end, also after this view model is gone (see [Saves]). */
+    private fun saving(block: suspend () -> Boolean): Deferred<Boolean> = Saves.launch(block)
 
     /** Saves a change, or says it could not be saved (a full disk) and returns null. */
     private suspend fun save(transform: (Settings) -> Settings): Settings? =
@@ -595,20 +605,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * user's cosmetic rules and page lists too), and lists the imported settings enable but were
      * never downloaded are fetched. The settings before it are kept for "Undo import".
      */
-    suspend fun applyImport(imported: Settings): Boolean = withContext(Dispatchers.IO) {
+    /** Runs in [Saves]: leaving Settings right after the tap must not cut the import half-way. */
+    suspend fun applyImport(imported: Settings): Boolean = Saves.launch {
         val before = storedSettings()
         runCatching { java.io.File(ctx.filesDir, SettingsBackup.BEFORE_IMPORT).writeText(SettingsBackup.encode(before)) }
         replaceSettings(imported).also { if (it) _undoImport.value = true }
-    }
+    }.await()
 
-    suspend fun undoImport(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun undoImport(): Boolean = Saves.launch {
         val f = java.io.File(ctx.filesDir, SettingsBackup.BEFORE_IMPORT)
-        val prev = runCatching { SettingsBackup.decode(f.readText(), storedSettings())?.settings }.getOrNull() ?: return@withContext false
-        if (!replaceSettings(prev)) return@withContext false
+        val prev = runCatching { SettingsBackup.restore(f.readText()) }.getOrNull() ?: return@launch false
+        if (!replaceSettings(prev)) return@launch false
         f.delete()
         _undoImport.value = false
         true
-    }
+    }.await()
 
     /** False when the settings could not be saved (a full disk): nothing else is done. */
     private suspend fun replaceSettings(next: Settings): Boolean {

@@ -39,6 +39,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -54,10 +55,22 @@ internal enum class PauseAtStart { NONE, STILL_PAUSED, ENDED }
 /**
  * The wall-clock end a timed pause shows ([pausedUntil], read by Home, the tile, the widget and
  * the card), realigned to its boot-clock end ([deadlineBoot], 0 = none) when the wall clock
- * moved: now plus what is left. A pause until Resume, or none, keeps its value.
+ * moved: now plus what is left, or 0 once it is over (a second look at a wall clock set back
+ * meanwhile took "now" for an end still to come). A pause until Resume, or none, keeps its value.
  */
-internal fun realignedPauseEnd(pausedUntil: Long, deadlineBoot: Long, nowWall: Long, nowBoot: Long): Long =
-    if (pausedUntil == 0L || pausedUntil == Long.MAX_VALUE || deadlineBoot <= 0) pausedUntil else nowWall + (deadlineBoot - nowBoot).coerceAtLeast(0)
+internal fun realignedPauseEnd(pausedUntil: Long, deadlineBoot: Long, nowWall: Long, nowBoot: Long): Long = when {
+    pausedUntil == 0L || pausedUntil == Long.MAX_VALUE || deadlineBoot <= 0 -> pausedUntil
+    nowBoot >= deadlineBoot -> 0
+    else -> nowWall + (deadlineBoot - nowBoot)
+}
+
+/**
+ * Whether a timed pause ending at [pausedUntil] has run out: by its boot-clock end when known
+ * ([deadlineBoot] > 0), else by the wall clock. With the same readings, a pause not over always
+ * has an end to show ([realignedPauseEnd] is 0 only once it is over).
+ */
+internal fun pauseOverAt(pausedUntil: Long, deadlineBoot: Long, nowWall: Long, nowBoot: Long): Boolean =
+    if (deadlineBoot > 0) nowBoot >= deadlineBoot else nowWall >= pausedUntil
 
 /**
  * What a start does with the pause saved before it ([over]: a timed pause's end has passed). A
@@ -98,12 +111,31 @@ internal fun <T : Any> planTunnel(wanted: String, running: () -> String?, build:
 }
 
 /**
- * Whether a command that ends with protection off takes the card away: unless protection runs
- * again or a start is queued behind it (that start posted the card it needs). A later command
- * (a second tap on Turn off, the card's re-post, the pause alarm) used to keep the card up under
- * a stopped protection while the app held the service bound.
+ * The boot-clock end of a timed pause that ends at wall time [pausedUntil] (0: no pause, or one
+ * until Resume). A pause read back from the settings is anchored this way at once, as the engine
+ * anchors what is left of it, so a wall clock moved afterwards changes neither its end nor when
+ * it is over.
  */
-internal fun cardGoes(running: Boolean, startsQueued: Int): Boolean = !running && startsQueued == 0
+internal fun pauseDeadline(pausedUntil: Long, nowWall: Long, nowBoot: Long): Long =
+    if (pausedUntil == 0L || pausedUntil == Long.MAX_VALUE) 0 else nowBoot + (pausedUntil - nowWall).coerceAtLeast(0)
+
+/**
+ * Whether a command that ends with protection off takes the card away and ends the service:
+ * unless protection runs again or a start other than the ending command waits ([startsQueued]
+ * counts the start commands not finished; [ownStart]: the ending command is a start that
+ * failed, still among them). A later command (a second tap on Turn off, the card's re-post, the
+ * pause alarm) used to keep the card up under a stopped protection while the app held the
+ * service bound, or end the service under a start still on its way.
+ */
+internal fun serviceEnds(running: Boolean, startsQueued: Int, ownStart: Boolean = false): Boolean =
+    !running && startsQueued - (if (ownStart) 1 else 0) <= 0
+
+/**
+ * Whether a command's answer keeps the service sticky (restarted by Android after its process
+ * ends): while protection runs or a start is on its way. The answer to the latest command is the
+ * one Android keeps.
+ */
+internal fun staysSticky(running: Boolean, startsQueued: Int): Boolean = running || startsQueued > 0
 
 /** A DNS table load's answer: `{"ok":true,...}`; anything else (an unreadable table) failed. */
 internal fun dnsTableLoaded(result: String): Boolean =
@@ -149,8 +181,8 @@ class AdusterVpnService : VpnService() {
             private set
 
         /**
-         * The boot-clock end of a timed pause this process set (0: none, or unknown after a
-         * restart, when the wall-clock [pausedUntil] decides).
+         * The boot-clock end of a timed pause (0: none): set by a pause in this process, or
+         * anchored when the pause is read back from the settings (see [pauseDeadline]).
          */
         @Volatile
         var pauseDeadlineBoot = 0L
@@ -209,21 +241,21 @@ class AdusterVpnService : VpnService() {
     private val serial = Dispatchers.IO.limitedParallelism(1)
     /**
      * A task that fails (an I/O error not handled where it happened) must not end this process,
-     * which would take protection down with it. It is logged. A start that failed half-way
-     * ([starting]) is taken down like any stop nobody asked for (tunnel, engine, card; the user
-     * is told); any other failure leaves protection as it was.
+     * which would take protection down with it. It is logged and protection is left as it was;
+     * a start that fails half-way is taken down by the start itself (see [startProtection]).
      */
     private val failed: kotlinx.coroutines.CoroutineExceptionHandler = kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
         Log.e(TAG, "protection task failed", e)
-        if (starting) {
-            starting = false
-            scope.launch { stopProtection(userInitiated = false, reason = "an internal error (${e.javaClass.simpleName})") }
-        }
     }
-    /** A start is under way: set first in [startProtection], cleared only when it returns. */
-    @Volatile
-    private var starting = false
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + serial + failed)
+
+    /**
+     * Runs [block] on [serial] under [lifecycle]: every task that reads or changes the protection's
+     * state runs whole, one at a time. [serial] alone lets the next task run while one waits on a
+     * write (a stop ran inside a pause's write and the pause then came back; a settings reload
+     * read before a resume brought the pause back after it).
+     */
+    private fun serially(block: suspend () -> Unit) = scope.launch { lifecycle.withLock { block() } }
     /**
      * Disk work a broadcast asks for (the stats written at screen-off, the widget redrawn at
      * screen-on): off the main thread, where a slow disk would hold up every other broadcast and
@@ -245,12 +277,17 @@ class AdusterVpnService : VpnService() {
     /** The newest start id: a stop ends the service only if no command arrived after it. */
     @Volatile
     private var latestStartId = 0
-    /** Start commands received whose start has not finished yet (see [cardGoes]). */
+    /** Start commands received whose start has not finished yet (see [serviceEnds]). */
     private val startsQueued = java.util.concurrent.atomic.AtomicInteger()
     /**
-     * Boot-clock end of a timed pause set in this process: a wall-clock change
-     * neither shortens nor lengthens it. 0 = none known (after a restart the wall time decides).
+     * Starts and stops one at a time: [serial] runs one task at a time but lets the next run
+     * while one waits (a start reading the settings let a stop find protection off, and the
+     * start then turned it on).
      */
+    private val lifecycle = kotlinx.coroutines.sync.Mutex()
+    /** The newest card re-post answered while a start or a stop was on its way (see ACTION_RENOTIFY). */
+    @Volatile
+    private var reposted = 0
     /** Why page filtering is not running (Home's chip): on, off, unavailable, no_browser, ca_untrusted, ca_missing, ca_key_unreadable, ca_mismatch, start_failed. */
     @Volatile
     private var httpsState = "off"
@@ -281,11 +318,11 @@ class AdusterVpnService : VpnService() {
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                ACTION_SETTINGS_CHANGED -> scope.launch { reloadSettings() }
+                ACTION_SETTINGS_CHANGED -> serially { reloadSettings() }
                 ACTION_FILTERS_CHANGED -> {
                     val dns = intent.getBooleanExtra(EXTRA_DNS, true)
                     val web = intent.getBooleanExtra(EXTRA_WEB, true)
-                    scope.launch {
+                    serially {
                         if (initialized) loadFilters(dns, web)
                         // A rebuilt page engine may be the first one (certificate just trusted).
                         if (web && running) reconfigure()
@@ -293,7 +330,7 @@ class AdusterVpnService : VpnService() {
                 }
                 // A user CA was added, removed or disabled: re-check ours (browsers would otherwise
                 // show certificate errors everywhere) and start or stop page filtering to match.
-                KeyChain.ACTION_TRUST_STORE_CHANGED -> scope.launch {
+                KeyChain.ACTION_TRUST_STORE_CHANGED -> serially {
                     caTrusted = null
                     if (running) reconfigure()
                     // Browser lists are built only once the certificate is trusted:
@@ -305,21 +342,21 @@ class AdusterVpnService : VpnService() {
                 }
                 // Browsing leaves freed buffers resident; give them back while the phone idles.
                 Intent.ACTION_SCREEN_OFF -> chores.launch { NativeCore.nativeScreenOff() }
-                Intent.ACTION_TIMEZONE_CHANGED -> scope.launch { if (engineReady) initEngine() }
+                Intent.ACTION_TIMEZONE_CHANGED -> serially { if (engineReady) initEngine() }
                 // The wall clock was set: a timed pause keeps its boot-clock end. One that is over
                 // ends now (the end-of-pause alarm, on the wall clock, would come late); one that
                 // runs gets its shown end and its alarm moved.
-                Intent.ACTION_TIME_CHANGED -> if (running && pausedUntil != 0L && pausedUntil != Long.MAX_VALUE) scope.launch { resume(auto = true) }
+                Intent.ACTION_TIME_CHANGED -> if (running && pausedUntil != 0L && pausedUntil != Long.MAX_VALUE) serially { resume(auto = true) }
                 // The widget refreshes only when someone can actually see it. The trust-store
                 // broadcast is the main signal; a rare, cheap alias check here is the safety net.
                 Intent.ACTION_SCREEN_ON -> {
                     // A timed pause that ran out while the screen was off: the engine already
                     // filters again (it compares times), the card and the timeline catch up now
                     // instead of when the inexact alarm runs. No new wakeup.
-                    if (running && pausedUntil != 0L && pausedUntil != Long.MAX_VALUE && pauseOver()) scope.launch { resume(auto = true) }
+                    if (running && pausedUntil != 0L && pausedUntil != Long.MAX_VALUE && pauseOver()) serially { resume(auto = true) }
                     // "Today" (stats, widget) is the local day: a new UTC offset (summer time
                     // starts or ends without a time-zone broadcast) reaches the engine first.
-                    if (engineReady && TimeZone.getDefault().getOffset(System.currentTimeMillis()) != tzOffset) scope.launch { initEngine() }
+                    if (engineReady && TimeZone.getDefault().getOffset(System.currentTimeMillis()) != tzOffset) serially { initEngine() }
                     chores.launch { StatsWidget.update(context) }
                     // The card can vanish while the protection runs on: Xiaomi's Android build
                     // removes an app's notifications when it cleans its other (UI) process in the
@@ -327,7 +364,7 @@ class AdusterVpnService : VpnService() {
                     // the screen puts it back or renews it (no timer, no wakeup).
                     if (running) ensureProtectionNotification()
                     if (settings.httpsFiltering && running && SystemClock.elapsedRealtime() - caCheckedAt > CERT_RECHECK_MS) {
-                        scope.launch {
+                        serially {
                             caCheckedAt = SystemClock.elapsedRealtime()
                             if (CaManager.stillInstalled(this@AdusterVpnService) != caTrusted?.second) {
                                 caTrusted = null
@@ -415,11 +452,11 @@ class AdusterVpnService : VpnService() {
         // The DNS thread exited on its own (see NativeCore.onEngineExit).
         NativeCore.engineExitListener = {
             // The DNS thread died (TUN error): without it no app can resolve names. Rebuild.
-            scope.launch {
-                if (!running) return@launch
+            serially {
+                if (!running) return@serially
                 // Revoked (the user, or another VPN took the slot): the engine ended because its
                 // tunnel did. onRevoke stops protection; a rebuild here would race it.
-                if (prepare(this@AdusterVpnService) != null) return@launch
+                if (prepare(this@AdusterVpnService) != null) return@serially
                 // A rebuild re-establishes the tunnel (AOSP keeps the same VPN network unless the
                 // allowed/excluded apps change, but every app's DNS is interrupted): an engine
                 // that keeps failing must not loop. The window slides, so a
@@ -429,13 +466,13 @@ class AdusterVpnService : VpnService() {
                 if (engineRebuilds.size >= ENGINE_REBUILDS_MAX) {
                     Log.w(TAG, "DNS engine exited ${engineRebuilds.size + 1} times within a minute; stopping")
                     stopProtection(userInitiated = false, reason = "the DNS engine kept stopping")
-                    return@launch
+                    return@serially
                 }
                 engineRebuilds.addLast(now)
                 Log.w(TAG, "DNS engine exited; rebuilding the tunnel")
                 tunSignature = null
                 reconfigure()
-                if (!running) return@launch
+                if (!running) return@serially
                 if (!NativeCore.nativeIsRunning()) {
                     stopProtection(userInitiated = false, reason = "the DNS engine stopped and could not be restarted")
                 } else {
@@ -444,13 +481,13 @@ class AdusterVpnService : VpnService() {
             }
         }
         // Only the cheap part here: a UI bind while protection is off must not load the lists.
-        scope.launch { prepareEngine() }
+        serially { prepareEngine() }
     }
 
     private val packages = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.data?.schemeSpecificPart == null) return
-            scope.launch {
+            serially {
                 val before = HttpsConfig.browsers(this@AdusterVpnService).map { it.uid }
                 HttpsConfig.forgetBrowsers()
                 val after = HttpsConfig.browsers(this@AdusterVpnService).map { it.uid }
@@ -471,13 +508,24 @@ class AdusterVpnService : VpnService() {
         latestStartId = startId
         when (intent?.action) {
             ACTION_STOP -> {
-                scope.launch {
+                // After a start on its way (one waiting on the settings let this run first, found
+                // protection off and was then undone by the start).
+                serially {
                     if (running) {
                         stopProtection(userInitiated = true, reason = "turned off in the app", startId = startId)
                     } else {
                         // Nothing runs: no "stopped" entry, no core start-up just to stop; only
-                        // the wish to stay off is kept.
+                        // the wish to stay off is kept (the settings are read first: a fresh
+                        // process knew none yet), and a pause it ends goes from memory and the
+                        // engine too (a start later in this process found it again).
+                        prepareEngine()
                         if (settings.enabled || settings.pausedUntil != 0L) settings = store.updateOrKeep(settings) { it.copy(enabled = false, pausedUntil = 0) }
+                        if (pausedUntil != 0L) {
+                            pausedUntil = 0
+                            pauseDeadlineBoot = 0
+                            scheduleResume(0)
+                            initEngine()
+                        }
                         withContext(Dispatchers.Main) { endStopped(startId) }
                     }
                 }
@@ -486,9 +534,13 @@ class AdusterVpnService : VpnService() {
             // The card was swiped away (Android 14+ lets users dismiss even a foreground service's
             // card): it comes straight back while protection runs; the service is the only way to
             // pause or turn it off from outside the app, so the card must stay.
+            // A start on its way keeps its card too (ended here, the service went under it).
             ACTION_RENOTIFY -> {
-                if (running) {
+                if (staysSticky(running, startsQueued.get())) {
                     showProtectionNotification()
+                    // This command does not end itself: a stop or failed start after it ends the
+                    // service by its id (theirs alone, older, would leave it started and sticky).
+                    reposted = startId
                     return START_STICKY
                 }
                 endStopped(startId)
@@ -498,9 +550,11 @@ class AdusterVpnService : VpnService() {
             // not running (stopped meanwhile, or the process was gone), the service started just
             // for them ends again: as a sticky service it would be restarted later and switch
             // protection on by itself.
+            // Sticky while protection runs or a start is on its way; a sticky restart after a
+            // stop meanwhile checks the setting before it starts anything.
             ACTION_PAUSE, ACTION_RESUME -> {
-                val wasRunning = running
-                scope.launch {
+                val sticky = staysSticky(running, startsQueued.get())
+                serially {
                     if (intent.action == ACTION_PAUSE) {
                         if (running) pause(intent.getIntExtra(EXTRA_MINUTES, 0))
                     } else {
@@ -508,7 +562,7 @@ class AdusterVpnService : VpnService() {
                     }
                     if (!running) withContext(Dispatchers.Main) { endStopped(startId) }
                 }
-                return if (wasRunning) START_STICKY else START_NOT_STICKY
+                return if (sticky) START_STICKY else START_NOT_STICKY
             }
             else -> {
                 // ACTION_START, Always-on VPN (SERVICE_INTERFACE) or a sticky restart (null intent).
@@ -531,7 +585,7 @@ class AdusterVpnService : VpnService() {
                 startsQueued.incrementAndGet()
                 scope.launch {
                     try {
-                        startProtection(from)
+                        lifecycle.withLock { startProtection(from, startId, restart = intent == null) }
                     } finally {
                         startsQueued.decrementAndGet()
                     }
@@ -544,7 +598,7 @@ class AdusterVpnService : VpnService() {
     override fun onRevoke() {
         // The user switched us off in system settings, or another VPN took the slot.
         val id = latestStartId
-        scope.launch {
+        serially {
             stopProtection(userInitiated = true, reason = "turned off in system settings, or another VPN took over", startId = id)
             Notifications.showRevoked(this@AdusterVpnService)
         }
@@ -555,7 +609,10 @@ class AdusterVpnService : VpnService() {
         unregisterReceiver(receiver)
         unregisterReceiver(packages)
         monitor?.stop()
-        if (running) NativeCore.nativeStop()
+        // Also what a start cut short by the end of the service had brought up before it counted
+        // as running (the proxy first): nothing else stops it in this process.
+        // (Stopping the engine stops the proxy too.)
+        if (running || NativeCore.nativeIsRunning()) NativeCore.nativeStop() else NativeCore.nativeProxyStop()
         running = false
         NativeCore.nativePersist()
         scope.cancel()
@@ -568,7 +625,10 @@ class AdusterVpnService : VpnService() {
     private suspend fun prepareEngine() {
         if (engineReady) return
         settings = store.data.first()
+        // A timed pause that outlived the last process is anchored to the boot clock now, with
+        // the same rest the engine is given (see [pauseDeadline]).
         pausedUntil = settings.pausedUntil
+        pauseDeadlineBoot = pauseDeadline(pausedUntil, System.currentTimeMillis(), SystemClock.elapsedRealtime())
         initEngine()
         engineReady = true
         // This process starts: if the last one ended while protecting, the timeline says so now
@@ -699,8 +759,7 @@ class AdusterVpnService : VpnService() {
     }
 
     /** A timed pause has run out (by the boot clock when this process set it). */
-    private fun pauseOver(): Boolean =
-        if (pauseDeadlineBoot > 0) SystemClock.elapsedRealtime() >= pauseDeadlineBoot else System.currentTimeMillis() >= pausedUntil
+    private fun pauseOver(): Boolean = pauseOverAt(pausedUntil, pauseDeadlineBoot, System.currentTimeMillis(), SystemClock.elapsedRealtime())
 
     /** (Re)configures the engine from [settings]; remembers the UTC offset "today" was based on. */
     private fun initEngine() {
@@ -758,14 +817,32 @@ class AdusterVpnService : VpnService() {
         if (!shown || SystemClock.elapsedRealtime() - cardBornAt >= CARD_RENEW_MS) postCard(foreground = false)
     }
 
-    /** [from]: who started it, for the timeline. A failure on the way is [failed]'s to clean up. */
-    private suspend fun startProtection(from: String) {
-        starting = true
-        startSteps(from)
-        starting = false
+    /**
+     * [from]: who started it, for the timeline; [startId]: its command; [restart]: Android
+     * restarted the sticky service (no command). A failure on the way (an I/O error not handled
+     * where it happened) is taken down here like any stop nobody asked for (tunnel, engine, card;
+     * the user is told), still in this start's turn: cleaned up later, it could stop a start that
+     * came after it.
+     */
+    private suspend fun startProtection(from: String, startId: Int, restart: Boolean) {
+        try {
+            startSteps(from, startId, restart)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "protection start failed", e)
+            stopProtection(userInitiated = false, reason = "an internal error (${e.javaClass.simpleName})", startId = startId, ownStart = true)
+        }
     }
 
-    private suspend fun startSteps(from: String) {
+    private suspend fun startSteps(from: String, startId: Int, restart: Boolean) {
+        prepareEngine()
+        if (restart && !running && !settings.enabled) {
+            // Restarted after the user turned protection off (a command answered "sticky" just
+            // before the stop): nothing starts and no list is loaded; the card and the service go.
+            withContext(Dispatchers.Main) { endStopped(startId, ownStart = true) }
+            return
+        }
         initialize()
         if (running) {
             reconfigure()
@@ -773,14 +850,14 @@ class AdusterVpnService : VpnService() {
         }
         if (prepare(this) != null) {
             // VPN consent is missing (never given, or revoked): the UI has to ask again.
-            stopProtection(userInitiated = false, reason = "the VPN permission is missing", notify = false)
+            stopProtection(userInitiated = false, reason = "the VPN permission is missing", notify = false, startId = startId, ownStart = true)
             Notifications.showRevoked(this)
             return
         }
         if (!intact) {
             // Trying again cannot help: the notification does not offer it, and Home says why.
             val reason = "this copy of Aduster was modified; install it from its official release"
-            stopProtection(userInitiated = false, reason = reason, notify = false)
+            stopProtection(userInitiated = false, reason = reason, notify = false, startId = startId, ownStart = true)
             Notifications.showStopped(this, reason, retry = false)
             return
         }
@@ -790,7 +867,7 @@ class AdusterVpnService : VpnService() {
         proxyPort = startProxy(settings)
         val tun = buildTun(settings)
         if (tun == null || !startEngine(tun)) {
-            stopProtection(userInitiated = false, reason = "the tunnel could not be set up")
+            stopProtection(userInitiated = false, reason = "the tunnel could not be set up", startId = startId, ownStart = true)
             return
         }
         running = true
@@ -799,12 +876,24 @@ class AdusterVpnService : VpnService() {
         // A pause that outlived a stop (an app update, a process end) opens again in the
         // timeline, so its Resume has a pause to close; one that ran out meanwhile is simply
         // over.
-        when (pauseAtStart(pausedUntil, pauseOver())) {
-            PauseAtStart.STILL_PAUSED -> Timeline.add(this, Timeline.PAUSED, "still paused")
+        // Both clocks read once: a pause that ends between two readings must not be "still
+        // paused" with no end to show.
+        val (nowWall, nowBoot) = System.currentTimeMillis() to SystemClock.elapsedRealtime()
+        when (pauseAtStart(pausedUntil, pauseOverAt(pausedUntil, pauseDeadlineBoot, nowWall, nowBoot))) {
+            PauseAtStart.STILL_PAUSED -> {
+                Timeline.add(this, Timeline.PAUSED, "still paused")
+                // A wall clock moved while protection was off: the end every screen shows
+                // (Home and Diagnostics read the saved one) follows the boot-clock end.
+                val end = realignedPauseEnd(pausedUntil, pauseDeadlineBoot, nowWall, nowBoot)
+                if (end != pausedUntil) {
+                    settings = store.updateOrKeep(settings) { it.copy(pausedUntil = end) }
+                    pausedUntil = end
+                }
+            }
             PauseAtStart.ENDED -> {
-                pauseDeadlineBoot = 0
                 settings = store.updateOrKeep(settings) { it.copy(pausedUntil = 0) }
                 pausedUntil = 0
+                pauseDeadlineBoot = 0
                 initEngine()
             }
             PauseAtStart.NONE -> {}
@@ -815,9 +904,12 @@ class AdusterVpnService : VpnService() {
         // paused included (a restart during a pause keeps it). Alarms do not survive a reboot:
         // a timed pause gets its end-of-pause alarm again.
         showProtectionNotification()
-        scheduleResume(pausedUntil)
+        scheduleResume(pauseDeadlineBoot)
         if (!settings.enabled) settings = store.updateOrKeep(settings) { it.copy(enabled = true) }
         refreshSurfaces()
+        // A pause that ran out during the writes above has no alarm left (it was past when set):
+        // it ends now.
+        if (pausedUntil != 0L && pausedUntil != Long.MAX_VALUE && pauseOver()) resume(auto = true)
     }
 
     /**
@@ -837,9 +929,11 @@ class AdusterVpnService : VpnService() {
 
     /**
      * [reason] goes to the timeline; a stop nobody asked for is also announced ([notify]):
-     * otherwise protection could be off for hours without anyone noticing.
+     * otherwise protection could be off for hours without anyone noticing. [startId]: the
+     * command that stops (a stop without one, such as a failed rebuild, passes the newest);
+     * [ownStart]: it is a start that failed (see [serviceEnds]).
      */
-    private suspend fun stopProtection(userInitiated: Boolean, reason: String, notify: Boolean = true, startId: Int = latestStartId) {
+    private suspend fun stopProtection(userInitiated: Boolean, reason: String, notify: Boolean = true, startId: Int = latestStartId, ownStart: Boolean = false) {
         // A pause ended by turning off is closed in the timeline first. Only turning off ends a
         // pause: after any other stop it goes on when protection starts again.
         if (running && pausedUntil != 0L && userInitiated) Timeline.add(this, Timeline.RESUMED, "turned off", code = "off")
@@ -864,17 +958,20 @@ class AdusterVpnService : VpnService() {
         scheduleResume(0)
         refreshSurfaces()
         withContext(Dispatchers.Main) {
-            // Only if no command came after the one that stopped: a "Turn on" right after
-            // "Turn off" is queued behind this stop and must find the service alive.
-            if (stopSelfResult(startId) || cardGoes(running, startsQueued.get())) stopForeground(STOP_FOREGROUND_REMOVE)
+            // Not while a "Turn on" waits behind this stop: it must find the service alive and
+            // its card up. The newest id ([startId] by default) may be that start's own.
+            if (serviceEnds(running, startsQueued.get(), ownStart)) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelfResult(maxOf(startId, reposted))
+            }
         }
     }
 
-    /** Ends command [startId], which found protection off: its card goes too (see [cardGoes]). Main thread. */
-    private fun endStopped(startId: Int) {
-        if (running) return
-        if (cardGoes(running, startsQueued.get())) stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf(startId)
+    /** Ends command [startId], which found protection off, with its card (see [serviceEnds]). Main thread. */
+    private fun endStopped(startId: Int, ownStart: Boolean = false) {
+        if (!serviceEnds(running, startsQueued.get(), ownStart)) return
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf(maxOf(startId, reposted))
     }
 
     /** The timeline's machine code for a stop (Diagnostics tests codes, not texts). */
@@ -888,8 +985,7 @@ class AdusterVpnService : VpnService() {
     /** Pauses for [minutes], or until Resume when 0. */
     private suspend fun pause(minutes: Int) {
         Timeline.add(this, Timeline.PAUSED, if (minutes > 0) "for $minutes min" else "until you resume")
-        pauseDeadlineBoot = if (minutes > 0) SystemClock.elapsedRealtime() + minutes * 60_000L else 0
-        setPause(if (minutes > 0) System.currentTimeMillis() + minutes * 60_000L else Long.MAX_VALUE)
+        if (minutes > 0) setPause(System.currentTimeMillis() + minutes * 60_000L, SystemClock.elapsedRealtime() + minutes * 60_000L) else setPause(Long.MAX_VALUE, 0)
     }
 
     /** [auto]: the end-of-pause alarm or a screen-on after it ran out, not the user. */
@@ -901,28 +997,36 @@ class AdusterVpnService : VpnService() {
         // Both clocks read once: a pause that ends between two readings must not be realigned to
         // "now" (an alarm at once, cancelled as past) instead of resumed.
         val (nowWall, nowBoot) = System.currentTimeMillis() to SystemClock.elapsedRealtime()
-        val over = if (pauseDeadlineBoot > 0) nowBoot >= pauseDeadlineBoot else nowWall >= pausedUntil
+        val over = pauseOverAt(pausedUntil, pauseDeadlineBoot, nowWall, nowBoot)
         if (auto && (pausedUntil == 0L || !over)) {
             val end = realignedPauseEnd(pausedUntil, pauseDeadlineBoot, nowWall, nowBoot)
             if (end != pausedUntil) {
+                // The alarm is on the boot clock: only the shown end moves.
                 settings = store.updateOrKeep(settings) { it.copy(pausedUntil = end) }
                 pausedUntil = end
-                scheduleResume(end)
                 if (running) showProtectionNotification()
                 refreshSurfaces()
             }
             return
         }
         if (pausedUntil != 0L) Timeline.add(this, Timeline.RESUMED, if (auto) "the pause ran out" else "by you")
-        pauseDeadlineBoot = 0
-        setPause(0)
+        setPause(0, 0)
     }
 
-    private suspend fun setPause(until: Long) {
+    /**
+     * [until]: the shown end (0: none, [Long.MAX_VALUE]: until Resume); [deadlineBoot]: a timed
+     * pause's boot-clock end. Both change together once the write is done: the card, tile and
+     * widget never see a new boot end with an old shown end (an old end on a wall clock set back
+     * read as paused again for a moment), and a settings reload during the write finds the
+     * stored end equal to the one in memory (set before the write, the old stored end read as
+     * another process's change and cleared the pause).
+     */
+    private suspend fun setPause(until: Long, deadlineBoot: Long) {
         settings = store.updateOrKeep(settings) { it.copy(pausedUntil = until) }
         pausedUntil = until
+        pauseDeadlineBoot = deadlineBoot
         initEngine()
-        scheduleResume(until)
+        scheduleResume(deadlineBoot)
         if (running) showProtectionNotification()
         refreshSurfaces()
     }
@@ -932,23 +1036,29 @@ class AdusterVpnService : VpnService() {
      * the timeline must say when it ended, and browser connections opened during it are closed
      * (the engine refilters when a pause ends). For a timed pause one alarm at its end does
      * that (a pause until Resume has none); it is not a wake-up alarm: if the phone sleeps then,
-     * it runs at the next wake, and a screen-on catches up even earlier.
+     * it runs at the next wake, and a screen-on catches up even earlier. It is set on the boot
+     * clock ([deadlineBoot]; 0 cancels it), as the engine's deadline is, so a wall clock moved
+     * meanwhile cannot make it come early or late.
      * The window keeps it within a minute of the end instead of the inexact batching of `set`.
      */
-    private fun scheduleResume(until: Long) {
+    private fun scheduleResume(deadlineBoot: Long) {
         val am = getSystemService(android.app.AlarmManager::class.java)
         val pi = PendingIntent.getService(
             this, 6, Intent(this, AdusterVpnService::class.java).setAction(ACTION_RESUME).putExtra(EXTRA_AUTO, true),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        if (until > System.currentTimeMillis() && until != Long.MAX_VALUE) am.setWindow(android.app.AlarmManager.RTC, until, 60_000L, pi) else am.cancel(pi)
+        if (deadlineBoot > SystemClock.elapsedRealtime()) am.setWindow(android.app.AlarmManager.ELAPSED_REALTIME, deadlineBoot, 60_000L, pi) else am.cancel(pi)
     }
 
     private suspend fun reloadSettings() {
         val old = settings
         settings = store.data.first()
-        if (settings.pausedUntil != pausedUntil) pauseDeadlineBoot = 0
-        pausedUntil = settings.pausedUntil
+        if (settings.pausedUntil != pausedUntil) {
+            // A pause written by another process: anchored to the boot clock as it is read.
+            pausedUntil = settings.pausedUntil
+            pauseDeadlineBoot = pauseDeadline(pausedUntil, System.currentTimeMillis(), SystemClock.elapsedRealtime())
+            if (running) scheduleResume(pauseDeadlineBoot)
+        }
         if (!engineReady) return
         initEngine()
         // The user may just have installed the certificate: a cached "not trusted" is checked

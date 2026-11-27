@@ -49,7 +49,10 @@ object SettingsBackup {
      * (a bare settings object) are accepted only if they set something away from the defaults
      * and carry none of a report's fields. [appName]: an excluded app's name from its package.
      */
-    fun read(text: String, current: Settings, pages: Boolean = true, appName: (String) -> String = { it }): Read {
+    fun read(text: String, current: Settings, pages: Boolean = true, appName: (String) -> String = { it }): Read = read(text, current, pages, appName, checked = true)
+
+    /** [checked]: leave out what the app's dialogs would refuse (an import; not the settings an undo puts back). */
+    private fun read(text: String, current: Settings, pages: Boolean, appName: (String) -> String, checked: Boolean): Read {
         val o = runCatching { SettingsJson.parseToJsonElement(text) as? JsonObject }.getOrNull() ?: return Read.NotSettings
         val format = o["format"]
         val inner: JsonObject = when {
@@ -62,9 +65,22 @@ object SettingsBackup {
             o.keys.any { it in REPORT_KEYS } -> return Read.NotSettings
             else -> o
         }
-        val s = runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), inner) }.getOrNull()?.sanitized() ?: return Read.NotSettings
-        if (format == null && s.copy(enabled = false, pausedUntil = 0) == Settings()) return Read.NotSettings
-        return Read.Ok(Preview(s, summary(current, s, pages, appName)))
+        val decoded = runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), inner) }.getOrNull()?.sanitized() ?: return Read.NotSettings
+        if (format == null && decoded.copy(enabled = false, pausedUntil = 0) == Settings()) return Read.NotSettings
+        if (!checked) return Read.Ok(Preview(decoded, emptyList()))
+        // What the app's own dialogs would refuse is not taken, and the preview says so.
+        val notes = mutableListOf<String>()
+        var s = decoded
+        val lists = s.customLists.filter { it.addable() }
+        if (lists.size != s.customLists.size) {
+            notes += "${app.aduster.ui.counted(s.customLists.size - lists.size, "custom list")} left out: a list needs an https address and a name"
+            s = s.copy(customLists = lists)
+        }
+        if (s.upstream == "custom" && !app.aduster.core.Upstreams.validCustom(s.customUpstream)) {
+            notes += "DNS server: kept, the file's custom address is not valid"
+            s = s.copy(upstream = current.upstream, customUpstream = current.customUpstream)
+        }
+        return Read.Ok(Preview(s, summary(current, s, pages, appName) + notes))
     }
 
     fun encode(s: Settings): String = buildJsonObject {
@@ -72,6 +88,12 @@ object SettingsBackup {
         put("version", VERSION)
         put("settings", SettingsJson.encodeToJsonElement(Settings.serializer(), s))
     }.toString()
+
+    /**
+     * The settings saved before the last import, for "Undo import": as they were, with nothing
+     * left out (a list or DNS address an import would refuse was the user's own).
+     */
+    fun restore(text: String): Settings? = (read(text, Settings(), pages = true, appName = { it }, checked = false) as? Read.Ok)?.preview?.settings
 
     /** [text] as settings, or null when it is not settings this app can import (see [read]). */
     fun decode(text: String, current: Settings, pages: Boolean = true, appName: (String) -> String = { it }): Preview? =

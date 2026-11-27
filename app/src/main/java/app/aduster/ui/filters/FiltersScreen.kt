@@ -86,8 +86,8 @@ import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ToggleRow
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.counted
+import app.aduster.ui.endTime
 import app.aduster.ui.fmt
-import app.aduster.ui.hm
 import app.aduster.ui.log.listLabel
 import app.aduster.ui.theme.AdIcons
 import app.aduster.ui.theme.LocalPalette
@@ -191,7 +191,7 @@ internal fun browserLines(
     if (!s.httpsFiltering) return listOf("Pages: page filtering is off" to false)
     if (c == null) return listOf("Pages: page filtering is not running" to true)
     val out = ArrayList<Pair<String, Boolean>>()
-    fun until(sec: Long?) = sec?.let { hm(now + it * 1000) } ?: "?"
+    fun until(sec: Long?) = sec?.let { endTime(now + it * 1000, now) } ?: "?"
     if (!c.filteringActive) out += "Pages: paused" to true
     for (r in c.reasons) {
         out += when (r.kind) {

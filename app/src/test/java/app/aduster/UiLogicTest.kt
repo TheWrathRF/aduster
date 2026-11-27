@@ -1,6 +1,7 @@
 package app.aduster
 
 import androidx.compose.ui.unit.dp
+import app.aduster.core.Upstreams
 import app.aduster.filters.UserRules
 import app.aduster.settings.Settings
 import app.aduster.settings.SettingsBackup
@@ -34,6 +35,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /** The pure logic behind the screens, no Android runtime needed. */
 class UiLogicTest {
@@ -689,17 +692,90 @@ class UiLogicTest {
         assertEquals("0", until(Settings(), 0))
     }
 
-    /** An imported custom list must be one the add dialog accepts: an https address and a name. */
+    /**
+     * An imported custom list must be one the add dialog accepts: an https address (in any case)
+     * and a name; the preview says how many were left out. Lists already stored are kept as
+     * they are: dropped on every read, they were deleted with their files by the next save.
+     */
     @Test
     fun importedListsNeedAnHttpsAddressAndAName() {
         val good = app.aduster.settings.CustomList("custom-0000000a", "Mine", "https://lists.example/a.txt")
+        val upper = app.aduster.settings.CustomList("custom-0000000e", "Upper", "HTTPS://lists.example/e.txt")
         val lists = listOf(
             good,
             app.aduster.settings.CustomList("custom-0000000b", "Plain", "http://lists.example/b.txt"),
             app.aduster.settings.CustomList("custom-0000000c", "File", "file:///sdcard/c.txt"),
             app.aduster.settings.CustomList("custom-0000000d", " ", "https://lists.example/d.txt"),
+            upper,
         )
-        assertEquals(listOf(good), Settings(customLists = lists).sanitized().customLists)
+        assertEquals(lists, Settings(customLists = lists).sanitized().customLists)
+        val file = SettingsBackup.encode(Settings(customLists = lists))
+        val read = SettingsBackup.read(file, Settings()) as SettingsBackup.Read.Ok
+        assertEquals(listOf(good, upper), read.preview.settings.customLists)
+        assertTrue(read.preview.summary.toString(), read.preview.summary.any { it.startsWith("3 custom lists left out") })
+    }
+
+    /**
+     * "Undo import" puts back the settings as they were, lists and a DNS address an import would
+     * leave out included: run through the import's checks, it dropped them.
+     */
+    @Test
+    fun undoingAnImportRestoresTheSettingsAsTheyWere() {
+        val old = app.aduster.settings.CustomList("custom-0000000b", "Plain", "http://lists.example/b.txt")
+        val before = Settings(customLists = listOf(old), upstream = "custom", customUpstream = "tls://bad host.example")
+        val restored = SettingsBackup.restore(SettingsBackup.encode(before))
+        assertEquals(listOf(old), restored?.customLists)
+        assertEquals("custom", restored?.upstream)
+        assertEquals("tls://bad host.example", restored?.customUpstream)
+    }
+
+    /**
+     * A save runs to its end after the scope that asked for it is gone: a screen saves what it
+     * holds as it closes, and closing the app's last screen cancels the view model's scope.
+     */
+    @Test
+    fun aSaveOutlivesTheScopeThatAskedForIt() {
+        val caller = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Job())
+        val started = java.util.concurrent.CountDownLatch(1)
+        var saved = false
+        lateinit var done: kotlinx.coroutines.Deferred<Boolean>
+        caller.launch {
+            done = app.aduster.ui.Saves.launch {
+                started.countDown()
+                kotlinx.coroutines.delay(200)
+                saved = true
+                true
+            }
+        }
+        assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        caller.cancel()
+        assertTrue(kotlinx.coroutines.runBlocking { kotlinx.coroutines.withTimeout(5_000) { done.await() } })
+        assertTrue(saved)
+    }
+
+    /**
+     * A custom DNS address the app cannot use falls back to the network's DNS: the DNS server's
+     * row says so instead of showing the address as if it were in use, and an import keeps the
+     * current DNS server instead of taking it.
+     */
+    @Test
+    fun anUnusableCustomDnsAddressIsShownAndNotImported() {
+        val bad = "tls://bad host.example"
+        assertEquals(Upstreams.SYSTEM.json, Upstreams.json("custom", bad))
+        assertEquals("Network default (custom address not valid)", Upstreams.label("custom", bad))
+        assertEquals("Network default (custom address not valid)", Upstreams.label("custom", ""))
+        assertEquals("tls://dns.example", Upstreams.label("custom", "tls://dns.example"))
+        // A DoH address the engine cannot parse falls back too, and says so.
+        for (doh in listOf("https://bad host.example/dns-query", "https://", "https://dns.example/dns-query#frag", "https://dns.example:99999/dns-query", "https://dñs.example/dns-query")) {
+            assertEquals(doh, Upstreams.SYSTEM.json, Upstreams.json("custom", doh))
+            assertEquals(doh, "Network default (custom address not valid)", Upstreams.label("custom", doh))
+        }
+        assertEquals("https://dns.example/q", Upstreams.label("custom", "https://dns.example/q"))
+        val current = Settings(upstream = "quad9-doh")
+        val file = SettingsBackup.encode(Settings(upstream = "custom", customUpstream = bad))
+        val read = SettingsBackup.read(file, current) as SettingsBackup.Read.Ok
+        assertEquals("quad9-doh", read.preview.settings.upstream)
+        assertTrue(read.preview.summary.toString(), read.preview.summary.any { it.startsWith("DNS server: kept") })
     }
 
     /** An import file is read up to 2 MiB; a larger one is not a settings file and is not read whole into memory. */

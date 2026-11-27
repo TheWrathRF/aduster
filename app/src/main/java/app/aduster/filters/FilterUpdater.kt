@@ -149,12 +149,40 @@ object FilterUpdater {
     }
 
     /**
-     * Not on disk, or downloaded from a URL the catalog no longer uses. Aduster's own lists come
-     * with the app (copied out when the page engine is compiled); a bundled list's first-run copy
-     * counts as there.
+     * Not on disk, downloaded from a URL the catalog no longer uses, or without a part it pulls
+     * in with `!#include` (its first download failed: the list is not whole). Aduster's own lists
+     * come with the app (copied out when the page engine is compiled); a bundled list's first-run
+     * copy counts as there.
      */
     private fun isMissing(l: FilterList, meta: FilterMeta, store: FilterStore): Boolean =
-        l.asset == null && (!store.raw(l.id).exists() || (!l.bundled && meta.lists[l.id]?.url.let { it != null && it != l.url }))
+        l.asset == null && (!store.raw(l.id).exists() || (!l.bundled && meta.lists[l.id]?.url.let { it != null && it != l.url }) || partMissing(l, meta, store))
+
+    /**
+     * A part [l] pulls in, or a part of a part (as deep as [fetchParts] goes), that would be
+     * downloaded (same host) but is not on disk.
+     */
+    private fun partMissing(l: FilterList, meta: FilterMeta, store: FilterStore): Boolean {
+        val m = meta.lists[l.id] ?: return false
+        var level = m.scan?.includes.orEmpty()
+        if (level.isEmpty()) return false
+        val base = runCatching { URL(l.url) }.getOrNull() ?: return false
+        val dir = store.includes(l.id)
+        val seen = HashSet<String>()
+        var depth = 0
+        while (level.isNotEmpty() && depth < MAX_INCLUDE_DEPTH) {
+            val next = mutableListOf<String>()
+            for (name in level) {
+                if (!seen.add(name) || runCatching { URL(base, name) }.getOrNull()?.host != base.host) continue
+                val file = File(dir, name)
+                if (!file.exists()) return true
+                // A part kept without its scan (a failed download of a part stored before) is read.
+                next += (m.parts[name]?.scan ?: scanOf(file, null)).includes
+            }
+            level = next
+            depth++
+        }
+        return false
+    }
 
     /** Whether list [l] is downloaded by an update that checks [check]. */
     internal fun due(l: FilterList, meta: FilterMeta, store: FilterStore, check: Check, now: Long): Boolean {

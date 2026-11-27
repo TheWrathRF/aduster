@@ -50,6 +50,28 @@ class CaManagerTest {
     }
 
     /**
+     * A move that fails is an error unless the file there already holds the new bytes (a copy
+     * that won the race): the old version's file left in place is not taken for the new one.
+     */
+    @Test
+    fun aFailedMoveOverAnOldFileIsAnError() {
+        val dir = java.nio.file.Files.createTempDirectory("copy-fail").toFile()
+        try {
+            val f = java.io.File(dir, "res.json")
+            f.writeText("old")
+            val refuse = { _: java.nio.file.Path, _: java.nio.file.Path -> throw java.io.IOException("refused") }
+            val thrown = runCatching { app.aduster.filters.FilterStore.copyWhole({ "new".byteInputStream() }, f, refuse) }.exceptionOrNull()
+            assertTrue("an old file kept silently", thrown is java.io.IOException)
+            assertEquals("old", f.readText())
+            f.writeText("new")
+            app.aduster.filters.FilterStore.copyWhole({ "new".byteInputStream() }, f, refuse)
+            assertEquals(listOf("res.json"), dir.list()!!.toList())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    /**
      * A remembered "trusted" holds for the certificate it was read for: a new certificate (made
      * after the old key became unreadable, not installed yet) is looked up in the store again,
      * so page filtering never starts with a certificate the browsers do not trust.

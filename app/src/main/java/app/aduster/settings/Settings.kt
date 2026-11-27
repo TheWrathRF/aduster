@@ -130,6 +130,9 @@ val UI_ONLY_FIELDS = setOf(
 /** Custom list ids are path parts of the list files: only the form the app makes. */
 private val CUSTOM_ID = Regex("^custom-[0-9a-f]{8}$")
 
+/** A list the add dialog would accept: an https address and a name (an edited backup could name http:// or file:// ones). */
+fun CustomList.addable(): Boolean = url.trim().startsWith("https://", ignoreCase = true) && name.isNotBlank()
+
 /**
  * The settings as read or imported, made safe to use: custom lists whose id the app could not
  * have made dropped, one list per id (an edited backup with a repeated id would crash the Filters
@@ -137,9 +140,9 @@ private val CUSTOM_ID = Regex("^custom-[0-9a-f]{8}$")
  * a negative count, which would stop protection from starting).
  */
 fun Settings.sanitized(): Settings {
-    // Also only lists the add dialog accepts: an https address and a name (an edited backup could
-    // name http:// or file:// addresses).
-    fun ok(l: CustomList) = CUSTOM_ID.matches(l.id) && l.url.trim().startsWith("https://") && l.name.isNotBlank()
+    // What a list holds is checked at import (see [addable]), not here: dropped on every read, a
+    // list stored by an older version went with its files at the next save.
+    fun ok(l: CustomList) = CUSTOM_ID.matches(l.id)
     val lists = if (customLists.all(::ok) && customLists.distinctBy { it.id }.size == customLists.size) customLists
     else customLists.filter(::ok).distinctBy { it.id }
     val s = copy(
