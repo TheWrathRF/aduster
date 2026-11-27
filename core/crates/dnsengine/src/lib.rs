@@ -277,8 +277,10 @@ impl Shared {
             if *cur != config.upstream {
                 match upstream::Upstream::from_config(&config.upstream) {
                     Ok(u) => {
-                        u.set_families(self.has_v4.load(Ordering::Relaxed), self.has_v6.load(Ordering::Relaxed));
                         self.upstream.store(Arc::new(u));
+                        // After the store: a network report on another thread meanwhile either
+                        // wrote the families before this read or reaches the new resolver itself.
+                        self.upstream.load().set_families(self.has_v4.load(Ordering::SeqCst), self.has_v6.load(Ordering::SeqCst));
                         *cur = config.upstream.clone();
                         // Answers from the previous resolver may differ (e.g. ISP-level blocking).
                         self.cache.lock().clear();
@@ -440,12 +442,13 @@ impl Shared {
             s
         };
         let servers_changed = set(&self.system_servers.load()) != set(&servers);
-        let families_changed = self.has_v4.load(Ordering::Relaxed) != has_v4 || self.has_v6.load(Ordering::Relaxed) != has_v6;
-        self.system_servers.store(Arc::new(servers));
-        // An unknown network (no addresses reported yet) must not stop either family.
+        // An unknown network (no addresses reported yet) must not stop either family; compared as
+        // stored, so a repeated unknown report is no change.
         let (v4, v6) = if has_v4 || has_v6 { (has_v4, has_v6) } else { (true, true) };
-        self.has_v4.store(v4, Ordering::Relaxed);
-        self.has_v6.store(v6, Ordering::Relaxed);
+        let families_changed = self.has_v4.load(Ordering::SeqCst) != v4 || self.has_v6.load(Ordering::SeqCst) != v6;
+        self.system_servers.store(Arc::new(servers));
+        self.has_v4.store(v4, Ordering::SeqCst);
+        self.has_v6.store(v6, Ordering::SeqCst);
         self.upstream.load().set_families(v4, v6);
         // Upstream DNS sockets go out on this network.
         upstream::BIND_HANDLE.store(handle, Ordering::Relaxed);
@@ -1670,6 +1673,18 @@ mod tests {
         let log: Vec<serde_json::Value> = serde_json::from_str(&s.log_json(0, 100)).unwrap();
         assert_eq!(log.len(), 3, "{log:?}");
     }
+
+    /// A network that reports no address family yet counts as having both, and saying so again
+    /// is no change.
+    #[test]
+    fn a_repeated_unknown_family_report_is_no_change() {
+        let s = Shared::new(Config::default());
+        let server: std::net::SocketAddr = "192.0.2.53:53".parse().unwrap();
+        s.set_network(vec![server], true, true, 1);
+        assert!(!s.set_network(vec![server], false, false, 1), "unknown families are stored as both");
+        assert!(s.set_network(vec![server], true, false, 1));
+    }
+
     /// New search domains on the same network do not reset what the network generation guards:
     /// the rebinding guard's public answers stay, `net_watch` stays in step with
     /// `net_generation`, and the same domains in another order change nothing. An answer asked

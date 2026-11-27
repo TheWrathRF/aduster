@@ -296,6 +296,9 @@ class AdusterVpnService : VpnService() {
      * start then turned it on).
      */
     private val lifecycle = kotlinx.coroutines.sync.Mutex()
+    /** The running start's own place in [startsQueued], given back once: by a failing start's stop, else when it ends. */
+    @Volatile
+    private var ownStartCount: java.util.concurrent.atomic.AtomicBoolean? = null
     /** The newest card re-post answered while a start or a stop was on its way (see ACTION_RENOTIFY). */
     @Volatile
     private var reposted = 0
@@ -595,12 +598,20 @@ class AdusterVpnService : VpnService() {
                     SERVICE_INTERFACE -> "by Always-on VPN"
                     else -> intent.getStringExtra(EXTRA_FROM) ?: "from the app"
                 }
+                val counted = java.util.concurrent.atomic.AtomicBoolean(true)
                 startsQueued.incrementAndGet()
                 scope.launch {
                     try {
-                        lifecycle.withLock { startProtection(from, startId, restart = intent == null) }
+                        lifecycle.withLock {
+                            ownStartCount = counted
+                            try {
+                                startProtection(from, startId, restart = intent == null)
+                            } finally {
+                                ownStartCount = null
+                            }
+                        }
                     } finally {
-                        startsQueued.decrementAndGet()
+                        if (counted.getAndSet(false)) startsQueued.decrementAndGet()
                     }
                 }
             }
@@ -975,7 +986,12 @@ class AdusterVpnService : VpnService() {
         withContext(Dispatchers.Main) {
             // Not while a "Turn on" waits behind this stop: it must find the service alive and
             // its card up. The newest id ([startId] by default) may be that start's own.
-            if (serviceEnds(running, startsQueued.get(), ownStart)) {
+            // A failing start gives its own place in [startsQueued] back here, on the main thread
+            // with the decision: a card re-post after this must not count it as a start still on
+            // its way (it would put the card back, sticky, over protection that is off).
+            val ownCounted = ownStart && ownStartCount?.getAndSet(false) == true
+            if (ownCounted) startsQueued.decrementAndGet()
+            if (serviceEnds(running, startsQueued.get(), ownStart && !ownCounted)) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelfResult(maxOf(startId, reposted))
             }
