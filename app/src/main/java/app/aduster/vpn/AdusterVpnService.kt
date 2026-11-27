@@ -372,8 +372,10 @@ class AdusterVpnService : VpnService() {
                     // The card can vanish while the protection runs on: Xiaomi's Android build
                     // removes an app's notifications when it cleans its other (UI) process in the
                     // background, and folds any card older than 6 h out of sight. One look when someone can see
-                    // the screen puts it back or renews it (no timer, no wakeup).
-                    if (running) ensureProtectionNotification()
+                    // the screen puts it back or renews it (no timer, no wakeup). Off the main thread (a
+                    // binder call into the notification service) and in turn with the protection's own
+                    // tasks, so it never puts the card back between a stop's steps.
+                    if (running) serially { if (running) ensureProtectionNotification() }
                     if (settings.httpsFiltering && running && SystemClock.elapsedRealtime() - caCheckedAt > CERT_RECHECK_MS) {
                         serially {
                             caCheckedAt = SystemClock.elapsedRealtime()
@@ -821,8 +823,10 @@ class AdusterVpnService : VpnService() {
     /**
      * The card on screen-on: posted again if it is gone (swiped away, or removed by the system),
      * renewed as a new notification if it is old (see [postCard]). Runs only on screen-on (no
-     * timer, no wakeup); a young card is left alone.
+     * timer, no wakeup); a young card is left alone. Under the card's lock, as [postCard]: the
+     * card's id and age are read and changed together.
      */
+    @Synchronized
     private fun ensureProtectionNotification() {
         val shown = getSystemService(NotificationManager::class.java).activeNotifications.any { it.id == cardId }
         if (!shown || SystemClock.elapsedRealtime() - cardBornAt >= CARD_RENEW_MS) postCard(foreground = false)
