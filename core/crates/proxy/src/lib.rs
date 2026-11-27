@@ -57,6 +57,9 @@ pub fn is_running() -> bool {
     false
 }
 
+/// The system is short of memory: the running proxy drops its caches of what it builds again on demand.
+pub fn trim_memory() {}
+
 /// Whether the running proxy has a page engine.
 pub fn web_loaded() -> bool {
     false

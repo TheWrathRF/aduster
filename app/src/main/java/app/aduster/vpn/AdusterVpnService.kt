@@ -2,6 +2,7 @@ package app.aduster.vpn
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks2
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -136,6 +137,16 @@ internal fun serviceEnds(running: Boolean, startsQueued: Int, ownStart: Boolean 
  * one Android keeps.
  */
 internal fun staysSticky(running: Boolean, startsQueued: Int): Boolean = running || startsQueued > 0
+
+/**
+ * Whether an `onTrimMemory` level means the system is about to kill processes, so the page
+ * engine drops its caches too: RUNNING_CRITICAL (sent up to Android 13; since 14 apps get only
+ * UI_HIDDEN and BACKGROUND) and BACKGROUND or worse. Not UI_HIDDEN: :core shows no UI, and it is
+ * no shortage.
+ */
+@Suppress("DEPRECATION")
+internal fun trimIsSevere(level: Int): Boolean =
+    level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL || level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
 
 /** A DNS table load's answer: `{"ok":true,...}`; anything else (an unreadable table) failed. */
 internal fun dnsTableLoaded(result: String): Boolean =
@@ -498,7 +509,7 @@ class AdusterVpnService : VpnService() {
 
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        chores.launch { NativeCore.nativeTrimMemory() }
+        chores.launch { NativeCore.nativeTrimMemory(trimIsSevere(level)) }
     }
 
     override fun onBind(intent: Intent?): IBinder? =

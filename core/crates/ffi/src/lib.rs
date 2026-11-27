@@ -85,7 +85,7 @@ natives! {
     "nativeReport" => native_report() -> jni::sys::jstring;
     "nativeClearLog" => native_clear_log() -> ();
     "nativeResetStats" => native_reset_stats() -> ();
-    "nativeTrimMemory" => native_trim_memory() -> ();
+    "nativeTrimMemory" => native_trim_memory(jboolean) -> ();
     "nativeScreenOff" => native_screen_off() -> ();
     "nativeUnbypass" => native_unbypass(JString) -> jboolean;
     "nativePauseSite" => native_pause_site(JString, jint) -> jboolean;
@@ -610,12 +610,18 @@ extern "system" fn native_reset_stats(_env: JNIEnv, _: JClass) {
     })
 }
 
-/// Memory pressure: returns freed heap memory to the kernel, nothing else (Android calls it
-/// while the user browses too).
-extern "system" fn native_trim_memory(_env: JNIEnv, _: JClass) {
-    guard("trim", (), || match shared() {
-        Some(s) => s.trim_memory(),
-        None => dnsengine::release_free_memory(),
+/// Memory pressure: returns freed heap memory to the kernel; `severe` (the system is about to
+/// kill processes) first drops the page engine's caches of what it builds again on demand.
+/// Connections and DNS state stay (Android calls it while the user browses too).
+extern "system" fn native_trim_memory(_env: JNIEnv, _: JClass, severe: jboolean) {
+    guard("trim", (), || {
+        if severe != JNI_FALSE {
+            proxy::trim_memory();
+        }
+        match shared() {
+            Some(s) => s.trim_memory(),
+            None => dnsengine::release_free_memory(),
+        }
     })
 }
 

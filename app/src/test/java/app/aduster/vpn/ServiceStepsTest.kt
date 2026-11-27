@@ -6,6 +6,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ServiceStepsTest {
+    /** Only a shortage that ends in killed processes drops the page engine's caches. */
+    @Test
+    fun onlyASevereShortageDropsThePageEnginesCaches() {
+        assertFalse(trimIsSevere(5)) // RUNNING_MODERATE
+        assertFalse(trimIsSevere(10)) // RUNNING_LOW
+        assertTrue(trimIsSevere(15)) // RUNNING_CRITICAL
+        assertFalse(trimIsSevere(20)) // UI_HIDDEN
+        assertTrue(trimIsSevere(40)) // BACKGROUND
+        assertTrue(trimIsSevere(60)) // MODERATE
+        assertTrue(trimIsSevere(80)) // COMPLETE
+    }
+
     /**
      * A settings change whose new tunnel cannot be made stops protection: the old tunnel still
      * names the proxy that was just stopped or restarted, so every page would fail under
