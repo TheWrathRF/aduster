@@ -999,14 +999,29 @@ object FilterUpdater {
         val head = raw.inputStream().use { it.readNBytes(4096) }.decodeToString()
         var path = DiffUpdates.diffPath(head) ?: return null
         if ((DiffUpdates.dueAt(path) ?: return null) > now) return Fetch.NotModified(patched = true)
+        // More patches may be out than one check applies (hourly patches and a daily check, or
+        // the first check after an app update). The first one still says whether the list
+        // changed at all (a quiet list keeps its copy); once it did, asking for the rest and
+        // applying each to the whole list would end in the full download anyway, after up to 8
+        // requests in a row.
+        val far = (DiffUpdates.dueCount(path, now) ?: return null) > MAX_PATCHES
         var cur: ByteArray? = null
+        // A result not yet checked: patches without their own SHA-1 are checked by the list's
+        // own checksum once, on the chain's result, the only copy that is stored (each check
+        // reads the whole list).
+        var unchecked = false
         for (n in 0 until MAX_PATCHES) {
             val body = patchBody(DiffUpdates.patchUrl(url, path) ?: return null) ?: return null
             if (body.isEmpty()) break
+            if (far) return null
             val (sha, rcs) = DiffUpdates.split(body)
             val next = DiffUpdates.applyRcs(cur ?: raw.readBytes(), rcs, MAX_BYTES) ?: return null
-            val ok = if (sha != null) DiffUpdates.sha1(next) == sha else DiffUpdates.checksumHolds(next) == true
-            if (!ok) return null
+            if (sha != null) {
+                if (DiffUpdates.sha1(next) != sha) return null
+                unchecked = false
+            } else {
+                unchecked = true
+            }
             cur = next
             val nextPath = DiffUpdates.diffPath(next.copyOfRange(0, minOf(next.size, 4096)).decodeToString()) ?: break
             if (nextPath == path) break
@@ -1017,6 +1032,7 @@ object FilterUpdater {
             if (n == MAX_PATCHES - 1) return null
         }
         val result = cur ?: return Fetch.NotModified(patched = true)
+        if (unchecked && DiffUpdates.checksumHolds(result) != true) return null
         val scanner = ListScanner()
         scanner.feed(result, result.size)
         val scan = scanner.finish()

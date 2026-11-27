@@ -737,6 +737,9 @@ class UiLogicTest {
     fun aSaveOutlivesTheScopeThatAskedForIt() {
         val caller = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Job())
         val started = java.util.concurrent.CountDownLatch(1)
+        // The save can start on another thread before `launch` hands back its result: the test
+        // reads `done` only after the caller has stored it.
+        val stored = java.util.concurrent.CountDownLatch(1)
         var saved = false
         lateinit var done: kotlinx.coroutines.Deferred<Boolean>
         caller.launch {
@@ -746,8 +749,10 @@ class UiLogicTest {
                 saved = true
                 true
             }
+            stored.countDown()
         }
         assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        assertTrue(stored.await(5, java.util.concurrent.TimeUnit.SECONDS))
         caller.cancel()
         assertTrue(kotlinx.coroutines.runBlocking { kotlinx.coroutines.withTimeout(5_000) { done.await() } })
         assertTrue(saved)

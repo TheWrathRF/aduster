@@ -48,6 +48,24 @@ internal object DiffUpdates {
         return runCatching { Math.multiplyExact(Math.addExact(m.groupValues[2].toLong(), valid), unit) }.getOrNull()
     }
 
+    /**
+     * How many patches can be out at [now] along the chain that starts at [path]: one per
+     * validity period since it came due (a list publishes a version at most once a period, so
+     * fewer when it changed less often); 0 before it is due, null if [path] is not such a name.
+     */
+    fun dueCount(path: String, now: Long): Long? {
+        val due = dueAt(path) ?: return null
+        if (now < due) return 0
+        val m = NAME.find(path) ?: return null
+        val unit = when (m.groupValues[1]) {
+            "s" -> 1_000L
+            "m" -> 60_000L
+            else -> 3_600_000L
+        }
+        val period = m.groupValues[3].toLong() * unit
+        return (now - due) / period + 1
+    }
+
     /** The patch's address, relative to the list's; null unless on the list's own server. */
     fun patchUrl(listUrl: String, path: String): String? = runCatching {
         val base = URI(listUrl)
