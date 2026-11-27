@@ -45,13 +45,7 @@ class StatsWidget : AppWidgetProvider() {
         // settings and today's count from disk.
         placed = true
         val pending = goAsync()
-        Thread {
-            try {
-                update(context)
-            } finally {
-                pending.finish()
-            }
-        }.start()
+        redraws.request({ pending.finish() }) { update(context) }
     }
 
     override fun onEnabled(context: Context) {
@@ -68,6 +62,8 @@ class StatsWidget : AppWidgetProvider() {
         /** Whether any widget is on the home screen; null = not asked yet. Saves a binder call per screen-on. */
         @Volatile
         private var placed: Boolean? = null
+
+        private val redraws = Redraws()
 
         /** Serializes reading protection state and calling `updateAppWidget`, so an older redraw never overwrites a newer state. */
         private val drawLock = Any()
