@@ -1,6 +1,9 @@
 package app.aduster.filters
 
 import java.net.URI
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
 import java.util.Base64
 
@@ -54,31 +57,50 @@ internal object DiffUpdates {
 
     /** [old] with the RCS [patch] applied, or null if the patch is not a clean one for it or the result passes [maxBytes]. */
     fun applyRcs(old: ByteArray, patch: ByteArray, maxBytes: Long = Long.MAX_VALUE): ByteArray? {
-        val lines = splitLines(old)
-        val p = splitLines(patch)
-        if (p.isEmpty()) return null
-        val out = java.io.ByteArrayOutputStream(old.size + patch.size)
-        var next = 0 // index of the first original line not yet copied
-        var i = 0
-        while (i < p.size) {
-            val cmd = COMMAND.matchEntire(p[i].decodeToString().trimEnd('\r', '\n')) ?: return null
-            val n = cmd.groupValues[2].toInt()
-            val count = cmd.groupValues[3].toInt()
-            i++
-            if (out.size() > maxBytes) return null
-            if (cmd.groupValues[1] == "d") {
-                if (n < 1 || count < 1 || n - 1 < next || n - 1 + count > lines.size) return null
-                for (k in next until n - 1) out.write(lines[k])
-                next = n - 1 + count
-            } else {
-                if (n < next || n > lines.size || i + count > p.size) return null
-                for (k in next until n) out.write(lines[k])
-                next = n
-                repeat(count) { out.write(p[i++]) }
+        // Lines are offsets into the two arrays, never copies: a 7 MB list is a few hundred
+        // thousand lines. The first pass checks the patch and sizes the result, the second
+        // copies ranges into it.
+        val lines = lineStarts(old)
+        val p = lineStarts(patch)
+        val oldLines = lines.size - 1
+        val patchLines = p.size - 1
+        if (patchLines == 0) return null
+        var out: ByteArray? = null
+        for (pass in 0..1) {
+            var size = 0L
+            var at = 0
+            fun copy(from: ByteArray, starts: IntArray, first: Int, end: Int) {
+                if (end <= first) return
+                val len = starts[end] - starts[first]
+                out?.let { System.arraycopy(from, starts[first], it, at, len) }
+                at += len
+                size += len
             }
+            var next = 0 // index of the first original line not yet copied
+            var i = 0
+            while (i < patchLines) {
+                val cmd = COMMAND.matchEntire(String(patch, p[i], p[i + 1] - p[i], Charsets.UTF_8).trimEnd('\r', '\n')) ?: return null
+                val n = cmd.groupValues[2].toInt()
+                val count = cmd.groupValues[3].toInt()
+                i++
+                if (size > maxBytes) return null
+                if (cmd.groupValues[1] == "d") {
+                    if (n < 1 || count < 1 || n - 1 < next || n - 1 + count > oldLines) return null
+                    copy(old, lines, next, n - 1)
+                    next = n - 1 + count
+                } else {
+                    if (n < next || n > oldLines || i + count > patchLines) return null
+                    copy(old, lines, next, n)
+                    next = n
+                    copy(patch, p, i, i + count)
+                    i += count
+                }
+            }
+            copy(old, lines, next, oldLines)
+            if (size > maxBytes) return null
+            if (pass == 0) out = ByteArray(size.toInt()) else return out
         }
-        for (k in next until lines.size) out.write(lines[k])
-        return if (out.size() > maxBytes) null else out.toByteArray()
+        return out
     }
 
     /**
@@ -95,30 +117,93 @@ internal object DiffUpdates {
     fun sha1(b: ByteArray): String = MessageDigest.getInstance("SHA-1").digest(b).joinToString("") { "%02x".format(it) }
 
     /** Adblock Plus's list checksum: MD5 (base64, no padding) of the text without its checksum line, CRs and blank lines. */
-    fun abpChecksum(text: String): String {
-        var d = text.replace("\r", "").replace(Regex("\n+"), "\n")
-        d = CHECKSUM.replaceFirst(d, "")
-        return Base64.getEncoder().withoutPadding().encodeToString(MessageDigest.getInstance("MD5").digest(d.toByteArray()))
-    }
+    fun abpChecksum(text: String): String = collapsed(CharBuffer.wrap(text)).let { checksumOf(it, CHECKSUM.find(it)) }
 
-    /** Whether the list's own `! Checksum:` matches its text; null when it has none. */
+    /**
+     * Whether the list's own `! Checksum:` matches its text; null when it has none. The text is
+     * decoded once, straight into its checksum form (no CRs, no blank lines): the checksum line
+     * the pattern finds there is the one it finds with blank lines kept (only `\n` runs differ,
+     * and every part of the pattern that can hold a `\n` takes a run as it takes one).
+     */
     fun checksumHolds(list: ByteArray): Boolean? {
-        val text = list.decodeToString()
-        val want = CHECKSUM.find(text.replace("\r", ""))?.groupValues?.get(1)?.trimEnd('=') ?: return null
-        return abpChecksum(text) == want
+        val decoder = Charsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPLACE).onUnmappableCharacter(CodingErrorAction.REPLACE)
+        val chars = CharBuffer.allocate(64 * 1024)
+        val input = ByteBuffer.wrap(list)
+        val text = StringBuilder(list.size)
+        // `flip()` on its own line: older Android stubs type it as returning a plain Buffer.
+        fun drain() {
+            chars.flip()
+            collapseInto(chars, text)
+            chars.clear()
+        }
+        while (true) {
+            val r = decoder.decode(input, chars, true)
+            drain()
+            if (r.isUnderflow) break
+        }
+        while (decoder.flush(chars).isOverflow) drain()
+        drain()
+        val m = CHECKSUM.find(text) ?: return null
+        return checksumOf(text, m) == m.groupValues[1].trimEnd('=')
     }
 
-    /** Lines with their own ends (LF, or CRLF kept whole); a last line without one too. */
-    private fun splitLines(b: ByteArray): List<ByteArray> {
-        val out = ArrayList<ByteArray>()
-        var start = 0
-        for (i in b.indices) {
-            if (b[i] == '\n'.code.toByte()) {
-                out += b.copyOfRange(start, i + 1)
-                start = i + 1
+    /** [text] without CRs and with every run of `\n` as one. */
+    private fun collapsed(text: CharBuffer): StringBuilder = StringBuilder(text.remaining()).also { collapseInto(text, it) }
+
+    /** Appends [chars] to [out] without CRs, a `\n` only first or after a character that is not one. */
+    private fun collapseInto(chars: CharBuffer, out: StringBuilder) {
+        while (chars.hasRemaining()) {
+            val c = chars.get()
+            if (c == '\r') continue
+            if (c == '\n' && out.isNotEmpty() && out[out.length - 1] == '\n') continue
+            out.append(c)
+        }
+    }
+
+    /** MD5 (base64, no padding) of [text]'s UTF-8 without [skip]'s range, encoded in chunks. */
+    private fun checksumOf(text: CharSequence, skip: MatchResult?): String {
+        val md5 = MessageDigest.getInstance("MD5")
+        val encoder = Charsets.UTF_8.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPLACE).onUnmappableCharacter(CodingErrorAction.REPLACE)
+        val bytes = ByteBuffer.allocate(64 * 1024)
+        fun feed(from: Int, to: Int) {
+            if (to <= from) return
+            val chars = CharBuffer.wrap(text, from, to)
+            encoder.reset()
+            while (true) {
+                val r = encoder.encode(chars, bytes, true)
+                md5.update(bytes.array(), 0, bytes.position())
+                bytes.clear()
+                if (r.isUnderflow) break
+            }
+            while (true) {
+                val r = encoder.flush(bytes)
+                md5.update(bytes.array(), 0, bytes.position())
+                bytes.clear()
+                if (r.isUnderflow) break
             }
         }
-        if (start < b.size) out += b.copyOfRange(start, b.size)
+        if (skip == null) {
+            feed(0, text.length)
+        } else {
+            feed(0, skip.range.first)
+            feed(skip.range.last + 1, text.length)
+        }
+        return Base64.getEncoder().withoutPadding().encodeToString(md5.digest())
+    }
+
+    /** The offset of every line's start (a line ends after its LF; a last line without one too), then the end. */
+    private fun lineStarts(b: ByteArray): IntArray {
+        var n = 0
+        for (x in b) if (x == '\n'.code.toByte()) n++
+        val lines = if (b.isNotEmpty() && b[b.size - 1] != '\n'.code.toByte()) n + 1 else n
+        val out = IntArray(lines + 1)
+        var k = 1
+        for (i in b.indices) {
+            if (b[i] == '\n'.code.toByte() && k < lines) out[k++] = i + 1
+        }
+        out[lines] = b.size
         return out
     }
 }
