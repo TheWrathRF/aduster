@@ -11,6 +11,9 @@ klarna.com
 cash.app
 alipay.com
 adyen.com
+! Braintree, PayPal's card gateway for other shops (its analytics host is blocked by name, not
+! by URL)
+braintreegateway.com
 ! Card networks and 3-D Secure checks (the bank's approval page during online payments)
 visa.com
 mastercard.com
@@ -28,7 +31,10 @@ okx.com
 bybit.com
 ! Password managers (vaults are decrypted in the page)
 bitwarden.com
+bitwarden.eu
 1password.com
+1password.eu
+1password.ca
 lastpass.com
 dashlane.com
 keepersecurity.com

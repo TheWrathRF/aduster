@@ -147,11 +147,17 @@ class GlobalDefaultsTest {
         val hosts = File("src/main/assets/builtin/https-sensitive.txt").readLines().filter { it.isNotBlank() && !it.startsWith("!") }
         assertTrue(hosts.size > 40)
         // No country's own sites: at most one host under any country code (a global service,
-        // such as a bot check or a mail provider).
-        val byCountry = hosts.map { it.substringAfterLast('.') }.filter { it.length == 2 }.groupingBy { it }.eachCount()
+        // such as a bot check or a mail provider). `.eu` is no country: global services' EU
+        // regions live there.
+        val byCountry = hosts.map { it.substringAfterLast('.') }.filter { it.length == 2 && it != "eu" }.groupingBy { it }.eachCount()
         assertTrue(byCountry.toString(), byCountry.values.all { it <= 1 })
         for (signIn in listOf("accounts.google.com", "appleid.apple.com", "login.microsoftonline.com", "account.samsung.com", "account.xiaomi.com", "id.cloud.huawei.com")) {
             assertTrue(signIn, signIn in hosts)
+        }
+        // Password managers' regional clouds and a global card gateway, also before the first
+        // download of the sensitive lists or with them off.
+        for (host in listOf("bitwarden.eu", "1password.eu", "1password.ca", "braintreegateway.com")) {
+            assertTrue(host, host in hosts)
         }
     }
 
