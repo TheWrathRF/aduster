@@ -113,7 +113,7 @@ object FilterUpdater {
     /** How long shrunk downloads are held back at most: a list really cut stays cut. */
     private const val HOLD_MAX_MS = 7 * 24 * 3600 * 1000L
 
-    internal data class Includes(val parts: Map<String, PartMeta>, val changed: Boolean, val error: String?)
+    internal data class Includes(val parts: Map<String, PartMeta>, val changed: Boolean, val error: String?, val unreachable: Boolean = false)
 
     /**
      * First run: installs the bundled snapshot and compiles, so filtering works offline right
@@ -297,8 +297,12 @@ object FilterUpdater {
             }
             dnsChecked + webChecked
         }
-        val failed = checked.filter { it.fetch is Fetch.Failed || it.fetch is Fetch.Shrunk }.map { it.list.name }
+        // A list counts as failed when one of its `!#include` parts did too (it misses that part's
+        // rules), and as unreachable when that part could not be downloaded: "Update now" retries.
+        val failedChecked = checked.filter { it.fetch is Fetch.Failed || it.fetch is Fetch.Shrunk || it.inc?.error != null }
+        val failed = failedChecked.map { it.list.name }
         val changedIds = checked.filter { it.fetch !is Fetch.Failed && it.fetch !is Fetch.Shrunk && (it.fetch is Fetch.Updated || it.inc?.changed == true) }.map { it.list.id }
+        val failedUnchanged = failedChecked.count { it.list.id !in changedIds }
         // A changed never-decrypt list reaches the proxy through a settings reload (:core reads
         // the files when it builds the proxy config).
         if (FilterCatalog.exclusionLists.any { it.id in changedIds }) {
@@ -310,7 +314,7 @@ object FilterUpdater {
             "update: $all lists, ${changedIds.size} changed $changedIds, ${failed.size} failed in ${lastDone - t0} ms ($total checked); " +
                 "DNS ${if (dnsCompiled) "compiled" else "unchanged"} $dnsMs ms, ready at $dnsReady ms, web ${if (webCompiled) "compiled" else "unchanged"} $webMs ms",
         )
-        return Result(changedIds.size, all - changedIds.size - failed.size, failed, dnsCompiled, webCompiled, checked = total, unreachable = checked.count { it.fetch is Fetch.Failed })
+        return Result(changedIds.size, all - changedIds.size - failedUnchanged, failed, dnsCompiled, webCompiled, checked = total, unreachable = checked.count { it.fetch is Fetch.Failed || it.inc?.unreachable == true })
     }
 
     /** Downloads list [l] and its parts ([prev]: what its last check stored). */
@@ -507,6 +511,7 @@ object FilterUpdater {
         val parts = linkedMapOf<String, PartMeta>()
         var changed = false
         var error: String? = null
+        var unreachable = false
         var level = names
         var depth = 0
         while (level.isNotEmpty() && depth < MAX_INCLUDE_DEPTH) {
@@ -537,6 +542,7 @@ object FilterUpdater {
                     }
                     is Fetch.Failed -> {
                         error = "$name: ${r.reason}"
+                        unreachable = true
                         if (p != null) parts[name] = p
                     }
                 }
@@ -552,7 +558,7 @@ object FilterUpdater {
             if ((!part && it.name !in parts) || (part && now - it.lastModified() > RECHECK_MS)) it.delete()
         }
         if (parts.keys != prev.keys) changed = true
-        Includes(parts, changed, error)
+        Includes(parts, changed, error, unreachable)
     }
 
     /** [stored] if it still describes [f] (same size), else [f] read once. */

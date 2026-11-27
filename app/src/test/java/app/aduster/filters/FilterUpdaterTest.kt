@@ -841,4 +841,42 @@ class FilterUpdaterTest {
             tmp.deleteRecursively()
         }
     }
+
+    /** A list whose `!#include` part cannot be downloaded counts as failed and unreachable, so "Update now" tries it again. */
+    @Test
+    fun aFailedIncludePartIsRetried() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/") { ex ->
+            try {
+                val (code, b) = if (ex.requestURI.path == "/part.txt") 500 to "no".toByteArray() else 200 to "! Title: l\n!#include part.txt\n||ads.test^\n".toByteArray()
+                ex.sendResponseHeaders(code, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            } finally {
+                ex.close()
+            }
+        }
+        server.start()
+        val tmp = Files.createTempDirectory("aduster-inc-fail").toFile()
+        try {
+            val store = FilterStore(tmp)
+            val l = FilterList("custom-00000001", "With part", "http://127.0.0.1:${server.address.port}/l.txt", false, Group.CUSTOM, true, "")
+            val r = FilterUpdater.updateStore(
+                store = store,
+                readSettings = { app.aduster.settings.Settings(userRules = "") },
+                check = FilterUpdater.Check.ALL,
+                webWanted = { false },
+                compileDns = { true },
+                compileWeb = { false },
+                dnsListsOf = { listOf(l) },
+                webListsOf = { emptyList() },
+            )
+            assertEquals(listOf("With part"), r.failed)
+            assertEquals(1, r.unreachable)
+            assertEquals(true, FilterJobs.retryAfter(r))
+            assertEquals(0, r.unchanged)
+        } finally {
+            server.stop(0)
+            tmp.deleteRecursively()
+        }
+    }
 }

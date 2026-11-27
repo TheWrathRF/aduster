@@ -33,9 +33,11 @@ object EngineConfig {
             put("optimistic_cache", s.optimisticCache)
             put("ipv4_only", s.ipv4Only)
             put("cache_size", CACHE_SIZE)
-            // While time is left on the boot clock the pause keeps its end, also once the wall
-            // time moved past it.
-            put("paused_until_ms", if (s.pausedUntil > now || (s.pausedUntil != 0L && pauseLeftMs > 0)) s.pausedUntil else 0L)
+            // The boot clock decides: while time is left the pause keeps its end, also once the
+            // wall time moved past it; with none left it is over, also when the wall clock was
+            // moved back (a pause kept here would keep browsers' connections opened during it
+            // unfiltered: the engine refilters only when a pause ends).
+            put("paused_until_ms", if (s.pausedUntil != 0L && pauseLeftMs > 0) s.pausedUntil else 0L)
             put("pause_left_ms", pauseLeftMs)
             put("tz_offset_s", TimeZone.getDefault().getOffset(now) / 1000)
             put("stats_path", statsPath)

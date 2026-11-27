@@ -389,8 +389,10 @@ internal fun logMatches(e: LogItem, kind: Int, inBrowsers: Boolean, pages: Boole
     if (e.action.marker) return q.isEmpty() && app == null
     if (kind == 1 && !e.action.blocked) return false
     if (kind == 2 && !e.action.answered) return false
-    if (pages && e.qtype != 0) return false
-    if (inBrowsers && e.qtype != 0 && e.uid !in browsers) return false
+    // Other apps' connections go through the proxy too (qtype 0): only browsers' rows count.
+    val browser = e.uid in browsers || e.action == QueryAction.FILTERED
+    if (pages && (e.qtype != 0 || !browser)) return false
+    if (inBrowsers && !browser) return false
     if (app != null && e.uid != app) return false
     return q.isEmpty() || e.name.contains(q) || appName(e.uid).lowercase().contains(q)
 }
@@ -698,9 +700,9 @@ private fun Empty(title: String, detail: String? = null) {
     }
 }
 
-/** The site host the page filter handled for [r], or null for plain DNS rows. */
-internal fun proxySiteOf(r: LogLine.Query): String? =
-    if (r.entries.any { it.qtype == 0 }) r.e.page ?: r.e.name else null
+/** The site host the page filter handled for [r], or null for plain DNS rows and other apps' connections. */
+internal fun proxySiteOf(r: LogLine.Query, browsers: Set<Int>): String? =
+    if (r.entries.any { it.qtype == 0 && (it.action == QueryAction.FILTERED || it.uid in browsers) }) r.e.page ?: r.e.name else null
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -716,7 +718,8 @@ private fun Details(r: LogLine.Query, app: String, vm: MainViewModel, onOnlyApp:
         onDismiss()
     }
     val s by vm.settings.collectAsStateWithLifecycle()
-    val proxySite = proxySiteOf(r)
+    val browsers by vm.browserUids.collectAsStateWithLifecycle()
+    val proxySite = proxySiteOf(r, browsers)
     var siteCheck by remember(proxySite) { mutableStateOf<SiteCheck?>(null) }
     LaunchedEffect(proxySite) {
         if (proxySite != null) siteCheck = withContext(Dispatchers.IO) { vm.checkSite(proxySite) }

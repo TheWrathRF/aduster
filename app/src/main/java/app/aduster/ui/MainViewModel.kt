@@ -191,12 +191,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * [fetch]: the change may need lists that are not on disk yet; one job then fetches them and
      * compiles (a compile job beside it would only build the engines twice).
      */
-    fun update(fetch: Boolean = false, transform: (Settings) -> Settings): Deferred<Boolean> =
+    /** Saves [transform]'s change; [saved]: said once it is written (a full disk says so instead). */
+    fun update(fetch: Boolean = false, saved: String? = null, transform: (Settings) -> Settings): Deferred<Boolean> =
         saving {
             // "Before" is what the transform really saw (the StateFlow can lag or still hold
             // the placeholder at start-up).
             var before = Settings()
             val after = save { cur -> before = cur; transform(cur) } ?: return@saving false
+            if (saved != null) withContext(Dispatchers.Main) { android.widget.Toast.makeText(ctx, saved, android.widget.Toast.LENGTH_SHORT).show() }
             // :core is told only when something it reads changed: the theme or the log size
             // would otherwise re-initialise its engine.
             if (before.coreKey() != after.coreKey()) AdusterVpnService.notifySettingsChanged(ctx)
@@ -576,7 +578,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * applied before the user confirms the summary.
      */
     suspend fun readImport(uri: android.net.Uri): SettingsBackup.Read = withContext(Dispatchers.IO) {
-        val text = runCatching { ctx.contentResolver.openInputStream(uri)?.use { it.readBytes().decodeToString() } }.getOrNull().orEmpty()
+        // A file over 2 MiB is not a settings file: read no further (it would all sit in memory).
+        val text = runCatching { ctx.contentResolver.openInputStream(uri)?.use { SettingsBackup.readCapped(it) } }.getOrNull().orEmpty()
         val pm = ctx.packageManager
         SettingsBackup.read(text, storedSettings(), pages = HttpsConfig.available) { pkg ->
             runCatching { pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString() }.getOrDefault(pkg)
@@ -609,8 +612,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** False when the settings could not be saved (a full disk): nothing else is done. */
     private suspend fun replaceSettings(next: Settings): Boolean {
-        val after = store.trySave { current -> next.copy(enabled = current.enabled, pausedUntil = current.pausedUntil) } ?: return false
+        var before = Settings()
+        val after = store.trySave { current -> before = current; next.copy(enabled = current.enabled, pausedUntil = current.pausedUntil) } ?: return false
         AdusterVpnService.notifySettingsChanged(ctx)
+        // The widget draws in the app's theme, as after a change in Settings.
+        if (before.theme != after.theme) app.aduster.widget.StatsWidget.refresh(ctx)
         FilterJobs.schedule(ctx, after)
         FilterJobs.afterChange(ctx, after, compileChanged = true, fetch = true)
         return true

@@ -16,10 +16,37 @@ class CaManagerTest {
     @Test
     fun storeErrorKeepsTheLastKnownState() {
         val busy: () -> Boolean = { throw KeyStoreException("store busy") }
-        assertTrue(CaManager.trustState { true })
-        assertTrue("an error after trusted", CaManager.trustState(busy))
-        assertFalse(CaManager.trustState { false })
-        assertFalse("an error after not trusted", CaManager.trustState(busy))
+        assertTrue(CaManager.trustState("AA:01") { true })
+        assertTrue("an error after trusted", CaManager.trustState("AA:01", busy))
+        assertFalse(CaManager.trustState("AA:01") { false })
+        assertFalse("an error after not trusted", CaManager.trustState("AA:01", busy))
+    }
+
+    /** A remembered "trusted" is not carried over to a new certificate when the store fails to answer for it. */
+    @Test
+    fun aStoreErrorForANewCertificateIsNotTrusted() {
+        val busy: () -> Boolean = { throw KeyStoreException("store busy") }
+        assertTrue(CaManager.trustState("AA:01") { true })
+        assertFalse("a new certificate", CaManager.trustState("BB:02", busy))
+        assertTrue("the old one again", CaManager.trustState("AA:01") { true })
+    }
+
+    /** Two processes copying the same file at once each write their own temporary file; the result is whole. */
+    @Test
+    fun concurrentCopiesLeaveOneWholeFile() {
+        val dir = java.nio.file.Files.createTempDirectory("copy-test").toFile()
+        try {
+            val f = java.io.File(dir, "res.json")
+            val body = ByteArray(2_000_000) { (it % 251).toByte() }
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+            val jobs = (1..16).map { pool.submit { app.aduster.filters.FilterStore.copyWhole({ java.io.ByteArrayInputStream(body) }, f) } }
+            jobs.forEach { it.get() }
+            pool.shutdown()
+            assertTrue(f.readBytes().contentEquals(body))
+            assertEquals(listOf("res.json"), dir.list()!!.toList())
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     /**

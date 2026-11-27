@@ -65,8 +65,13 @@ fun AppsScreen(vm: MainViewModel, onBack: () -> Unit) {
         if (want != vm.storedSettings().excludedApps) vm.update { it.copy(excludedApps = want) }
     }
     val latest by rememberUpdatedState(excluded)
+    // Not on a rotation: the set is kept across it, and each save rebuilds the VPN for every app.
+    val activity = androidx.activity.compose.LocalActivity.current
     DisposableEffect(Unit) {
-        onDispose { latest?.let { want -> vm.update { if (it.excludedApps == want) it else it.copy(excludedApps = want) } } }
+        onDispose {
+            if (activity?.isChangingConfigurations == true) return@onDispose
+            latest?.let { want -> vm.update { if (it.excludedApps == want) it else it.copy(excludedApps = want) } }
+        }
     }
 
     // Filtered and sorted only when its inputs change, not for every icon that loads. An

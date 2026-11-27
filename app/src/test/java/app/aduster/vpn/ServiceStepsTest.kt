@@ -39,4 +39,12 @@ class ServiceStepsTest {
         assertFalse(dnsTableLoaded("not json"))
         assertFalse(dnsTableLoaded("{}"))
     }
+
+    /** A command that ends with protection off takes the card away, unless a start queued behind it needs it. */
+    @Test
+    fun aStopEndsTheCardUnlessAStartWaits() {
+        assertTrue(cardGoes(running = false, startsQueued = 0))
+        assertFalse(cardGoes(running = false, startsQueued = 1))
+        assertFalse(cardGoes(running = true, startsQueued = 0))
+    }
 }

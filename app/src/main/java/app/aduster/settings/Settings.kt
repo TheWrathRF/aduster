@@ -137,8 +137,11 @@ private val CUSTOM_ID = Regex("^custom-[0-9a-f]{8}$")
  * a negative count, which would stop protection from starting).
  */
 fun Settings.sanitized(): Settings {
-    val lists = if (customLists.all { CUSTOM_ID.matches(it.id) } && customLists.distinctBy { it.id }.size == customLists.size) customLists
-    else customLists.filter { CUSTOM_ID.matches(it.id) }.distinctBy { it.id }
+    // Also only lists the add dialog accepts: an https address and a name (an edited backup could
+    // name http:// or file:// addresses).
+    fun ok(l: CustomList) = CUSTOM_ID.matches(l.id) && l.url.trim().startsWith("https://") && l.name.isNotBlank()
+    val lists = if (customLists.all(::ok) && customLists.distinctBy { it.id }.size == customLists.size) customLists
+    else customLists.filter(::ok).distinctBy { it.id }
     val s = copy(
         customLists = lists,
         blockedTtl = blockedTtl.coerceIn(0, 86_400),
@@ -184,6 +187,16 @@ internal fun salvageSettings(text: String): Settings? {
     return runCatching { SettingsJson.decodeFromJsonElement(Settings.serializer(), kotlinx.serialization.json.JsonObject(kept)).sanitized() }.getOrNull()
 }
 
+/**
+ * Keeps [text], a settings file that could not be read, as `settings.corrupt-<checksum>.json` in
+ * [dir]: once per content. The salvaged settings are only written back by the next change, so
+ * every start reads the same file again (a copy named by the time made one more each start).
+ */
+internal fun keepCorruptCopy(dir: File, text: String): File {
+    val crc = java.util.zip.CRC32().apply { update(text.encodeToByteArray()) }.value
+    return File(dir, "settings.corrupt-%08x.json".format(crc)).also { if (!it.exists()) it.writeText(text) }
+}
+
 private object SettingsSerializer : Serializer<Settings> {
     override val defaultValue = Settings()
 
@@ -199,7 +212,7 @@ private object SettingsSerializer : Serializer<Settings> {
             if (e !is SerializationException && e !is IllegalArgumentException) throw e
             // One bad field must not cost every rule and list: the file is kept
             // as settings.corrupt-<time>.json and every field that still reads is kept.
-            file?.let { f -> runCatching { File(f.parentFile, "settings.corrupt-${System.currentTimeMillis()}.json").writeText(text) } }
+            file?.let { f -> runCatching { keepCorruptCopy(f.parentFile!!, text) } }
             salvageSettings(text) ?: throw CorruptionException("settings", e)
         }
     }

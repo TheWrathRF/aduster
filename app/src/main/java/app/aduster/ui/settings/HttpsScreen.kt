@@ -115,8 +115,7 @@ fun HttpsScreen(vm: MainViewModel, onBack: () -> Unit) {
     DisposableEffect(Unit) {
         onDispose {
             if (latestDirty && activity?.isChangingConfigurations != true) {
-                vm.update { it.copy(httpsExclusions = latestText.trim()) }
-                Toast.makeText(ctx, "Never-decrypt list saved", Toast.LENGTH_SHORT).show()
+                vm.update(saved = "Never-decrypt list saved") { it.copy(httpsExclusions = latestText.trim()) }
             }
         }
     }

@@ -87,6 +87,7 @@ object CaManager {
         keyFile(ctx).delete()
         cachedCert = null
         alias = null
+        lastTrusted = null
         return generate(ctx)
     }
 
@@ -154,25 +155,26 @@ object CaManager {
         return runCatching { Base64.getDecoder().decode(b64) }.getOrNull()
     }
 
-    /** The store's last answer (see [trustState]); null until one was read. */
+    /** The store's last answer (see [trustState]) and the certificate (fingerprint) it was for; null until one was read. */
     @Volatile
-    private var lastTrusted: Boolean? = null
+    private var lastTrusted: Pair<String, Boolean>? = null
 
     /**
-     * [read]'s answer, remembered. An error reading the store (busy or failing for a moment)
-     * keeps the last known answer: as "not trusted" it would stop HTTPS filtering until the next
-     * check, up to 30 minutes. Not trusted only when nothing was known yet.
+     * [read]'s answer for the certificate [fingerprint], remembered. An error reading the store
+     * (busy or failing for a moment) keeps the last known answer for that certificate: as "not
+     * trusted" it would stop HTTPS filtering until the next check, up to 30 minutes. Not trusted
+     * when nothing was known yet, or only for another certificate (a new one is not installed).
      */
-    internal fun trustState(read: () -> Boolean): Boolean = try {
-        read().also { lastTrusted = it }
+    internal fun trustState(fingerprint: String, read: () -> Boolean): Boolean = try {
+        read().also { lastTrusted = fingerprint to it }
     } catch (_: Exception) {
-        lastTrusted ?: false
+        rememberedTrust(lastTrusted, fingerprint) ?: false
     }
 
     /** True once the user has installed our certificate as a trusted user CA (full scan). */
     fun isInstalled(ctx: Context): Boolean {
         val ours = certDer(ctx) ?: return false
-        return trustState {
+        return trustState(fingerprintOf(ours)) {
             val ks = KeyStore.getInstance("AndroidCAStore").apply { load(null) }
             val found = ks.aliases().asSequence()
                 .filter { it.startsWith("user:") }
@@ -186,7 +188,7 @@ object CaManager {
     fun stillInstalled(ctx: Context): Boolean {
         val a = alias ?: return isInstalled(ctx)
         val ours = certDer(ctx) ?: return false
-        return trustState {
+        return trustState(fingerprintOf(ours)) {
             val ks = KeyStore.getInstance("AndroidCAStore").apply { load(null) }
             (ks.getCertificate(a) as? X509Certificate)?.encoded?.contentEquals(ours) == true
         }

@@ -122,11 +122,7 @@ class FilterStore(val dir: File) {
     fun resourcePaths(context: Context): String {
         val installed = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
         for (f in listOf(uboResources, extraResources)) {
-            if (!f.exists() || f.lastModified() < installed) {
-                val tmp = File(f.path + ".part")
-                context.assets.open("builtin/${f.name}").use { input -> tmp.outputStream().use { input.copyTo(it) } }
-                tmp.renameTo(f)
-            }
+            if (!f.exists() || f.lastModified() < installed) copyWhole({ context.assets.open("builtin/${f.name}") }, f)
         }
         return listOf(uboResources, extraResources).filter { it.exists() }.joinToString("|") { it.path }
     }
@@ -159,6 +155,9 @@ class FilterStore(val dir: File) {
             "web.tmp", "web.extra.tmp", "web.count.tmp",
             "web-user.tmp", "web-user.extra.tmp", "web-user.count.tmp",
         )) File(dir, name).delete()
+        // A resource copy cut short; one under way is younger than a minute.
+        val now = System.currentTimeMillis()
+        builtinDir.listFiles { f -> f.name.endsWith(".part") && now - f.lastModified() > 60_000 }?.forEach { it.delete() }
     }
 
     /**
@@ -197,8 +196,29 @@ class FilterStore(val dir: File) {
         }
     }
 
-    private companion object {
-        const val META_TMP = "meta.json.tmp"
-        val processLock = java.util.concurrent.locks.ReentrantLock()
+    companion object {
+        private const val META_TMP = "meta.json.tmp"
+        private val processLock = java.util.concurrent.locks.ReentrantLock()
+
+        /**
+         * [open]'s bytes as [f]'s new content: through a temporary file of this copy's own (both
+         * processes copy the resources after an update, without the store's lock) moved over [f]
+         * at once, so a reader sees the old file or the new one, never a mix.
+         */
+        internal fun copyWhole(open: () -> java.io.InputStream, f: File) {
+            val tmp = File.createTempFile(f.name + ".", ".part", f.parentFile)
+            try {
+                open().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                try {
+                    java.nio.file.Files.move(tmp.toPath(), f.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+                } catch (e: java.io.IOException) {
+                    // Another copy of the same bytes is being moved in (a system that refuses to
+                    // replace a file in use): that one stands.
+                    if (!f.exists()) throw e
+                }
+            } finally {
+                tmp.delete()
+            }
+        }
     }
 }

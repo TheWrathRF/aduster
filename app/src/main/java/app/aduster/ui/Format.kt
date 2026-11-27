@@ -44,6 +44,14 @@ fun micros(us: Long): String = when {
 /** A time of day, the one format every screen uses for it (24-hour, as the Log's times). */
 fun hm(ms: Long): String = hmFmt.format(Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()))
 
+private val dayHmFmt = DateTimeFormatter.ofPattern("d MMM HH:mm", Locale.US)
+
+/** When something ends: the time alone today, with the day otherwise ("14:32", "4 Dec 14:32"). */
+fun endTime(ms: Long, now: Long = System.currentTimeMillis(), zone: ZoneId = ZoneId.systemDefault()): String {
+    val end = Instant.ofEpochMilli(ms).atZone(zone)
+    return if (end.toLocalDate() == Instant.ofEpochMilli(now).atZone(zone).toLocalDate()) hmFmt.format(end) else dayHmFmt.format(end)
+}
+
 /**
  * The system's own lookups (root's daemons, the system server) under one name; null for apps.
  * Neither has an app's icon or label to show.

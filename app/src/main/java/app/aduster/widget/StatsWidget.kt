@@ -95,7 +95,7 @@ class StatsWidget : AppWidgetProvider() {
             if (ids.isEmpty()) return
             renderLocked(
                 readRunning = { AdusterVpnService.running },
-                readPausedUntil = { AdusterVpnService.pausedUntil },
+                readPausedUntil = { AdusterVpnService.pauseEnd() },
                 readBlocked = { blockedToday(ctx) },
             ) { running, paused, big, small ->
                 val p = if (light(ctx)) LightPalette else BlackPalette

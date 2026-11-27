@@ -201,15 +201,26 @@ object FilterJobs {
         // A pending forced check already covers an unforced one.
         val pending = js.getPendingJob(ID_NOW)
         val forced = force || pending?.extras?.getBoolean(EXTRA_FORCE) == true
-        if (active[ID_NOW] == null) publish(ID_NOW, Progress(UpdatePhase.CHECKING))
+        val shown = active[ID_NOW] == null
+        if (shown) publish(ID_NOW, Progress(UpdatePhase.CHECKING))
         // No network constraint (see [schedule]); without a network the job retries with backoff.
-        js.schedule(
-            builder(ctx, ID_NOW)
-                .setExpedited(true)
-                .setBackoffCriteria(30_000L, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
-                .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forced) })
-                .build(),
-        )
+        fun job(expedited: Boolean) = builder(ctx, ID_NOW)
+            .setExpedited(expedited)
+            .setBackoffCriteria(30_000L, JobInfo.BACKOFF_POLICY_EXPONENTIAL)
+            .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forced) })
+            .build()
+        if (!scheduled({ js.schedule(job(true)) }, { js.schedule(job(false)) }) && shown) done(ID_NOW)
+    }
+
+    /**
+     * A job scheduled: expedited, else as an ordinary job (the expedited quota can be used up).
+     * False when the scheduler refused both; the progress shown for it is then taken away again,
+     * or the strip would stay and "Update now" stay disabled.
+     */
+    internal fun scheduled(expedited: () -> Int, plain: () -> Int): Boolean {
+        if (expedited() == JobScheduler.RESULT_SUCCESS || plain() == JobScheduler.RESULT_SUCCESS) return true
+        android.util.Log.w("Aduster", "a filter job was refused by the scheduler")
+        return false
     }
 
     /**
@@ -228,15 +239,15 @@ object FilterJobs {
             askAgain(ctx, ID_COMPILE, force)
             return
         }
-        if (active[ID_COMPILE] == null) publish(ID_COMPILE, Progress(UpdatePhase.APPLYING_DNS))
+        val shown = active[ID_COMPILE] == null
+        if (shown) publish(ID_COMPILE, Progress(UpdatePhase.APPLYING_DNS))
         val js = scheduler(ctx)
         // A pending forced rebuild (asked once per app version) is not replaced by an unforced one.
         val forced = force || js.getPendingJob(ID_COMPILE)?.extras?.getBoolean(EXTRA_FORCE) == true
-        js.schedule(
-            builder(ctx, ID_COMPILE).setExpedited(true)
-                .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forced) })
-                .build(),
-        )
+        fun job(expedited: Boolean) = builder(ctx, ID_COMPILE).setExpedited(expedited)
+            .setExtras(PersistableBundle().apply { putBoolean(EXTRA_FORCE, forced) })
+            .build()
+        if (!scheduled({ js.schedule(job(true)) }, { js.schedule(job(false)) }) && shown) done(ID_COMPILE)
     }
 
     /** Job ids whose work runs right now in this process. */

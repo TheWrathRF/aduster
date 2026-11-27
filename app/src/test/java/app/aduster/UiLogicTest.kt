@@ -14,6 +14,7 @@ import app.aduster.ui.LogItem
 import app.aduster.ui.QueryAction
 import app.aduster.ui.Stats
 import app.aduster.ui.common.segmentShape
+import app.aduster.ui.endTime
 import app.aduster.ui.historySlots
 import app.aduster.ui.parseDomainCheck
 import app.aduster.ui.parseSiteCheck
@@ -672,6 +673,77 @@ class UiLogicTest {
         assertTrue(QueryAction.NO_IPV6.answered && !QueryAction.NO_IPV6.blocked)
     }
 
+    /**
+     * A pause that ran out on the boot clock is over for the engine, also when the wall clock was
+     * moved back and still says it runs: the engine sees "not paused" and refilters browsers'
+     * connections opened during it.
+     */
+    @Test
+    fun aPauseOverOnTheBootClockIsOverForTheEngine() {
+        fun until(s: Settings, left: Long) = kotlinx.serialization.json.Json.parseToJsonElement(app.aduster.core.EngineConfig.json("stats.json", s, left))
+            .let { it as kotlinx.serialization.json.JsonObject }["paused_until_ms"].toString()
+        val later = System.currentTimeMillis() + 3_600_000
+        assertEquals("0", until(Settings(pausedUntil = later), 0))
+        assertEquals("$later", until(Settings(pausedUntil = later), 60_000))
+        assertEquals("${Long.MAX_VALUE}", until(Settings(pausedUntil = Long.MAX_VALUE), Long.MAX_VALUE))
+        assertEquals("0", until(Settings(), 0))
+    }
+
+    /** An imported custom list must be one the add dialog accepts: an https address and a name. */
+    @Test
+    fun importedListsNeedAnHttpsAddressAndAName() {
+        val good = app.aduster.settings.CustomList("custom-0000000a", "Mine", "https://lists.example/a.txt")
+        val lists = listOf(
+            good,
+            app.aduster.settings.CustomList("custom-0000000b", "Plain", "http://lists.example/b.txt"),
+            app.aduster.settings.CustomList("custom-0000000c", "File", "file:///sdcard/c.txt"),
+            app.aduster.settings.CustomList("custom-0000000d", " ", "https://lists.example/d.txt"),
+        )
+        assertEquals(listOf(good), Settings(customLists = lists).sanitized().customLists)
+    }
+
+    /** An import file is read up to 2 MiB; a larger one is not a settings file and is not read whole into memory. */
+    @Test
+    fun aHugeImportFileIsNotRead() {
+        assertEquals("{}", SettingsBackup.readCapped(java.io.ByteArrayInputStream("{}".toByteArray())))
+        val max = SettingsBackup.MAX_IMPORT_BYTES
+        assertEquals(max, SettingsBackup.readCapped(java.io.ByteArrayInputStream(ByteArray(max) { 'a'.code.toByte() }))?.length)
+        var read = 0L
+        val endless = object : java.io.InputStream() {
+            override fun read(): Int = 'a'.code.also { read++ }
+            override fun read(b: ByteArray, off: Int, len: Int): Int { java.util.Arrays.fill(b, off, off + len, 'a'.code.toByte()); read += len; return len }
+        }
+        assertNull(SettingsBackup.readCapped(endless))
+        assertTrue("read $read bytes", read <= max + 65_536)
+    }
+
+    /** A settings file that cannot be read is kept once per content, not once per start. */
+    @Test
+    fun aCorruptSettingsFileIsKeptOnce() {
+        val dir = java.nio.file.Files.createTempDirectory("corrupt-test").toFile()
+        try {
+            repeat(3) { app.aduster.settings.keepCorruptCopy(dir, "{\"logSize\": oops}") }
+            assertEquals(1, dir.list()!!.size)
+            app.aduster.settings.keepCorruptCopy(dir, "{\"theme\": 7}")
+            assertEquals(2, dir.list()!!.size)
+            assertTrue(dir.list()!!.all { it.startsWith("settings.corrupt-") && it.endsWith(".json") })
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    /** A filter job the scheduler refuses is tried as an ordinary job; refused both ways, the shown progress goes. */
+    @Test
+    fun aRefusedFilterJobIsSaid() {
+        val ok = android.app.job.JobScheduler.RESULT_SUCCESS
+        val no = android.app.job.JobScheduler.RESULT_FAILURE
+        var plainAsked = false
+        assertTrue(app.aduster.filters.FilterJobs.scheduled({ ok }, { plainAsked = true; no }))
+        assertFalse(plainAsked)
+        assertTrue(app.aduster.filters.FilterJobs.scheduled({ no }, { ok }))
+        assertFalse(app.aduster.filters.FilterJobs.scheduled({ no }, { no }))
+    }
+
     @Test
     fun importedNumbersStayInTheirRange() {
         // The engine refuses a negative count (unsigned fields), which would stop protection
@@ -1009,5 +1081,15 @@ class UiLogicTest {
         }
         val (hi, lo) = listOf(lum(a), lum(b)).sortedDescending()
         return (hi + 0.05) / (lo + 0.05)
+    }
+
+    @Test
+    fun anEndOnAnotherDayNamesTheDay() {
+        val zone = java.time.ZoneId.of("UTC")
+        val now = java.time.ZonedDateTime.of(2026, 11, 27, 10, 0, 0, 0, zone).toInstant().toEpochMilli()
+        assertEquals("14:32", endTime(now + (4 * 3600 + 32 * 60) * 1000L, now, zone))
+        // A 7-day retreat read "until 10:00", as if it ended today.
+        assertEquals("4 Dec 10:00", endTime(now + 7 * 86_400_000L, now, zone))
+        assertEquals("28 Nov 00:30", endTime(now + (14 * 3600 + 30 * 60) * 1000L, now, zone))
     }
 }

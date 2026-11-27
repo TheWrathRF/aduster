@@ -30,7 +30,7 @@ import app.aduster.ui.common.ListRow
 import app.aduster.ui.common.SectionHeading
 import app.aduster.ui.common.ValueText
 import app.aduster.ui.fmt
-import app.aduster.ui.hm
+import app.aduster.ui.endTime
 import app.aduster.ui.micros
 import app.aduster.ui.theme.LocalPalette
 import app.aduster.ui.theme.Type
@@ -192,7 +192,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                     val o = e as? JsonObject ?: return@forEach
                     val host = o["host"]?.jsonPrimitive?.content.orEmpty()
                     val left = o["remaining_s"]?.jsonPrimitive?.longOrNull ?: 0L
-                    val until = hm(System.currentTimeMillis() + left * 1000)
+                    val until = endTime(System.currentTimeMillis() + left * 1000)
                     val why = when (o["reason"]?.jsonPrimitive?.content) {
                         "bot_check" -> "Bot check, until $until"
                         "media" -> "Video or audio, until $until"
@@ -232,7 +232,7 @@ fun DiagnosticsScreen(vm: MainViewModel, onBack: () -> Unit) {
                         "inline" -> "Forced hiding"
                         else -> m
                     }
-                    row { ListRow(o["host"]?.jsonPrimitive?.content.orEmpty(), "$what, until ${hm(System.currentTimeMillis() + left * 1000)}") }
+                    row { ListRow(o["host"]?.jsonPrimitive?.content.orEmpty(), "$what, until ${endTime(System.currentTimeMillis() + left * 1000)}") }
                 }
             }
         } }

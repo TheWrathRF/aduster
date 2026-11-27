@@ -331,10 +331,30 @@ class FiltersLogicTest {
             ),
         )
         val pageBlock = LogLine.Query(listOf(LogItem(5, 0, "ads.test", 0, 10, QueryAction.FILTERED, null, null, 0, page = "news.test")))
-        assertNull(proxySiteOf(dnsOnly))
-        assertEquals("news.test", proxySiteOf(connOnly))
-        assertEquals("news.test", proxySiteOf(folded))
-        assertEquals("news.test", proxySiteOf(pageBlock))
+        assertNull(proxySiteOf(dnsOnly, setOf(10)))
+        assertEquals("news.test", proxySiteOf(connOnly, setOf(10)))
+        assertEquals("news.test", proxySiteOf(folded, setOf(10)))
+        assertEquals("news.test", proxySiteOf(pageBlock, setOf(10)))
+    }
+
+    @Test
+    fun otherAppsProxiedConnectionsStayOutOfBrowsersAndPages() {
+        val browsers = setOf(10)
+        val mail = LogItem(6, 0, "api.mail.test", 0, 77, QueryAction.UPSTREAM, null, null, 0)
+        val chrome = LogItem(7, 0, "news.test", 0, 10, QueryAction.UPSTREAM, null, null, 0)
+        val pageBlock = LogItem(8, 0, "ads.test", 0, 10, QueryAction.FILTERED, null, null, 0, page = "news.test")
+        val mailLookup = LogItem(9, 0, "api.mail.test", 1, 77, QueryAction.UPSTREAM, null, null, 0)
+        assertFalse("Browsers chip", app.aduster.ui.log.logMatches(mail, 0, true, false, null, "", browsers) { "" })
+        assertFalse("Pages chip", app.aduster.ui.log.logMatches(mail, 0, false, true, null, "", browsers) { "" })
+        assertFalse("Browsers chip, lookup", app.aduster.ui.log.logMatches(mailLookup, 0, true, false, null, "", browsers) { "" })
+        for (e in listOf(chrome, pageBlock)) {
+            assertTrue(app.aduster.ui.log.logMatches(e, 0, true, false, null, "", browsers) { "" })
+            assertTrue(app.aduster.ui.log.logMatches(e, 0, false, true, null, "", browsers) { "" })
+        }
+        assertTrue("all rows", app.aduster.ui.log.logMatches(mail, 0, false, false, null, "", browsers) { "" })
+        // "Never decrypt" is offered for browsers' connections only.
+        assertNull(proxySiteOf(LogLine.Query(listOf(mail)), browsers))
+        assertEquals("news.test", proxySiteOf(LogLine.Query(listOf(chrome)), browsers))
     }
 
     @Test

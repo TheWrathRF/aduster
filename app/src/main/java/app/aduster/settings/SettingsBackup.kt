@@ -12,6 +12,21 @@ import kotlinx.serialization.json.put
  * all-default settings, so picking a saved report by mistake would wipe every rule and list.
  */
 object SettingsBackup {
+    /** The largest file an import reads: a settings file is a few kilobytes, even with long rule lists. */
+    const val MAX_IMPORT_BYTES = 2 * 1024 * 1024
+
+    /** [input] as text, or null when it is longer than [MAX_IMPORT_BYTES] (read no further than that). */
+    fun readCapped(input: java.io.InputStream): String? {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(65_536)
+        while (true) {
+            val n = input.read(buf)
+            if (n < 0) return out.toByteArray().decodeToString()
+            out.write(buf, 0, n)
+            if (out.size() > MAX_IMPORT_BYTES) return null
+        }
+    }
+
     const val FORMAT = "aduster-settings"
     private const val VERSION = 1
     /** The settings as they were before the last import, for "Undo import" (files dir). */

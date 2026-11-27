@@ -7,6 +7,9 @@ import kotlinx.serialization.json.putJsonArray
 
 /** Upstream resolver presets. Encrypted presets carry bootstrap IPs so no plain lookup is needed. */
 object Upstreams {
+    /** A DNS name or IPv4 address: letters, digits, `-` and `_` in dot-separated labels (no spaces, no empty label). */
+    private val DOT_HOST = Regex("""^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\.?$""")
+
     data class Preset(val id: String, val label: String, val detail: String, val json: JsonObject?)
 
     private fun doh(url: String, vararg ips: String) = buildJsonObject {
@@ -57,14 +60,20 @@ object Upstreams {
      */
     fun dotHostPort(url: String): Pair<String, Int>? {
         val hostPort = url.trim().removePrefix("tls://").substringBefore('/')
-        val (host, rest) = if (hostPort.startsWith("[")) {
-            hostPort.removePrefix("[").substringBefore(']') to hostPort.substringAfter(']', "")
+        val bracketed = hostPort.startsWith("[")
+        val (host, rest) = if (bracketed) {
+            if (']' !in hostPort) return null
+            hostPort.removePrefix("[").substringBefore(']') to hostPort.substringAfter(']')
         } else {
             hostPort.substringBefore(':') to hostPort.substring(hostPort.substringBefore(':').length)
         }
-        val port = if (rest.isEmpty()) 853 else rest.removePrefix(":").toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-        return if (host.isEmpty()) null else host to port
+        // Only ":port" may follow the host (`[::1]853` and a second colon were taken as 853).
+        if (rest.isNotEmpty() && !rest.startsWith(":")) return null
+        val port = if (rest.isEmpty()) 853 else rest.substring(1).toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+        val valid = if (bracketed) app.aduster.https.HttpsConfig.isIpv6(host.lowercase()) else DOT_HOST.matches(host)
+        return if (valid) host to port else null
     }
+
 
     /** Whether a custom resolver address can be used (checked before saving it). */
     fun validCustom(url: String): Boolean {
