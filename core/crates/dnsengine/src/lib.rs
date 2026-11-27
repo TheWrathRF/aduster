@@ -277,6 +277,7 @@ impl Shared {
             if *cur != config.upstream {
                 match upstream::Upstream::from_config(&config.upstream) {
                     Ok(u) => {
+                        u.set_families(self.has_v4.load(Ordering::Relaxed), self.has_v6.load(Ordering::Relaxed));
                         self.upstream.store(Arc::new(u));
                         *cur = config.upstream.clone();
                         // Answers from the previous resolver may differ (e.g. ISP-level blocking).
@@ -445,6 +446,7 @@ impl Shared {
         let (v4, v6) = if has_v4 || has_v6 { (has_v4, has_v6) } else { (true, true) };
         self.has_v4.store(v4, Ordering::Relaxed);
         self.has_v6.store(v6, Ordering::Relaxed);
+        self.upstream.load().set_families(v4, v6);
         // Upstream DNS sockets go out on this network.
         upstream::BIND_HANDLE.store(handle, Ordering::Relaxed);
         // Only a different network makes existing connections useless; a resolver or address

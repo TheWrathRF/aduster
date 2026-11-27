@@ -105,6 +105,21 @@ impl Upstream {
         }
     }
 
+    /// The network's address families (both true: unknown). Not a change of network: a dial in
+    /// flight goes on, and only the next one orders its addresses by them.
+    pub fn set_families(&self, v4: bool, v6: bool) {
+        let net = match self {
+            Upstream::System => return,
+            Upstream::Doh(d) => &d.network,
+            Upstream::Dot(d) => &d.network,
+        };
+        net.send_if_modified(|n| {
+            n.v4 = v4;
+            n.v6 = v6;
+            false
+        });
+    }
+
     pub async fn exchange(&self, system: &[SocketAddr], q: &[u8]) -> io::Result<Vec<u8>> {
         match self {
             Upstream::System => system_exchange(system, q).await,
@@ -148,15 +163,25 @@ const ENCRYPTED_USER_TIMEOUT_MS: libc::c_uint = 10_000;
 pub(crate) const DIAL_FAILED_RECENTLY: &str = "encrypted resolver unreachable a moment ago";
 
 /// The network an encrypted resolver's connections and dials belong to: a number bumped on
-/// every change ([`Upstream::reset_connections`]), and whether there is a network at all.
+/// every change ([`Upstream::reset_connections`]), whether there is a network at all, and the
+/// address families it has ([`Upstream::set_families`]: which bootstrap addresses are dialled
+/// first).
 #[derive(Clone, Copy)]
 struct Net {
     n: u64,
     online: bool,
+    v4: bool,
+    v6: bool,
 }
 
 fn new_net() -> tokio::sync::watch::Sender<Net> {
-    tokio::sync::watch::Sender::new(Net { n: 0, online: true })
+    tokio::sync::watch::Sender::new(Net { n: 0, online: true, v4: true, v6: true })
+}
+
+/// The network's address families (v4, v6), as the dial orders its addresses by them.
+fn families(network: &tokio::sync::watch::Sender<Net>) -> (bool, bool) {
+    let n = *network.borrow();
+    (n.v4, n.v6)
 }
 
 /// True while a dial that failed at boot ms `at` (0: none) on network `on` still counts: only
@@ -510,7 +535,30 @@ async fn lookup_resolver(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     .map_err(io::Error::other)?
 }
 
-async fn tls_connect(host: &str, port: u16, bootstrap: &[IpAddr], connector: &TlsConnector) -> io::Result<TlsStream<TcpStream>> {
+/// The order a resolver's addresses are dialled in, each [`NEXT_ADDRESS_AFTER`] after the one
+/// before: on a network with one family its addresses first, the
+/// other's after them (still tried: the network's report can be wrong, and 464XLAT carries IPv4
+/// on IPv6-only mobile networks); on both (or unknown) the families take turns, starting with
+/// the list's first address, so a broken family costs one step, not one per address it has.
+fn dial_order(addrs: &[SocketAddr], (v4, v6): (bool, bool)) -> Vec<SocketAddr> {
+    let (fours, sixes): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs.iter().partition(|a| a.is_ipv4());
+    let (first, second) = match (v4, v6) {
+        (true, false) => return fours.into_iter().chain(sixes).collect(),
+        (false, true) => return sixes.into_iter().chain(fours).collect(),
+        _ if addrs.first().is_some_and(|a| a.is_ipv6()) => (sixes, fours),
+        _ => (fours, sixes),
+    };
+    let mut out = Vec::with_capacity(addrs.len());
+    let (mut a, mut b) = (first.into_iter(), second.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return out,
+            (x, y) => out.extend(x.into_iter().chain(y)),
+        }
+    }
+}
+
+async fn tls_connect(host: &str, port: u16, bootstrap: &[IpAddr], families: (bool, bool), connector: &TlsConnector) -> io::Result<TlsStream<TcpStream>> {
     // An IPv6 literal comes in brackets from a URL (`https://[2606:4700::1111]/dns-query`); the
     // lookup and the certificate check take the bare address.
     let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
@@ -523,6 +571,7 @@ async fn tls_connect(host: &str, port: u16, bootstrap: &[IpAddr], connector: &Tl
     } else {
         bootstrap.iter().map(|ip| SocketAddr::new(*ip, port)).collect()
     };
+    let addrs = dial_order(&addrs, families);
     let name = ServerName::try_from(host.to_string()).map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
     let Some(&first) = addrs.first() else { return Err(io::Error::new(ErrorKind::NotFound, "no address")) };
     let plan = addrs.iter().enumerate().map(|(i, a)| (NEXT_ADDRESS_AFTER * i as u32, *a)).chain(std::iter::once((BACKUP_DIAL_AFTER, first)));
@@ -632,7 +681,7 @@ impl Doh {
             return Err(io::Error::new(ErrorKind::NotConnected, DIAL_FAILED_RECENTLY));
         }
         let (on, dialed) = dial_on_this_network(&self.network, || async {
-            let tls = tls_connect(&self.host, self.port, &self.bootstrap, &self.connector).await?;
+            let tls = tls_connect(&self.host, self.port, &self.bootstrap, families(&self.network), &self.connector).await?;
             let handshake = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls));
             match tokio::time::timeout(TLS_TIMEOUT, handshake).await {
                 Ok(r) => r.map_err(|e| io::Error::other(e.to_string())),
@@ -855,7 +904,8 @@ impl Dot {
         if dial_failed_recently(&self.dial_failed, &self.network) {
             return Err(io::Error::new(ErrorKind::NotConnected, DIAL_FAILED_RECENTLY));
         }
-        let (on, dialed) = dial_on_this_network(&self.network, || tls_connect(&self.host, self.port, &self.bootstrap, &self.connector)).await;
+        let (on, dialed) =
+            dial_on_this_network(&self.network, || tls_connect(&self.host, self.port, &self.bootstrap, families(&self.network), &self.connector)).await;
         let tls = match (on, dialed) {
             (Some(on), Ok(t)) => {
                 self.conn_net.store(on, Ordering::Release);
@@ -1296,6 +1346,61 @@ mod tests {
         }
     }
 
+    /// On an IPv6-only network the IPv6 bootstrap address is dialled
+    /// first (it waited a quarter second behind every IPv4 one listed before it), on an
+    /// IPv4-only network the IPv4 ones, and on both the families take turns.
+    #[tokio::test]
+    async fn the_networks_family_is_dialled_first() {
+        let ck = rcgen::generate_simple_self_signed(vec!["dns.test".into()]).unwrap();
+        let cert = ck.cert.der().clone();
+        let key = rustls_pki_types::PrivateKeyDer::try_from(ck.signing_key.serialize_der()).unwrap();
+        let server = rustls::ServerConfig::builder_with_provider(tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let Ok(l) = tokio::net::TcpListener::bind("[::1]:0").await else { return }; // no IPv6 here
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = l.accept().await else { return };
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut t) = a.accept(s).await {
+                        let _ = t.read_u8().await;
+                    }
+                });
+            }
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client));
+        // Two IPv4 addresses that swallow the SYN, then the server's IPv6 one.
+        let bootstrap: [IpAddr; 3] = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap(), "::1".parse().unwrap()];
+        let t0 = std::time::Instant::now();
+        tls_connect("dns.test", port, &bootstrap, (false, true), &connector).await.unwrap();
+        assert!(t0.elapsed() < NEXT_ADDRESS_AFTER, "IPv6-only network: took {:?}", t0.elapsed());
+        let t0 = std::time::Instant::now();
+        tls_connect("dns.test", port, &bootstrap, (true, true), &connector).await.unwrap();
+        let both = t0.elapsed();
+        assert!(both >= NEXT_ADDRESS_AFTER && both < NEXT_ADDRESS_AFTER * 2, "both families take turns: took {both:?}");
+        assert_eq!(dial_order(&[a("192.0.2.1"), a("192.0.2.2"), a("::1"), a("::2")], (true, true)), [a("192.0.2.1"), a("::1"), a("192.0.2.2"), a("::2")]);
+        assert_eq!(dial_order(&[a("::1"), a("192.0.2.1"), a("192.0.2.2")], (true, true)), [a("::1"), a("192.0.2.1"), a("192.0.2.2")]);
+        assert_eq!(dial_order(&[a("::1"), a("192.0.2.1")], (true, false)), [a("192.0.2.1"), a("::1")]);
+        assert_eq!(dial_order(&[a("192.0.2.1"), a("::1")], (false, false)), [a("192.0.2.1"), a("::1")]);
+    }
+
+    fn a(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 853)
+    }
+
     /// A first resolver address that swallows the SYN costs a quarter second, not the
     /// whole 5 s attempt: the next address is dialled meanwhile and the first handshake wins.
     #[tokio::test]
@@ -1333,7 +1438,7 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client));
         let t0 = std::time::Instant::now();
         let bootstrap: [IpAddr; 2] = ["192.0.2.1".parse().unwrap(), "127.0.0.1".parse().unwrap()];
-        tls_connect("dns.test", port, &bootstrap, &connector).await.unwrap();
+        tls_connect("dns.test", port, &bootstrap, (true, true), &connector).await.unwrap();
         assert!(t0.elapsed() < Duration::from_secs(1), "took {:?}", t0.elapsed());
     }
 
