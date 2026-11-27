@@ -96,7 +96,6 @@ pub struct Stats {
     pub total_blocked: u64,
     pub history: VecDeque<DayStat>,
     pub top_blocked: HashMap<String, u64>,
-    pub top_allowed: HashMap<String, u64>,
     /// Of the blocked counts, those of requests a page rule stopped inside browsers' pages (the
     /// host itself is not blocked, only some of its addresses): the Home screen says so.
     #[serde(default)]
@@ -149,7 +148,6 @@ impl Stats {
         self.blocked = back.as_ref().map_or(0, |d| d.blocked);
         self.cached = 0;
         self.top_blocked.clear();
-        self.top_allowed.clear();
         self.top_in_pages.clear();
         self.dns_queries = 0;
         self.dns_blocked = 0;
@@ -189,11 +187,10 @@ impl Stats {
             if action == Action::Filtered {
                 bump(&mut self.top_in_pages, name);
             }
-        } else {
-            bump(&mut self.top_allowed, name);
-            if matches!(action, Action::Cache | Action::Stale) {
-                self.cached += 1;
-            }
+        } else if matches!(action, Action::Cache | Action::Stale) {
+            // Allowed names are not kept: nothing shows them, and the file and every stats poll
+            // would carry up to 1,500 of the day's hosts.
+            self.cached += 1;
         }
         if let Some(latency_us) = dns {
             match action {
@@ -213,6 +210,7 @@ impl Stats {
     }
 
     pub fn report(&self) -> serde_json::Value {
+        let top_blocked = top(&self.top_blocked);
         serde_json::json!({
             "day": self.day,
             "queries": self.queries,
@@ -221,21 +219,14 @@ impl Stats {
             "total_queries": self.total_queries,
             "total_blocked": self.total_blocked,
             "history": self.history,
-            "top_blocked": top(&self.top_blocked),
-            // Names of `top_blocked` counted mostly from requests blocked inside pages.
-            "top_blocked_in_pages": top(&self.top_blocked)
-                .into_iter()
-                .filter(|(n, c)| self.top_in_pages.get(*n).is_some_and(|p| p * 2 >= *c))
-                .map(|(n, _)| n)
-                .collect::<Vec<_>>(),
             // How many of each top name's blocks were inside pages (shown as "N · M in pages").
-            "top_blocked_page_counts": top(&self.top_blocked)
-                .into_iter()
-                .filter_map(|(n, _)| self.top_in_pages.get(n).map(|p| (n, *p)))
+            "top_blocked_page_counts": top_blocked
+                .iter()
+                .filter_map(|(n, _)| self.top_in_pages.get(*n).map(|p| (*n, *p)))
                 .collect::<Vec<_>>(),
+            "top_blocked": top_blocked,
             "dns_queries": self.dns_queries,
             "dns_blocked": self.dns_blocked,
-            "top_allowed": top(&self.top_allowed),
             "apps": self.apps.iter().map(|(u, a)| (u, a.queries, a.blocked)).collect::<Vec<_>>(),
             "latency": {
                 "upstream_p50_us": self.upstream_latency.percentile(0.5),
@@ -253,10 +244,19 @@ fn bump(map: &mut HashMap<String, u64>, name: &str) {
         return;
     }
     if map.len() >= TOP_LIMIT {
+        // The [`TOP_KEEP`] busiest stay, ties at the cut included up to that many: keeping only
+        // counts above the cut emptied a list of names counted alike.
         let mut counts: Vec<u64> = map.values().copied().collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let cutoff = counts[TOP_KEEP.min(counts.len() - 1)];
-        map.retain(|_, c| *c > cutoff);
+        let (_, cut, _) = counts.select_nth_unstable_by(TOP_KEEP - 1, |a, b| b.cmp(a));
+        let cut = *cut;
+        let mut ties = TOP_KEEP - map.values().filter(|c| **c > cut).count();
+        map.retain(|_, c| {
+            *c > cut
+                || (*c == cut && ties > 0 && {
+                    ties -= 1;
+                    true
+                })
+        });
     }
     map.insert(name.to_string(), 1);
 }
@@ -432,7 +432,6 @@ mod tests {
         }
         s.add("x.com", 10, Action::Blocked, None);
         let r = s.report();
-        assert_eq!(r["top_blocked_in_pages"], serde_json::json!(["x.com"]));
         // The page count beside the total; DNS counted apart.
         assert_eq!(r["top_blocked_page_counts"], serde_json::json!([["x.com", 3]]));
         assert_eq!((r["dns_queries"].as_u64(), r["dns_blocked"].as_u64()), (Some(3), Some(3)));
@@ -480,5 +479,43 @@ mod tests {
         }
         assert_eq!(h.percentile(0.5), 128);
         assert_eq!(h.percentile(0.99), 65_536);
+    }
+
+    /// Allowed names are neither kept nor reported (nothing reads them); a stats file that has
+    /// them still loads.
+    #[test]
+    fn allowed_names_are_not_kept() {
+        let mut s = Stats::default();
+        s.roll_day(100);
+        s.add("allowed.test", 10, Action::Upstream, Some(5));
+        s.add("ads.test", 10, Action::Blocked, Some(5));
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(!saved.contains("allowed.test"), "{saved}");
+        let r = s.report();
+        assert!(r.get("top_allowed").is_none() && r.get("top_blocked_in_pages").is_none(), "{r}");
+        let old: Stats = serde_json::from_str(r#"{"day":100,"queries":2,"blocked":1,"cached":0,"total_queries":2,"total_blocked":1,"history":[],"top_blocked":{"ads.test":1},"top_allowed":{"allowed.test":1},"apps":{}}"#).unwrap();
+        assert_eq!(old.top_blocked.get("ads.test"), Some(&1));
+    }
+
+    /// A full top list of names counted alike keeps its first 1,000, not none.
+    #[test]
+    fn ties_at_the_trim_keep_the_list() {
+        let mut s = Stats::default();
+        s.roll_day(100);
+        for i in 0..=TOP_LIMIT {
+            s.add(&format!("n{i}.test"), 10, Action::Blocked, None);
+        }
+        assert_eq!(s.top_blocked.len(), TOP_KEEP + 1);
+        // The busiest names stay whatever the ties below them.
+        let mut s = Stats::default();
+        s.roll_day(100);
+        for _ in 0..5 {
+            s.add("busy.test", 10, Action::Blocked, None);
+        }
+        for i in 0..TOP_LIMIT {
+            s.add(&format!("n{i}.test"), 10, Action::Blocked, None);
+        }
+        assert_eq!(s.top_blocked.get("busy.test"), Some(&5));
+        assert!(s.top_blocked.len() > TOP_KEEP / 2);
     }
 }
